@@ -342,6 +342,11 @@ def vessel_card(vessel: dict, core) -> str:
     if kind:
         lines.append(f"Что везёт: {kind} — {kind_detail}")
 
+    signals = core.vessel_signals(vessel) if hasattr(core, "vessel_signals") else []
+    if signals:
+        lines.append("<b>Признаки</b> (по наблюдениям программы):")
+        lines += [f"• {signal}" for signal in signals]
+
     if vessel.get("imo") or mmsi:
         lines.append(f"VesselFinder: https://www.vesselfinder.com/vessels/details/"
                      f"{vessel.get('imo') or mmsi}")

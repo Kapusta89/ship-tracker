@@ -1553,6 +1553,10 @@ class App:
         if kind:
             lines.append(f"Что везёт: {kind} — {kind_detail}")
             lines.append("  (название груза AIS не передаёт: подпись по типу судна)")
+        signals = self.core.vessel_signals(vessel)
+        if signals:
+            lines.append("Признаки (по наблюдениям программы):")
+            lines += [f"  • {signal}" for signal in signals]
         target = self._targets.get(mmsi)
         if target and target.get("eta_calc"):
             lines.append(f"Прибытие (расчёт): {fmt_moment(target['eta_calc'])} "

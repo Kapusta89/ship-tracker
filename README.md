@@ -145,6 +145,8 @@ Open Waters работают без ключа. Если статусы «на �
       core.py                приём AIS, геозоны, фильтр, алерты
       ais_feed.py            AISStream, Open Waters, снимок района, треки
       services_feed.py       внешние API по ключу (VesselFinder, MyShipTracking, Digitraffic)
+      analysis.py            признаки: флаг, тёмные периоды AIS, рейд, цикл заходов, осадка
+      cargo.py               оценка груза по осадке и габаритам корпуса
       forecast.py            прогноз маршрута на 5 дней
       telegram_bot.py        бот: порт → суда в этот порт, карточки, автообновление
       store.py               SQLite: суда, позиции, визиты

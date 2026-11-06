@@ -23,6 +23,7 @@ from pathlib import Path
 import requests
 
 import ais_feed
+import analysis
 import cargo
 import flags
 import geo
@@ -1086,6 +1087,26 @@ class RadarCore:
             if pause:
                 time.sleep(pause)
         return {"checked": checked, "imported": imported, "failed": failed}
+
+    def vessel_signals(self, vessel) -> list:
+        """Признаки судна по наблюдениям: флаг, тёмные периоды, рейд, цикл.
+
+        Считается в analysis.py по нашим позициям и визитам. Список может быть
+        пустым: признаков нет или данных ещё мало.
+        """
+        if not vessel:
+            return []
+        mmsi = vessel.get("mmsi")
+        if not mmsi:
+            return []
+        days = float(self.config.get("history_days") or 7)
+        try:
+            track = self.store.track(mmsi, days * 24)
+            visits = self.store.visits(200, mmsi=mmsi)
+        except Exception:
+            return [analysis.flag_note(mmsi)] if analysis.flag_note(mmsi) else []
+        return analysis.signals(vessel, track, visits,
+                                self.config.get("ports") or [], days)
 
     def cargo_estimate(self, vessel):
         """Оценка груза по осадке и габаритам корпуса — см. cargo.py."""
