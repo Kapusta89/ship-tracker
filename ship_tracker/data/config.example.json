@@ -1,0 +1,107 @@
+{
+  "api_key": "",
+  "openwaters_token": "",
+  "use_openwaters": true,
+  "use_snapshot": true,
+  "snapshot_minutes": 10.0,
+  "snapshot_max_age_hours": 6,
+  "port_watch_km": 100.0,
+  "use_history": true,
+  "use_vf": true,
+  "use_mt": false,
+  "use_mst": true,
+  "use_dt": false,
+  "vf_key": "",
+  "mt_key": "",
+  "mst_key": "",
+  "mst_minutes": 120,
+  "mst_daily_coins": 150,
+  "mst_max_vessels": 40,
+  "bounding_boxes": [
+    [
+      [
+        40.5,
+        26.0
+      ],
+      [
+        47.5,
+        42.0
+      ]
+    ]
+  ],
+  "message_types": [
+    "PositionReport",
+    "ExtendedClassBPositionReport",
+    "ShipStaticData"
+  ],
+  "ports": [
+    {
+      "name": "RENI",
+      "label": "RENI",
+      "lat": 45.4528,
+      "lon": 28.2822,
+      "radius_km": 5.0
+    },
+    {
+      "name": "IZMAIL",
+      "label": "IZMAIL",
+      "lat": 45.3517,
+      "lon": 28.8367,
+      "radius_km": 5.0
+    },
+    {
+      "name": "VYLKOVE",
+      "label": "VYLKOVE",
+      "lat": 45.3975,
+      "lon": 29.5853,
+      "radius_km": 4.0
+    },
+    {
+      "name": "CHORNOMORSK",
+      "label": "CHORNOMORSK",
+      "lat": 46.3,
+      "lon": 30.6667,
+      "radius_km": 8.0
+    },
+    {
+      "name": "ODESSA",
+      "label": "ODESSA",
+      "lat": 46.4825,
+      "lon": 30.7233,
+      "radius_km": 8.0
+    },
+    {
+      "name": "YUZHNY",
+      "label": "YUZHNY",
+      "lat": 46.6233,
+      "lon": 31.0167,
+      "radius_km": 8.0
+    }
+  ],
+  "filter_destinations": [
+    "RENI",
+    "IZMAIL",
+    "VYLKOVE",
+    "CHORNOMORSK",
+    "ODESSA",
+    "YUZHNY"
+  ],
+  "filter_origins": [
+    "RENI",
+    "IZMAIL",
+    "VYLKOVE",
+    "CHORNOMORSK",
+    "ODESSA",
+    "YUZHNY"
+  ],
+  "trip_window_hours": 96.0,
+  "min_speed_knots": 2.0,
+  "alert_cooldown_hours": 6.0,
+  "position_interval_seconds": 60.0,
+  "stale_minutes": 15.0,
+  "history_days": 7.0,
+  "forget_vessels_hours": 24,
+  "telegram_token": "",
+  "telegram_chat_id": "",
+  "telegram_commands": true
+}

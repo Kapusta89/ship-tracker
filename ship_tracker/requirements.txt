@@ -1,0 +1,4 @@
+requests>=2.31
+websockets>=12.0
+aiogram>=3.13
+pillow>=10.0

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Виртуальные окружения: создаются на каждом компьютере заново
+.venv/
+.venv_old/
+**/.venv/
+**/.venv_old/
+
+# Данные и секреты (ключи API, токен бота, база, фото, логи)
+**/data/config.json
+**/data/*.db
+**/data/*.db-*
+**/data/photos/
+**/data/*.lock
+**/data/*.log
+**/data/*.err
+**/data/bot_messages.json
+**/data/credits*.json
+**/data/errors.log
+**/data/headless_check.log
+
+# Служебное Freebuff и артефакты сборки
+.freebuff/
+.cloud-attachments/
+build/
+dist/
+output.txt

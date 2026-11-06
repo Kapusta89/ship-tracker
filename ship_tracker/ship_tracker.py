@@ -1,0 +1,2509 @@
+"""Ship Tracker — рабочее приложение наблюдения за судами по живому AIS.
+
+Данные: AISStream (бесплатный ключ, регистрация через GitHub) в районе
+северо-западного Причерноморья и Дуная: Рени, Измаил, Вилково, Черноморск,
+Одесса, Южный.
+
+Что делает:
+  * принимает поток AIS по веб-сокету и складывает суда, позиции и визиты в SQLite;
+  * сам определяет порт отправления по геозонам портов (AIS его не передаёт);
+  * считает целью танкер (AIS Type 80–89), который идёт в IZMAIL или RENI
+    и вышел из ODESSA или CHORNOMORSK;
+  * присылает алерт в Telegram и показывает его в окне;
+  * рисует радар: порты, суда, курс, трек выбранного судна.
+
+Запуск с окном:
+    python ship_tracker.py
+
+Без окна (фоном, без интерфейса):
+    python ship_tracker.py --headless --minutes 60
+
+Настройки: data/config.json, база: data/ship_tracker.db.
+"""
+
+import argparse
+import math
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+import ais_feed
+import cargo
+import flags
+import forecast
+import geo
+import photos
+import services_feed
+from core import (AppError, BotCommander, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
+                  duration_text, fmt_moment, fmt_number, fmt_tons, load_config, span_text,
+                  norm, port_matches, save_config, send_telegram, split_list, telegram_call)
+from store import Store, parse_iso
+
+AIRSTREAM_SITE = "https://aisstream.io"
+
+# Кэш фото судов: скачивается один раз и остаётся на диске.
+PHOTO_DIR = DATA_DIR / "photos"
+
+# Поля с ключами API тех сервисов, которым они нужны.
+SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "mt": "var_mt_key", "mst": "var_mst_key"}
+
+# Дополнительные подключения: название, ключ настройки, описание и сайт с ключом.
+SERVICE_BLOCKS = [
+    ("VesselFinder", "vf", "API по ключу: LiveData — только по подписке"),
+    ("MarineTraffic", "mt", "живой API по ключу, район задаётся в кабинете"),
+    ("MyShipTracking", "mst", "триал 2000 кредитов: расширенные данные по нашим судам"),
+    ("Digitraffic", "dt", "открытые данные Финляндии, только Балтика"),
+]
+
+SERVICE_SITES = {
+    "vf": ("vesselfinder.com", "https://www.vesselfinder.com/"),
+    "mt": ("marinetraffic.com", "https://www.marinetraffic.com/"),
+    "mst": ("myshiptracking.com", "https://www.myshiptracking.com/"),
+    "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
+}
+
+
+def service_key_var(app, key):
+    """Переменная Tk с ключом API сервиса или None, если ключ не нужен."""
+    name = SERVICE_KEY_FIELDS.get(key)
+    return getattr(app, name, None) if name else None
+
+
+# --------------------------------------------------------------------- утилиты
+
+def console_log(message: str):
+    line = f"[{datetime.now():%H:%M:%S}] {message}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
+
+
+def open_folder(path):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if sys.platform.startswith("win"):
+        os.startfile(str(path))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def clean_key(text) -> str:
+    """Ключ из буфера обмена: без пробелов, переводов строк и невидимых символов.
+
+    Копирование со страницы часто тянет за собой пробел, перевод строки или
+    невидимый символ — из-за них ключ выглядит правильным, но не принимается.
+    """
+    if not text:
+        return ""
+    parts = [part for part in str(text).split() if part.strip()]
+    if not parts:
+        return ""
+    candidate = max(parts, key=len)
+    cleaned = "".join(ch for ch in candidate if ch.isprintable() and not ch.isspace())
+    return cleaned[:200]
+
+
+def parse_bboxes(text: str) -> list:
+    """«44.05, 27.55, 45.95, 29.35; ...» → [[[s, w], [n, e]], ...] для AISStream."""
+    boxes = []
+    for chunk in (text or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [part for part in chunk.replace(",", " ").split() if part]
+        if len(parts) != 4:
+            raise AppError("Район задаётся четырьмя числами: юг, запад, север, восток.")
+        try:
+            south, west, north, east = (float(part) for part in parts)
+        except ValueError:
+            raise AppError(f"В районе «{chunk}» не числа.")
+        if not (-90 <= south < north <= 90 and -180 <= west < east <= 180):
+            raise AppError(f"Район «{chunk}»: нужно юг < север и запад < восток.")
+        boxes.append([[south, west], [north, east]])
+    if not boxes:
+        raise AppError("Не задан район подписки.")
+    return boxes
+
+
+def format_bboxes(boxes) -> str:
+    chunks = []
+    for box in boxes or []:
+        try:
+            (south, west), (north, east) = box
+        except (ValueError, TypeError):
+            continue
+        chunks.append(f"{south:g}, {west:g}, {north:g}, {east:g}")
+    return "; ".join(chunks)
+
+
+def parse_ports(text: str) -> list:
+    """Строки «ГАЛАЦ; 45.4353; 28.0081; 7» → список геозон."""
+    ports = []
+    for number, line in enumerate((text or "").splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.replace(",", ";").split(";") if part.strip()]
+        if len(parts) < 4:
+            raise AppError(f"Строка {number}: нужно «ИМЯ; широта; долгота; радиус_км».")
+        try:
+            lat, lon, radius = float(parts[1]), float(parts[2]), float(parts[3])
+        except ValueError:
+            raise AppError(f"Строка {number}: широта, долгота и радиус должны быть числами.")
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180) or radius <= 0:
+            raise AppError(f"Строка {number}: проверьте координаты и радиус.")
+        ports.append({
+            "name": norm(parts[0]),
+            "label": parts[0],
+            "lat": lat,
+            "lon": lon,
+            "radius_km": radius,
+        })
+    if not ports:
+        raise AppError("Нужен хотя бы один порт с геозоной.")
+    return ports
+
+
+def format_ports(ports) -> str:
+    lines = []
+    for port in ports or []:
+        lines.append(f"{port.get('name')}; {port.get('lat')}; {port.get('lon')}; "
+                     f"{port.get('radius_km')}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- холст радара
+
+class RadarCanvas:
+    def __init__(self, tk, parent, config, on_select, request_redraw, store=None):
+        self.tk = tk
+        self.config = config
+        self.on_select = on_select
+        self.request_redraw = request_redraw
+        self.store = store
+        self.canvas = tk.Canvas(parent, bg="#061018", highlightthickness=0,
+                                width=800, height=560)
+        self.center_lat, self.center_lon, self.span = self._initial_view()
+        self.selected = None
+        self.show_tracks = True
+        self.show_forecast = True
+        self.targets_only = False
+        self.schematic_view = False
+        self.track = []
+        self._forecast_cache = {}
+        self._hits = []
+        self._press = None
+        self._press_geo = None
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+        self.canvas.bind("<Button-4>", lambda event: self.zoom(1.2))
+        self.canvas.bind("<Button-5>", lambda event: self.zoom(1 / 1.2))
+        self.canvas.bind("<Configure>", lambda event: self.request_redraw())
+        self.canvas.bind("<Double-Button-1>", lambda event: self.fit_all())
+
+    # -- вид
+    def _initial_view(self):
+        boxes = self.config.get("bounding_boxes") or geo.DEFAULT_BOUNDING_BOXES
+        try:
+            (south, west), (north, east) = boxes[0]
+        except (ValueError, TypeError, IndexError):
+            south, west, north, east = 44.05, 27.55, 45.95, 29.35
+        span = max(0.2, (east - west) * 1.12)
+        return (south + north) / 2, (west + east) / 2, span
+
+    def fit_all(self):
+        self.center_lat, self.center_lon, self.span = self._initial_view()
+        self.request_redraw()
+
+    def zoom(self, factor):
+        self.span = max(0.04, min(25.0, self.span / factor))
+        self.request_redraw()
+
+    def projector(self):
+        width = self.canvas.winfo_width() or 900
+        height = self.canvas.winfo_height() or 560
+        return geo.Projector(width, height, self.center_lat, self.center_lon, self.span)
+
+    def select(self, mmsi):
+        self.selected = mmsi
+        self.request_redraw()
+
+    # -- мышь
+    def _on_press(self, event):
+        self._press = (event.x, event.y)
+        self._press_geo = self.projector().to_geo(event.x, event.y)
+
+    def _on_motion(self, event):
+        if not self._press or not self._press_geo:
+            return
+        if abs(event.x - self._press[0]) < 3 and abs(event.y - self._press[1]) < 3:
+            return
+        width = self.canvas.winfo_width() or 900
+        height = self.canvas.winfo_height() or 560
+        projector = self.projector()
+        lat_g, lon_g = self._press_geo
+        self.center_lon = lon_g - (event.x - width / 2) / projector.px_per_km / (
+            111.32 * projector.cos_lat)
+        self.center_lat = lat_g + (event.y - height / 2) / projector.px_per_km / 111.32
+        self.center_lat = max(-85.0, min(85.0, self.center_lat))
+        self.center_lon = max(-180.0, min(180.0, self.center_lon))
+        self.request_redraw()
+
+    def _on_release(self, event):
+        moved = self._press and (abs(event.x - self._press[0]) > 3
+                                 or abs(event.y - self._press[1]) > 3)
+        if not moved:
+            mmsi = self.pick(event.x, event.y)
+            self.selected = mmsi
+            self.on_select(mmsi)
+            self.request_redraw()
+        self._press = None
+        self._press_geo = None
+
+    def _on_wheel(self, event):
+        self.zoom(1.2 if event.delta > 0 else 1 / 1.2)
+
+    def pick(self, x, y):
+        best = None
+        for hit_x, hit_y, mmsi in self._hits:
+            distance = ((hit_x - x) ** 2 + (hit_y - y) ** 2) ** 0.5
+            if distance <= 14 and (best is None or distance < best[0]):
+                best = (distance, mmsi)
+        return best[1] if best else None
+
+    # -- отрисовка
+    def draw(self, vessels, target_mmsi):
+        canvas = self.canvas
+        canvas.delete("all")
+        # Get canvas size; if 1x1 (before window mapping), use default
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1:
+            width = 800
+        if height <= 1:
+            height = 560
+        if width < 20 or height < 20:
+            return
+        projector = geo.Projector(width, height, self.center_lat, self.center_lon, self.span)
+        self._draw_grid(projector, width, height)
+        self._draw_ports(projector)
+        self._draw_forecasts(projector, vessels)
+        self._draw_track(projector)
+        self._hits = []
+        now = datetime.now()
+        drawn = 0
+        stale_count = 0
+        for vessel in vessels:
+            lat, lon = vessel.get("lat"), vessel.get("lon")
+            # Если нет координат попадания, но есть назначение порта — помещаем порт в центр цели
+            if lat is None or lon is None:
+                destination = vessel.get("destination") or ""
+                if destination:
+                    # Ищем порт по названию назначения
+                    ports = self.config.get("ports") or []
+                    for port in ports:
+                        if port.get("name") and destination.lower().find(port.get("name").lower()) >= 0:
+                            lat = port.get("lat")
+                            lon = port.get("lon")
+                            break
+                    if lat is None:
+                        # Если порт не найден по названию, берём точку последнего визита
+                        visit = self._last_visit(vessel.get("mmsi"))
+                        if visit:
+                            lat = visit.get("lat")
+                            lon = visit.get("lon")
+                if lat is None or lon is None:
+                    continue
+            is_target = vessel["mmsi"] in target_mmsi
+            if self.targets_only and not is_target:
+                continue
+            x, y = projector.to_screen(lat, lon)
+            if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
+                continue
+            drawn += 1
+            self._hits.append((x, y, vessel["mmsi"]))
+            updated = parse_iso(vessel.get("updated_at"))
+            stale = not updated or (now - updated).total_seconds() > self.stale_seconds()
+            if stale:
+                stale_count += 1
+            # Цвета в зависимости от типа и схемatical режима
+            if is_target:
+                color, radius = "#ff3b30", 5
+            elif ais_feed.is_tanker_code(vessel.get("type_code")):
+                color, radius = "#ffd166", 4
+            else:
+                color, radius = "#7fa8bf", 3
+            if self.schematic_view:
+                # Схемatical view: более насыщенные, упрощенные цвета
+                if color == "#ff3b30": color = "#c62828"
+                elif color == "#ffd166": color = "#fb8c00"
+                elif color == "#7fa8bf": color = "#42a5f5"
+            if stale:
+                color = "#4b6472"
+            if vessel["mmsi"] == self.selected:
+                canvas.create_oval(x - 11, y - 11, x + 11, y + 11, outline="#ffffff", width=2)
+            course = vessel.get("cog")
+            if course is None:
+                course = vessel.get("heading")
+            if course is not None:
+                angle = math.radians(float(course))
+                dx, dy = math.sin(angle), -math.cos(angle)
+                canvas.create_line(x, y, x + dx * 14, y + dy * 14, fill=color, width=1 if self.schematic_view else 1)
+            canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                               fill=color, outline="" if self.schematic_view else "")
+            if drawn % 7 == 0 and vessel.get("name"):
+                if self.schematic_view:
+                    canvas.create_text(x + 7, y - 7, text="", anchor="w",
+                                       fill="#5d7280", font=("Consolas", 5))
+                else:
+                    canvas.create_text(x + 7, y - 7, text=vessel["name"], anchor="w",
+                                       fill="#d7e6ee" if not stale else "#5d7280",
+                                       font=("Consolas", 7))
+        self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_count)
+
+    def _last_visit(self, mmsi):
+        """Последний визит судна (или None): у точки входа колонки lat/lon."""
+        if not self.store or not mmsi:
+            return None
+        try:
+            visits = self.store.visits(1, mmsi=str(mmsi))
+        except Exception:
+            return None
+        return visits[0] if visits else None
+
+    def _draw_grid(self, projector, width, height):
+        canvas = self.canvas
+        # Схемatical view: simpler grid with fewer labels
+        if self.schematic_view:
+            step = 5.0
+            color = "#304050"
+            label_color = "#607080"
+            font_size = 6
+        else:
+            step = 0.5
+            color = "#0f2430"
+            label_color = "#2f5b6e"
+            font_size = 7
+        for candidate in (5.0, 1.0, 0.5, 0.25, 0.1):
+            if self.span / candidate <= 12:
+                step = candidate
+                break
+        lat_top, lon_left = projector.to_geo(0, 0)
+        lat_bottom, lon_right = projector.to_geo(width, height)
+        start_lat = int(lat_bottom / step) * step
+        lat = start_lat
+        while lat <= lat_top + step:
+            y = projector.to_screen(lat, projector.center_lon)[1]
+            if 0 <= y <= height:
+                canvas.create_line(0, y, width, y, fill=color)
+                if not self.schematic_view or lat % 5 == 0:
+                    canvas.create_text(4, y + 6, text=f"{lat:.1f}", anchor="w",
+                                       fill=label_color, font=("Consolas", font_size))
+            lat += step
+        start_lon = int(lon_left / step) * step
+        lon = start_lon
+        while lon <= lon_right + step:
+            x = projector.to_screen(projector.center_lat, lon)[0]
+            if 0 <= x <= width:
+                canvas.create_line(x, 0, x, height, fill=color)
+                if not self.schematic_view or lon % 5 == 0:
+                    canvas.create_text(x + 3, height - 10, text=f"{lon:.1f}", anchor="w",
+                                       fill=label_color, font=("Consolas", font_size))
+            lon += step
+
+    def _draw_ports(self, projector):
+        canvas = self.canvas
+        for port in self.config.get("ports") or []:
+            try:
+                x, y = projector.to_screen(port["lat"], port["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            radius = max(4.0, projector.km_to_px(float(port.get("radius_km") or 5)))
+            if self.schematic_view:
+                # Схемatical view: simpler port markers (no inner circle / label simplified)
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                   outline="#1c6b42", width=2)
+                canvas.create_text(x, y + radius + 6, text=port.get("name") or "",
+                                   fill="#607080", font=("Consolas", 6, "bold"))
+            else:
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                   outline="#1f7a52", dash=(3, 3))
+                canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#35d08a", outline="")
+                canvas.create_text(x, y - radius - 8, text=port.get("name") or "",
+                                   fill="#7fe0b3", font=("Consolas", 8, "bold"))
+
+    def _draw_track(self, projector):
+        if not self.show_tracks or len(self.track) < 2:
+            return
+        points = []
+        for point in self.track:
+            points.extend(projector.to_screen(point["lat"], point["lon"]))
+        if len(points) >= 4:
+            self.canvas.create_line(*points, fill="#c8a24a", width=1, smooth=False)
+
+    def _forecast_for(self, vessel):
+        """Прогноз маршрута с кэшем: пересчёт только при новых данных AIS."""
+        key = (vessel.get("updated_at"), vessel.get("sog"), vessel.get("cog"),
+               vessel.get("heading"), vessel.get("destination"))
+        mmsi = vessel.get("mmsi")
+        cached = self._forecast_cache.get(mmsi)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            points = forecast.route(vessel, self.config.get("ports") or [])
+        except Exception:
+            points = []
+        if len(self._forecast_cache) > 5000:
+            self._forecast_cache.clear()
+        self._forecast_cache[mmsi] = (key, points)
+        return points
+
+    def _draw_forecasts(self, projector, vessels):
+        """Линии прогноза: пунктир — ожидаемый путь, метки — сутки вперёд."""
+        if not self.show_forecast:
+            return
+        canvas = self.canvas
+        for vessel in vessels:
+            is_selected = vessel.get("mmsi") == self.selected
+            if self.targets_only and not is_selected:
+                continue
+            points = self._forecast_for(vessel)
+            if len(points) < 2:
+                continue
+            coords = []
+            for point in points:
+                x, y = projector.to_screen(point["lat"], point["lon"])
+                coords.extend((x, y))
+            if len(coords) < 4:
+                continue
+            color = "#39d3ff" if is_selected else "#2b6f80"
+            canvas.create_line(*coords, fill=color, dash=(4, 3),
+                               width=2 if is_selected else 1)
+            if is_selected:
+                for point in forecast.daily_points(points):
+                    x, y = projector.to_screen(point["lat"], point["lon"])
+                    canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                       outline=color, width=1)
+                    canvas.create_text(x + 6, y - 6, text=point["label"], anchor="w",
+                                       fill="#8fe6ff", font=("Consolas", 7))
+
+    def stale_seconds(self):
+        """Через сколько секунд без сообщений судно считается устаревшим."""
+        try:
+            minutes = float(self.config.get("stale_minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 15.0
+        if minutes <= 0:
+            return float("inf")
+        return minutes * 60
+
+    def _draw_legend(self, width, height, vessels, targets, drawn, stale):
+        fresh = drawn - stale
+        self.canvas.create_text(
+            10, 10, anchor="nw",
+            text=(f"источник: живой AIS (AISStream)\n"
+                  f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
+                  f"свежих: {fresh}   без данных > {self._stale_label()}: {stale}\n"
+                  f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}"),
+            fill="#5f8ea3", font=("Consolas", 8))
+
+    def _stale_label(self):
+        seconds = self.stale_seconds()
+        if seconds == float("inf"):
+            return "—"
+        return f"{int(round(seconds / 60))} мин"
+
+
+# ------------------------------------------------------------------ приложение
+
+class App:
+    def __init__(self, tk, ttk, messagebox, root, config, store, config_path):
+        self.tk = tk
+        self.ttk = ttk
+        self.messagebox = messagebox
+        self.root = root
+        self.config = config
+        self.store = store
+        self.config_path = Path(config_path)
+        self.events = queue.Queue()
+        self.selected = None
+        self.core = RadarCore(config, store, log=self.log, on_alert=self.on_alert)
+        self.core.on_service_status = self._on_service_status
+        self.bot = None
+        self._targets = {}
+        self._banner_job = None
+        self._key_checking = False
+        self._photo_image = None
+        self._photo_for = None
+
+        self.root.title("Ship Tracker")
+        self.root.geometry("1240x820")
+        self.root.minsize(1000, 680)
+
+        self.build()
+        self.enable_clipboard()
+        self.core.start()
+        self.start_bot()
+        self.root.after(250, self.drain)
+        self.root.after(600, self.fast_tick)
+        self.root.after(2500, self.slow_tick)
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        if not (config.get("api_key") or "").strip():
+            self.log("Ключ AISStream не задан: откройте вкладку «Подключение» и вставьте ключ "
+                     "(бесплатно на aisstream.io).")
+
+    # -- журнал и события из фоновых потоков
+    def log(self, message):
+        self.events.put(("log", message))
+
+    def on_alert(self, alert):
+        self.events.put(("alert", alert))
+
+    def drain(self):
+        self.drain_once()
+        self.root.after(250, self.drain)
+
+    def drain_once(self):
+        """Забирает сообщения из очереди (в главном потоке)."""
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                if kind == "log":
+                    self.append_log(payload)
+                elif kind == "alert":
+                    self.show_banner(payload)
+                elif kind == "photo":
+                    self.show_photo(*payload)
+        except queue.Empty:
+            pass
+
+    def append_log(self, message):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def show_banner(self, alert):
+        self.banner.configure(
+            text=f"🚨 {alert.get('name')}: {alert.get('origin')} → {alert.get('destination')} · "
+                 f"{fmt_number(alert.get('sog'))} уз")
+        self.banner.pack(fill="x", padx=10, pady=(0, 4), before=self.notebook)
+        try:
+            self.root.bell()
+        except Exception:
+            pass
+        if self._banner_job:
+            self.root.after_cancel(self._banner_job)
+        self._banner_job = self.root.after(25000, self.hide_banner)
+
+    def hide_banner(self):
+        self._banner_job = None
+        self.banner.pack_forget()
+
+    # -- построение окна
+    def build(self):
+        tk, ttk = self.tk, self.ttk
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(header, text="Ship Tracker", font=("Segoe UI", 16, "bold")).pack(side="left")
+        ttk.Label(header, text="  живой AIS · Дунай · танкеры в Измаил и Рени",
+                  foreground="#555").pack(side="left")
+        self.conn_var = tk.StringVar(value="поток: —")
+        ttk.Label(header, textvariable=self.conn_var, foreground="#555").pack(side="right")
+
+        self.banner = ttk.Label(self.root, text="", background="#b3261e", foreground="#ffffff",
+                                font=("Segoe UI", 11, "bold"), anchor="center", padding=6)
+        self.banner.pack(fill="x", padx=10, pady=(0, 4))
+        self.banner.pack_forget()
+
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=10, pady=4)
+        self.notebook = notebook
+
+        self.tab_radar = ttk.Frame(notebook)
+        self.tab_vessels = ttk.Frame(notebook)
+        self.tab_alerts = ttk.Frame(notebook)
+        self.tab_visits = ttk.Frame(notebook)
+        self.tab_connection = ttk.Frame(notebook)
+        self.tab_filters = ttk.Frame(notebook)
+        self.tab_telegram = ttk.Frame(notebook)
+        self.tab_services = ttk.Frame(notebook)
+        self.tab_log = ttk.Frame(notebook)
+        for tab, title in ((self.tab_radar, "Радар"),
+                           (self.tab_vessels, "Все суда"), (self.tab_visits, "Стоянки"),
+                           (self.tab_alerts, "Алерты"),
+                           (self.tab_connection, "Подключение"), (self.tab_filters, "Фильтры"),
+                           (self.tab_telegram, "Telegram"), (self.tab_services, "Сервисы"),
+                           (self.tab_log, "Журнал")):
+            notebook.add(tab, text=title)
+
+        self.build_radar()
+        self.build_vessels()
+        self.build_visits()
+        self.build_alerts()
+        self.build_connection()
+        self.build_filters()
+        self.build_telegram()
+        self.build_services()
+        self.build_log()
+
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", padx=10, pady=(2, 8))
+        ttk.Button(bar, text="▶ Запустить поток", command=self.start_core).pack(side="left")
+        ttk.Button(bar, text="■ Остановить", command=self.stop_core).pack(side="left", padx=(6, 0))
+        self.stats_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.stats_var, foreground="#555").pack(side="left", padx=16)
+        ttk.Button(bar, text="Открыть папку данных",
+                   command=lambda: open_folder(DATA_DIR)).pack(side="right")
+
+    def build_radar(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_radar
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", pady=(6, 2))
+        self.canvas_holder = ttk.PanedWindow(frame, orient="horizontal")
+        self.canvas_holder.pack(fill="both", expand=True, padx=2, pady=(0, 4))
+        canvas_frame = ttk.Frame(self.canvas_holder)
+        panel = ttk.Frame(self.canvas_holder, width=310)
+        self.canvas_holder.add(canvas_frame, weight=4)
+        self.canvas_holder.add(panel, weight=1)
+
+        self.radar = RadarCanvas(tk, canvas_frame, self.config, self.select_vessel,
+                                 self.redraw_map, self.store)
+        self.radar.canvas.pack(fill="both", expand=True)
+
+        # Force geometry update so canvas gets proper size
+        self.canvas_holder.update_idletasks()
+        canvas_frame.update_idletasks()
+        self.radar.canvas.update_idletasks()
+
+        ttk.Button(toolbar, text="−", width=3,
+                   command=lambda: self.radar.zoom(1 / 1.3)).pack(side="left")
+        ttk.Button(toolbar, text="+", width=3,
+                   command=lambda: self.radar.zoom(1.3)).pack(side="left", padx=(2, 0))
+        ttk.Button(toolbar, text="Весь район", command=self.radar.fit_all).pack(side="left", padx=(6, 0))
+        self.var_targets_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="только цели", variable=self.var_targets_only,
+                        command=self.toggle_targets_only).pack(side="left", padx=(12, 0))
+        self.var_tracks = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="трек", variable=self.var_tracks,
+                        command=self.toggle_tracks).pack(side="left", padx=(8, 0))
+        self.var_forecast = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="прогноз 5 дн", variable=self.var_forecast,
+                        command=self.toggle_forecast).pack(side="left", padx=(8, 0))
+        self.var_schematic = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="схематический вид", variable=self.var_schematic,
+                        command=self.toggle_schematic).pack(side="left", padx=(8, 0))
+        ttk.Label(toolbar, text="колесо — масштаб, перетаскивание — сдвиг, клик — карточка судна",
+                  foreground="#777").pack(side="left", padx=12)
+
+        self.photo_label = tk.Label(panel, text="фото судна", background="#eef2f4",
+                                    foreground="#777", height=9, width=34,
+                                    relief="flat", anchor="center")
+        self.photo_label.pack(fill="x", padx=(8, 0), pady=(0, 4))
+        self.photo_note = ttk.Label(panel, text="", foreground="#777", wraplength=300)
+        self.photo_note.pack(fill="x", padx=(8, 0))
+
+        self.detail_text = tk.Text(panel, width=36, height=20, wrap="word", state="disabled",
+                                   font=("Consolas", 9), background="#f7f9fa")
+        self.detail_text.pack(fill="both", expand=True, padx=(8, 0), pady=0)
+
+    def build_vessels(self):
+        ttk = self.ttk
+        frame = self.tab_vessels
+        ttk.Label(frame, text="Только суда, связанные с нашими портами: стоят или проходят "
+                              "рядом, идут в порт или вышли из него, либо уже были в нём "
+                              "(свежие сверху).", foreground="#555").pack(
+            anchor="w", padx=8, pady=(8, 4))
+        self.vessels_tree = self.make_tree(
+            frame, (                    ("name", "Судно", 170), ("flag", "Флаг", 140), ("type", "Тип", 100),
+                    ("size", "Размеры", 115),
+                    ("dest", "Назначение", 140), ("left", "До прибытия", 150),
+                    ("stay", "Стоянка в порту", 170), ("cargo", "Груз (оценка)", 130),
+                    ("cargo_kind", "Что везёт", 235),
+                    ("sog", "Узлы", 55),
+                    ("port", "В порту", 100),
+                    ("updated", "Обновлено", 115), ("mmsi", "MMSI", 90)))
+
+    def build_visits(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_visits
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="Стоянки судов в наших портах: когда пришло, когда ушло, "
+                            "сколько простояло, с какой осадкой и грузом.",
+                  foreground="#555").pack(side="left")
+        ttk.Button(top, text="Обновить", command=self.refresh_visits).pack(side="right")
+        ttk.Button(top, text="Загрузить из истории", command=self.load_history_stays
+                   ).pack(side="right", padx=(0, 6))
+        self.visits_info = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.visits_info, foreground="#555").pack(
+            anchor="w", padx=8, pady=(0, 4))
+        self.visits_tree = self.make_tree(
+            frame, (("name", "Судно", 180), ("port", "Порт", 110),
+                    ("arrived", "Пришёл", 130), ("left", "Ушёл", 130),
+                    ("stay", "Стоянка", 110), ("draft", "Осадка вход→выход", 150),
+                    ("cargo", "Груз", 230), ("source", "Источник", 90)))
+
+    def refresh_visits(self):
+        tree = getattr(self, "visits_tree", None)
+        if not tree:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        open_visits = 0
+        for visit in self.store.visits(300):
+            vessel = self.store.vessel(visit.get("mmsi")) or {}
+            entered = parse_iso(visit.get("entered_at"))
+            left = parse_iso(visit.get("left_at"))
+            if left and entered:
+                stay = span_text((left - entered).total_seconds() / 3600)
+            elif entered:
+                stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
+                open_visits += 1
+            else:
+                stay = "—"
+            draft_in = visit.get("draft_in")
+            draft_out = visit.get("draft_out")
+            if draft_in is None and draft_out is None:
+                draft = "—"
+            else:
+                draft = f"{fmt_number(draft_in)} → {fmt_number(draft_out)} м"
+            tree.insert("", "end", values=(
+                vessel.get("name") or f"MMSI {visit.get('mmsi')}",
+                visit.get("port"),
+                self.fmt_time(visit.get("entered_at")),
+                self.fmt_time(visit.get("left_at")) if left else "на месте",
+                stay,
+                draft,
+                visit.get("cargo_kind") or self.cargo_kind_text(vessel),
+                "история" if visit.get("source") == "track" else "наблюдение",
+            ))
+        counts = self.store.counts()
+        self.visits_info.set(
+            f"Визитов в базе: {counts['visits']}, из них открыто сейчас: {open_visits}. "
+            f"Источники: «наблюдение» — геозона порта по живому AIS (считается с момента "
+            f"входа, время идёт по часам); «история» — трек за сутки и свои позиции "
+            f"за {self.config.get('history_days', 7)} дн.")
+
+    def load_history_stays(self):
+        if getattr(self, "_history_loading", False):
+            self.log("Загрузка истории стоянок уже идёт — подождите.")
+            return
+        self._history_loading = True
+        threading.Thread(target=self._load_history_worker, daemon=True).start()
+
+    def _load_history_worker(self):
+        self.log("История стоянок: запрашиваю треки судов из базы…")
+        try:
+            result = self.core.import_history_stays(limit=25, pause=0.5)
+        except Exception as error:
+            self.log(f"История стоянок: ошибка — {error}")
+        else:
+            self.log(f"История стоянок: проверено судов {result['checked']}, "
+                     f"новых визитов {result['imported']}"
+                     + (f", ошибок {result['failed']}" if result.get("failed") else "") + ".")
+        finally:
+            self._history_loading = False
+
+    def build_alerts(self):
+        ttk = self.ttk
+        frame = self.tab_alerts
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="Журнал алертов: что отправлено и с каким результатом.",
+                  foreground="#555").pack(side="left")
+        ttk.Button(top, text="Обновить", command=self.refresh_alerts).pack(side="right")
+        self.alerts_tree = self.make_tree(
+            frame, (("time", "Время", 120), ("name", "Судно", 190), ("route", "Маршрут", 220),
+                    ("status", "Статус", 90), ("error", "Ошибка", 260)))
+
+    def build_connection(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_connection
+        box = ttk.Frame(frame)
+        box.pack(fill="x", padx=10, pady=8)
+        box.columnconfigure(1, weight=1)
+
+        self.var_key = tk.StringVar(value=self.config.get("api_key", ""))
+        ttk.Label(box, text="API-ключ").grid(row=0, column=0, sticky="nw", pady=4)
+        key_row = ttk.Frame(box)
+        key_row.grid(row=0, column=1, sticky="ew", pady=4)
+        key_row.columnconfigure(0, weight=1)
+        key_entry = ttk.Entry(key_row, textvariable=self.var_key, show="*")
+        key_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(key_row, text="Вставить из буфера",
+                   command=self.paste_key).grid(row=0, column=1, padx=(6, 0))
+        show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(key_row, text="показать", variable=show,
+                        command=lambda: key_entry.config(show="" if show.get() else "*")
+                        ).grid(row=0, column=2, sticky="w", padx=(6, 0))
+        self.key_info = tk.StringVar()
+        ttk.Label(key_row, textvariable=self.key_info, foreground="#777").grid(
+            row=1, column=0, columnspan=3, sticky="w")
+        self.var_key.trace_add("write", lambda *_: self.update_key_info())
+        self.update_key_info()
+
+        self.var_bboxes = tk.StringVar(value=format_bboxes(self.config.get("bounding_boxes")))
+        ttk.Label(box, text="Район подписки").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(box, textvariable=self.var_bboxes).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(box, text="юг, запад, север, восток; несколько районов — через «;»",
+                  foreground="#777").grid(row=2, column=1, sticky="w")
+
+        # Все каналы, с которыми работает программа
+        self.var_use_ow = tk.BooleanVar(value=bool(self.config.get("use_openwaters", True)))
+        self.var_ow_token = tk.StringVar(value=self.config.get("openwaters_token", ""))
+        self.var_use_snapshot = tk.BooleanVar(value=bool(self.config.get("use_snapshot", True)))
+        self.var_snapshot_minutes = tk.StringVar(value=str(self.config.get("snapshot_minutes", 10)))
+        # Additional service toggles
+        self.feed_status = {}
+        self.var_use_vf = tk.BooleanVar(value=bool(self.config.get("use_vf", False)))
+        self.var_use_mt = tk.BooleanVar(value=bool(self.config.get("use_mt", False)))
+        self.var_use_mst = tk.BooleanVar(value=bool(self.config.get("use_mst", False)))
+        self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
+        # Ключи API сервисов, которым они нужны
+        self.var_vf_key = tk.StringVar(value=self.config.get("vf_key", ""))
+        self.var_mt_key = tk.StringVar(value=self.config.get("mt_key", ""))
+        self.var_mst_key = tk.StringVar(value=self.config.get("mst_key", ""))
+        self.feed_status.update({
+            "vf": tk.StringVar(), "mt": tk.StringVar(),
+            "mst": tk.StringVar(), "dt": tk.StringVar(),
+        })
+        for key in self.feed_status:
+            self.feed_status[key].set(self.service_status_text(key))
+
+        ttk.Label(box, text="Подключения").grid(row=4, column=0, sticky="nw", pady=(16, 4))
+        links = ttk.LabelFrame(box, text="Каналы данных")
+        links.grid(row=4, column=1, sticky="ew", pady=(16, 4))
+        links.columnconfigure(1, weight=1)
+
+        # 1. AISStream — основной поток
+        ttk.Label(links, text="AISStream", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(8, 6), pady=(6, 2))
+        self.feed_status["ais"] = tk.StringVar(value="не запущен")
+        ttk.Label(links, textvariable=self.feed_status["ais"], foreground="#555"
+                  ).grid(row=0, column=1, sticky="w", pady=(6, 2))
+        ais_row = ttk.Frame(links)
+        ais_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=8)
+        ttk.Label(ais_row, text="живой поток wss://stream.aisstream.io (ключ выше)",
+                  foreground="#777").pack(side="left")
+        ttk.Button(ais_row, text="Проверить", command=self.check_key
+                   ).pack(side="left", padx=(8, 0))
+        ttk.Button(ais_row, text="Открыть aisstream.io",
+                   command=lambda: webbrowser.open(AIRSTREAM_SITE)).pack(side="left", padx=(6, 0))
+
+        # 2. Open Waters — второй живой поток
+        ttk.Checkbutton(links, text="Open Waters AIS — второй живой поток (совместим с AISStream)",
+                        variable=self.var_use_ow).grid(row=2, column=0, columnspan=2,
+                                                       sticky="w", padx=4, pady=(10, 0))
+        self.feed_status["ow"] = tk.StringVar(value="не запущен")
+        ttk.Label(links, textvariable=self.feed_status["ow"], foreground="#555"
+                  ).grid(row=3, column=0, columnspan=2, sticky="w", padx=30)
+        ow_row = ttk.Frame(links)
+        ow_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=30, pady=(2, 0))
+        ttk.Label(ow_row, text="Токен:").pack(side="left")
+        ttk.Entry(ow_row, textvariable=self.var_ow_token, width=28, show="*"
+                  ).pack(side="left", padx=(6, 0))
+        ttk.Button(ow_row, text="Проверить", command=self.check_openwaters
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Button(ow_row, text="Открыть openwaters.io",
+                   command=lambda: webbrowser.open("https://openwaters.io/ais/")
+                   ).pack(side="left", padx=(6, 0))
+
+
+        # 3. Снимок района — последние известные позиции всех судов вокруг портов
+        ttk.Checkbutton(links, text="Снимок района — все известные суда вокруг наших портов",
+                        variable=self.var_use_snapshot).grid(row=5, column=0, columnspan=3,
+                                                             sticky="w", padx=4, pady=(10, 0))
+        self.feed_status["snap"] = tk.StringVar(value="не запущен")
+        ttk.Label(links, textvariable=self.feed_status["snap"], foreground="#555"
+                  ).grid(row=6, column=0, columnspan=3, sticky="w", padx=30)
+        snap_row = ttk.Frame(links)
+        snap_row.grid(row=7, column=0, columnspan=3, sticky="w", padx=30, pady=(2, 8))
+        ttk.Label(snap_row, text="обновлять каждые").pack(side="left")
+        ttk.Entry(snap_row, textvariable=self.var_snapshot_minutes, width=5).pack(side="left", padx=(4, 0))
+        ttk.Label(snap_row, text="мин (ключ не нужен)").pack(side="left", padx=(4, 8))
+        ttk.Button(snap_row, text="Проверить сейчас", command=self.check_snapshot).pack(side="left")
+
+        # 4. Дополнительные подключения — каждый сервис отдельным блоком, как Open Waters
+        ttk.Separator(links, orient="horizontal").grid(
+            row=8, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 0))
+        ttk.Label(links, text="Дополнительные подключения",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=9, column=0, columnspan=3, sticky="w", padx=(8, 6), pady=(8, 2))
+        ttk.Label(links, text="Каждый сервис работает своим потоком и пишет в ту же базу.",
+                  foreground="#777").grid(row=10, column=0, columnspan=3,
+                                          sticky="w", padx=(8, 6), pady=(0, 4))
+
+        row = 11
+        for name, key, desc in SERVICE_BLOCKS:
+            var = getattr(self, f"var_use_{key}")
+            ttk.Checkbutton(links, text=f"{name} — {desc}", variable=var,
+                            command=lambda k=key, v=var: self._on_service_toggle(k, v)
+                            ).grid(row=row, column=0, columnspan=3, sticky="w",
+                                   padx=4, pady=(10, 0))
+            ttk.Label(links, textvariable=self.feed_status[key], foreground="#555"
+                      ).grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=30)
+            service_row = ttk.Frame(links)
+            service_row.grid(row=row + 2, column=0, columnspan=3, sticky="w",
+                             padx=30, pady=(2, 0))
+            key_var = service_key_var(self, key)
+            if key_var is not None:
+                ttk.Label(service_row, text="Ключ:").pack(side="left")
+                ttk.Entry(service_row, textvariable=key_var, width=28, show="*"
+                          ).pack(side="left", padx=(6, 0))
+            else:
+                ttk.Label(service_row, text="ключ не нужен", foreground="#777"
+                          ).pack(side="left")
+            ttk.Button(service_row, text="Проверить",
+                       command=lambda k=key: self.check_service(k)
+                       ).pack(side="left", padx=(6, 0))
+            site_name, site_url = SERVICE_SITES[key]
+            ttk.Button(service_row, text=f"Открыть {site_name}",
+                       command=lambda u=site_url: webbrowser.open(u)
+                       ).pack(side="left", padx=(6, 0))
+            row += 3
+
+        buttons = ttk.Frame(box)
+        buttons.grid(row=5, column=1, sticky="w", pady=(16, 0))
+        ttk.Button(buttons, text="Сохранить и перезапустить",
+                   command=self.save_and_restart).pack(side="left")
+        ttk.Button(buttons, text="Проверить ключ AISStream",
+                   command=self.check_key).pack(side="left", padx=(8, 0))
+
+        hint = (
+            "Три канала и выбранные сервисы работают одновременно и пишут в одну базу.\n"
+            "Дополнительные подключения: у каждого свой блок — галочка, статус, ключ API "
+            "и кнопки «Проверить» / «Открыть сайт». "
+            "Digitraffic работает без ключа, но отдаёт только Балтику.\n\n"
+            "• AISStream — основной живой поток (нужен бесплатный ключ, см. шаги ниже).\n"
+            "• Open Waters AIS — второй живой поток, тот же протокол; токен бесплатный на openwaters.io.\n"
+            "• Снимок района — раз в N минут забирает последние известные позиции всех судов "
+            "вокруг ваших портов, поэтому карта не пустует после запуска и при обрывах связи.\n\n"
+            "Как получить ключ AISStream (бесплатно):\n"
+            "1. Откройте aisstream.io и войдите через GitHub.\n"
+            "2. Нажмите Create API key и скопируйте ключ.\n"
+            "3. Вставьте его выше и нажмите «Проверить».\n\n"
+            "Ключи хранятся только в data/config.json на этом компьютере."
+        )
+        ttk.Label(frame, text=hint, justify="left", foreground="#444").pack(
+            anchor="w", padx=12, pady=(16, 0))
+
+    def build_filters(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_filters
+        box = ttk.Frame(frame)
+        box.pack(fill="x", padx=10, pady=8)
+        box.columnconfigure(1, weight=1)
+
+        self.var_dest = tk.StringVar(value=", ".join(self.config.get("filter_destinations") or []))
+        self.var_orig = tk.StringVar(value=", ".join(self.config.get("filter_origins") or []))
+        self.var_window = tk.StringVar(value=str(self.config.get("trip_window_hours", 96)))
+        self.var_speed = tk.StringVar(value=str(self.config.get("min_speed_knots", 2)))
+        self.var_cooldown = tk.StringVar(value=str(self.config.get("alert_cooldown_hours", 6)))
+        self.var_history = tk.StringVar(value=str(self.config.get("history_days", 7)))
+        self.var_interval = tk.StringVar(value=str(self.config.get("position_interval_seconds", 60)))
+        self.var_stale = tk.StringVar(value=str(self.config.get("stale_minutes", 15)))
+        self.var_watch_km = tk.StringVar(value=str(self.config.get("port_watch_km", 50)))
+
+        # Чекбоксы для выбора портов отслеживания
+        ports_list = self.config.get("ports") or []
+        port_names_unique = []
+        seen_ports = set()
+        for p in ports_list:
+            if isinstance(p, dict) and p.get("name"):
+                pname = str(p["name"]).strip().upper()
+                if pname and pname not in seen_ports:
+                    seen_ports.add(pname)
+                    port_names_unique.append(pname)
+
+        self.port_dest_vars = {}
+        self.port_orig_vars = {}
+        current_dests = [str(x).strip().upper() for x in (self.config.get("filter_destinations") or [])]
+        current_origs = [str(x).strip().upper() for x in (self.config.get("filter_origins") or [])]
+
+        ttk.Label(box, text="Отслеживать суда, идущие в порты:", font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        dest_frame = ttk.Frame(box)
+        dest_frame.grid(row=1, column=0, columnspan=2, sticky="w")
+        for i, pname in enumerate(port_names_unique):
+            var = tk.BooleanVar(value=pname in current_dests)
+            self.port_dest_vars[pname] = var
+            ttk.Checkbutton(dest_frame, text=pname, variable=var).grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 12))
+
+        ttk.Label(box, text="Только из портов отправления:", font=("Segoe UI", 9, "bold")).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 4))
+        orig_frame = ttk.Frame(box)
+        orig_frame.grid(row=3, column=0, columnspan=2, sticky="w")
+        for i, pname in enumerate(port_names_unique):
+            var = tk.BooleanVar(value=pname in current_origs)
+            self.port_orig_vars[pname] = var
+            ttk.Checkbutton(orig_frame, text=pname, variable=var).grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 12))
+
+        ttk.Separator(box, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 8))
+
+        fields_start = 5
+        fields = [
+            ("Окно рейса, часов", self.var_window,
+             "Сколько часов считаются «рейсом» — визит в порт старше окна не считается."),
+            ("Минимальный ход, узлы", self.var_speed, "Стоящее судно целью не считается."),
+            ("Пауза повтора, часов", self.var_cooldown,
+             "По одному судну и маршруту алерт не чаще; 0 — один раз."),
+            ("Хранить историю, дней", self.var_history, "Старые позиции удаляются автоматически."),
+            ("Запись точки раз в, сек", self.var_interval,
+             "Позиции с AIS приходят часто — в базу пишем с этим шагом."),
+            ("Считать устаревшим, мин", self.var_stale,
+             "Судно без сообщений дольше выглядит на карте бледным; 0 — не приглушать."),
+            ("Радиус интереса, км", self.var_watch_km,
+             "Судно ближе этого расстояния к нашему порту считается своим и показывается "
+             "на карте. 20–30 км — порт и подходы; больше — на карту попадёт транзит."),
+        ]
+        for index, (title, var, hint) in enumerate(fields):
+            r = fields_start + index * 2
+            ttk.Label(box, text=title).grid(row=r, column=0, sticky="w", pady=3)
+            ttk.Entry(box, textvariable=var, width=28).grid(row=r, column=1,
+                                                            sticky="w", pady=3)
+            ttk.Label(box, text=hint, foreground="#777").grid(row=r + 1, column=1,
+                                                              sticky="w")
+
+        ttk.Label(frame, text="Порты и геозоны (ИМЯ; широта; долгота; радиус_км)",
+                  foreground="#444").pack(anchor="w", padx=12, pady=(12, 2))
+        self.ports_text = tk.Text(frame, height=8, width=80, font=("Consolas", 9))
+        self.ports_text.pack(fill="x", padx=12)
+        self.ports_text.insert("1.0", format_ports(self.config.get("ports")))
+
+        ttk.Button(frame, text="Сохранить настройки", command=self.save_settings).pack(
+            anchor="w", padx=12, pady=8)
+        ttk.Label(frame, text="После сохранения поток перезапускается, если он был запущен.",
+                  foreground="#777").pack(anchor="w", padx=12)
+
+    def build_telegram(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_telegram
+        box = ttk.Frame(frame)
+        box.pack(fill="x", padx=10, pady=8)
+        box.columnconfigure(1, weight=1)
+
+        self.var_token = tk.StringVar(value=self.config.get("telegram_token", ""))
+        self.var_chat = tk.StringVar(value=self.config.get("telegram_chat_id", ""))
+        self.var_commands = tk.BooleanVar(value=bool(self.config.get("telegram_commands", True)))
+
+        ttk.Label(box, text="Токен бота").grid(row=0, column=0, sticky="w", pady=4)
+        token_entry = ttk.Entry(box, textvariable=self.var_token, show="*")
+        token_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="показать", variable=show,
+                        command=lambda: token_entry.config(show="" if show.get() else "*")
+                        ).grid(row=0, column=2, sticky="w")
+
+        ttk.Label(box, text="chat_id").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(box, textvariable=self.var_chat).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Checkbutton(box, text="принимать команды (/status, /last, /mute)",
+                        variable=self.var_commands).grid(row=2, column=1, sticky="w")
+
+        ttk.Button(box, text="Отправить тестовое сообщение",
+                   command=self.test_telegram).grid(row=3, column=1, sticky="w", pady=8)
+
+        ttk.Label(
+            frame,
+            text="1. @BotFather → /newbot → токен вида 123456:AA...\n"
+                 "2. Напишите боту любое сообщение (без этого он не сможет ответить).\n"
+                 "3. Нажмите «Отправить тестовое сообщение»: если chat_id пуст, программа "
+                 "найдёт его сама и подставит.\n"
+                 "4. Сохраните настройки — алерты пойдут в этот чат.",
+            justify="left", foreground="#444").pack(anchor="w", padx=12, pady=(16, 0))
+
+    def build_services(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_services
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
+        scroll.pack(side="right", fill="y", padx=(0, 10), pady=8)
+
+        ttk.Label(inner, text="Альтернативные источники AIS и сервисы для проверки судов",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        ttk.Label(inner, text="Можно использовать как запасной источник или для перепроверки по MMSI/IMO",
+                  foreground="#555").pack(anchor="w", pady=(0, 12))
+
+        box1 = ttk.LabelFrame(inner, text="Онлайн-сервисы (карточки судов)")
+        box1.pack(fill="x", pady=(0, 10))
+        for name, url in [
+            ("VesselFinder", "https://www.vesselfinder.com/"),
+            ("MarineTraffic", "https://www.marinetraffic.com/"),
+            ("MyShipTracking", "https://www.myshiptracking.com/"),
+            ("AIS Marine Traffic", "https://www.aismarinetraffic.com/"),
+            ("Equasis (тип, дедвейт, владелец)", "https://www.equasis.org/"),
+            ("IMO GISIS (реестр судов)", "https://gisis.imo.org/"),
+            ("Open Waters (карта и API)", "https://openwaters.io/ais/"),
+        ]:
+            f = ttk.Frame(box1)
+            f.pack(fill="x", padx=8, pady=2)
+            ttk.Label(f, text=name, width=18).pack(side="left")
+            ttk.Button(f, text="Открыть", command=lambda u=url: webbrowser.open(u)).pack(side="left")
+
+        box2 = ttk.LabelFrame(inner, text="AIS-потоки (альтернативы AISStream)")
+        box2.pack(fill="x", pady=(0, 10))
+        for name, url, desc in [
+            ("Open Waters AIS", "https://openwaters.io/ais/", "Совместим с протоколом AISStream, агрегирует данные AISHub и др."),
+            ("AISHub", "https://www.aishub.net/", "Бесплатно при наличии своего AIS-приёмника (обмен данными)."),
+            ("Digitraffic (Финляндия)", "https://www.digitraffic.fi/en/marine-traffic/", "Открытые данные, только Балтика."),
+            ("OpenCpn", "https://www.opencpn.org/", "Навигация + приём NMEA AIS по UDP/TCP"),
+            ("AIS-catcher", "https://github.com/jvde-github/AIS-catcher", "Декодер для RTL-SDR, веб-интерфейс, форвард в сети"),
+        ]:
+            f = ttk.Frame(box2)
+            f.pack(fill="x", padx=8, pady=2)
+            ttk.Label(f, text=name, width=22).pack(side="left")
+            ttk.Label(f, text=desc, foreground="#555").pack(side="left", padx=(0, 8))
+            ttk.Button(f, text="Сайт", command=lambda u=url: webbrowser.open(u)).pack(side="right")
+
+        box3 = ttk.LabelFrame(inner, text="Десктопные программы")
+        box3.pack(fill="x", pady=(0, 10))
+        for name, url, desc in [
+            ("OpenCPN", "https://opencpn.org/", "Навигация + приём NMEA AIS по UDP/TCP"),
+            ("AIS-catcher", "https://github.com/jvde-github/AIS-catcher", "Декодер для RTL-SDR, веб-интерфейс, форвард в сети"),
+            ("AIS Dispatcher (AISHub)", "https://www.aishub.net/ais-dispatcher", "Форвардинг данных с приёмника в несколько сетей"),
+        ]:
+            f = ttk.Frame(box3)
+            f.pack(fill="x", padx=8, pady=2)
+            ttk.Label(f, text=name, width=22).pack(side="left")
+            ttk.Label(f, text=desc, foreground="#555").pack(side="left", padx=(0, 8))
+            ttk.Button(f, text="Сайт", command=lambda u=url: webbrowser.open(u)).pack(side="right")
+
+        ttk.Label(inner, text="Подсказка: в карточке судна (панель справа на вкладке Радар) добавлены прямые ссылки для быстрой проверки.",
+                  foreground="#666").pack(anchor="w", pady=(12, 0))
+
+    def build_log(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_log
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=6)
+        ttk.Button(top, text="Очистить журнал",
+                   command=lambda: (self.log_text.configure(state="normal"),
+                                    self.log_text.delete("1.0", "end"),
+                                    self.log_text.configure(state="disabled"))).pack(side="left")
+        ttk.Label(top, text=f"База: {DB_PATH}", foreground="#777").pack(side="right")
+        self.log_text = tk.Text(frame, state="disabled", wrap="word", font=("Consolas", 9))
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scroll.set)
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+        scroll.pack(side="right", fill="y", padx=(0, 8), pady=(0, 8))
+
+    # -- буфер обмена
+    def _walk_widgets(self, widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from self._walk_widgets(child)
+
+    def enable_clipboard(self):
+        """Правый клик и Ctrl+V/C/X/A во всех полях ввода.
+
+        Tkinter сам по себе не делает контекстное меню по правой кнопке, поэтому
+        скопированный из браузера ключ некуда вставить мышью. Здесь каждому
+        полю добавляется меню «Вставить/Копировать/Вырезать/Выделить всё» и
+        привычные сочетания клавиш.
+        """
+        for widget in [self.root, *self._walk_widgets(self.root)]:
+            if not self._is_text_input(widget):
+                continue
+            self._add_input_menu(widget)
+            widget.bind("<Control-Insert>", lambda event, w=widget: self._paste(w))
+            widget.bind("<Shift-Insert>", lambda event, w=widget: self._paste(w))
+            widget.bind("<Control-a>", lambda event, w=widget: self._select_all(w))
+            widget.bind("<Control-A>", lambda event, w=widget: self._select_all(w))
+            # при русской раскладке Ctrl+V — это «М», и Tk не вызывает <<Paste>>;
+            # поэтому смотрим на физическую клавишу (keycode), а не на символ
+            widget.bind("<Control-KeyPress>", self._hotkey)
+
+    def _hotkey(self, event):
+        widget = event.widget
+        code = getattr(event, "keycode", None)
+        if code == 65:      # A
+            return self._select_all(widget)
+        if code == 67:      # C
+            widget.event_generate("<<Copy>>")
+            return "break"
+        if code == 88:      # X
+            widget.event_generate("<<Cut>>")
+            return "break"
+        if code == 86:      # V
+            return self._paste(widget)
+        return None
+
+    @staticmethod
+    def _is_text_input(widget) -> bool:
+        try:
+            kind = widget.winfo_class()
+        except Exception:
+            return False
+        return kind in ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox")
+
+    def _select_all(self, widget):
+        try:
+            if widget.winfo_class() == "Text":
+                widget.tag_add("sel", "1.0", "end-1c")
+            else:
+                widget.select_range(0, "end")
+                widget.icursor("end")
+        except Exception:
+            pass
+        return "break"
+
+    def _paste(self, widget):
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            self.log("Буфер обмена пуст — скопируйте текст и повторите.")
+            return "break"
+        try:
+            if widget.winfo_class() == "Text":
+                widget.insert("insert", text)
+            else:
+                widget.insert("insert", text)
+        except Exception:
+            pass
+        return "break"
+
+    def _add_input_menu(self, widget):
+        tk = self.tk
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+        menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставить", command=lambda: self._paste(widget))
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=lambda: self._select_all(widget))
+
+        def popup(event):
+            widget.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        widget.bind("<Button-3>", popup)
+
+    def update_key_info(self):
+        """Подпись под полем ключа: видно, что вставка действительно сработала."""
+        value = (self.var_key.get() or "").strip()
+        if not value:
+            self.key_info.set("ключ не введён")
+        else:
+            self.key_info.set(f"введено символов: {len(value)} (скрыто звёздочками; "
+                              f"нажмите «показать», чтобы увидеть)")
+
+    def paste_key(self):
+        """Кнопка «Вставить из буфера»: чистит пробелы и переводы строк."""
+        try:
+            raw = self.root.clipboard_get()
+        except Exception:
+            self.messagebox.showwarning(
+                "Буфер обмена",
+                "В буфере обмена нет текста.\nСкопируйте ключ на aisstream.io и повторите.")
+            self.log("Вставка ключа: буфер обмена пуст.")
+            return
+        key = clean_key(raw)
+        if not key:
+            self.messagebox.showwarning("Буфер обмена",
+                                        "В буфере обмена нет похожего на ключ текста.")
+            return
+        self.var_key.set(key)
+        self.log(f"Ключ вставлен из буфера: {len(key)} символов, начинается с {key[:4]}…")
+
+    def make_tree(self, parent, columns):
+        ttk = self.ttk
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show="headings", height=18)
+        for key, title, width in columns:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, anchor="w")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=scroll.set, xscrollcommand=xscroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        xscroll.pack(side="bottom", fill="x")
+        tree.bind("<Double-1>", self.on_tree_double_click)
+        return tree
+
+    # -- действия интерфейса
+    def toggle_targets_only(self):
+        self.radar.targets_only = bool(self.var_targets_only.get())
+        self.redraw_map()
+
+    def toggle_tracks(self):
+        self.radar.show_tracks = bool(self.var_tracks.get())
+        self.redraw_map()
+
+    def toggle_forecast(self):
+        self.radar.show_forecast = bool(self.var_forecast.get())
+        self.redraw_map()
+
+    def toggle_schematic(self):
+        """Переключить схематический вид карты."""
+        self.radar.schematic_view = not self.radar.schematic_view
+        self.var_schematic.set(int(self.radar.schematic_view))
+        self.redraw_map()
+
+    def redraw_map(self):
+        try:
+            vessels = self.core.related_vessels(1000)
+            self.radar.draw(vessels, set(self._targets.keys()))
+        except Exception as error:
+            self.log(f"Отрисовка радара: {error}")
+
+    def select_vessel(self, mmsi):
+        self.selected = mmsi
+        self.radar.selected = mmsi
+        self.update_detail()
+        self.update_track()
+        self.load_photo(mmsi)
+        self.redraw_map()
+
+    def on_tree_double_click(self, event):
+        tree = event.widget
+        # Если удалена вкладка «Цели», проверяем только vessels_tree
+        if not hasattr(self, 'targets_tree') and tree != self.vessels_tree:
+            return
+        if hasattr(self, 'targets_tree') and tree not in (self.targets_tree, self.vessels_tree):
+            return
+        selection = tree.selection()
+        if not selection:
+            return
+        tags = tree.item(selection[0], "tags") or ()
+        if not tags:
+            return
+        self.radar.select(tags[0])
+        self.select_vessel(tags[0])
+
+    def update_track(self):
+        if not self.selected:
+            self.radar.track = []
+            return
+        try:
+            self.radar.track = self.store.track(self.selected, self.config.get("history_days") or 7)
+        except Exception:
+            self.radar.track = []
+
+    def update_detail(self):
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", self.detail_report(self.selected))
+        self.detail_text.configure(state="disabled")
+
+    # -- фото судна
+    def load_photo(self, mmsi):
+        """Загружает фото выбранного судна в фоне, чтобы окно не подвисало."""
+        if not mmsi:
+            self._photo_for = None
+            self.clear_photo()
+            return
+        if mmsi == self._photo_for:
+            return
+        self._photo_for = mmsi
+        vessel = self.store.vessel(mmsi) or {}
+        self.clear_photo("фото: загружаю...")
+        threading.Thread(target=self._photo_worker, args=(mmsi, vessel.get("imo")),
+                         daemon=True, name=f"photo-{mmsi}").start()
+
+    def _photo_worker(self, mmsi, imo):
+        try:
+            path = photos.fetch(mmsi, imo, PHOTO_DIR)
+        except Exception:
+            path = None
+        self.events.put(("photo", (mmsi, path)))
+
+    def show_photo(self, mmsi, path):
+        if mmsi != self.selected:
+            return
+        if not path:
+            self.clear_photo("фото: у VesselFinder нет снимка этого судна")
+            return
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            self.clear_photo("фото: нужна библиотека Pillow (pip install pillow)")
+            return
+        try:
+            image = Image.open(path)
+            image.thumbnail((300, 190))
+            self._photo_image = ImageTk.PhotoImage(image)
+            width, height = image.size
+        except Exception as error:
+            self.clear_photo(f"фото: не удалось открыть файл ({error.__class__.__name__})")
+            return
+        # У метки с картинкой width/height задаются в пикселях, а не в знаках.
+        self.photo_label.configure(image=self._photo_image, text="",
+                                   width=width, height=height)
+        self.photo_note.configure(text="фото: VesselFinder")
+
+    def clear_photo(self, note=""):
+        self._photo_image = None
+        self.photo_label.configure(image="", text="фото судна", height=9)
+        self.photo_note.configure(text=note)
+
+    def detail_report(self, mmsi):
+        if not mmsi:
+            return ("Кликните по судну на радаре или дважды щёлкните строку\n"
+                    "в списке «Все суда», чтобы увидеть карточку.\n\n"
+                    "Красные точки — цели, проходящие фильтр.\n"
+                    "Жёлтые — танкеры. Серые — остальные суда.")
+        vessel = self.store.vessel(mmsi)
+        if not vessel:
+            return "Судно не найдено — возможно, оно ушло из района."
+        country, iso2, emoji = flags.flag_for_mmsi(mmsi)
+        lines = [
+            vessel.get("name") or mmsi,
+            f"MMSI: {mmsi}",
+            f"Флаг: {flags.flag_text(mmsi)}" + (f" ({iso2})" if iso2 else ""),
+        ]
+        if vessel.get("imo"):
+            lines.append(f"IMO: {vessel['imo']}")
+        lines += [
+            f"Тип: {ais_feed.type_detail(vessel.get('type_code'))} "
+            f"(код AIS {vessel.get('type_code')}, {vessel.get('type_label') or '—'})",
+            f"Назначение: {vessel.get('destination') or '—'}",
+            f"Скорость: {fmt_number(vessel.get('sog'))} уз",
+            f"Размеры: {self.size_text(vessel)} (длина × ширина)",
+            f"Курс: {fmt_number(vessel.get('cog'))}°",
+            f"Осадка: {fmt_number(vessel.get('draft'))} м",
+            f"В порту: {vessel.get('port') or '—'}",
+            f"Координаты: {fmt_number(vessel.get('lat'))}, {fmt_number(vessel.get('lon'))}",
+            f"Обновлено: {self.fmt_time(vessel.get('updated_at'))}",
+        ]
+        declared = parse_iso(vessel.get("eta_declared"))
+        voyage = self.core.voyage(vessel)
+        if voyage:
+            port_name = voyage.get("port_label") or voyage.get("port")
+            if voyage.get("in_port"):
+                lines.append(f"До прибытия: уже в порту {port_name}")
+            elif voyage.get("hours") is not None:
+                lines.append(f"До прибытия: {duration_text(voyage['hours'])} "
+                             f"({fmt_moment(voyage['eta'])}), "
+                             f"{fmt_number(voyage['distance_km'])} км до {port_name}")
+            else:
+                lines.append(f"До прибытия: скорость слишком мала для расчёта "
+                             f"({fmt_number(voyage['distance_km'])} км до {port_name})")
+        lines.append(f"Срок прибытия (AIS): {fmt_moment(declared) if declared else '—'} "
+                      f"(передаёт капитан, в UTC)")
+        stay = self.core.port_stay(vessel)
+        if stay:
+            stay_port = stay.get("port_label") or stay.get("port")
+            parts = []
+            if stay.get("current_hours") is not None:
+                parts.append(f"стоит {span_text(stay['current_hours'])}")
+            if stay.get("typical_hours"):
+                source = ("по истории судна" if stay.get("scope") == "судно"
+                          else "по истории порта")
+                parts.append(f"обычно {span_text(stay['typical_hours'])} "
+                             f"({source}, визитов: {stay['visits']})")
+            if stay.get("remaining_hours") is not None:
+                parts.append(f"осталось примерно {span_text(stay['remaining_hours'])}")
+            lines.append(f"Стоянка в {stay_port}: "
+                         + ("; ".join(parts) if parts else "наблюдений пока нет"))
+
+        cargo_info = self.core.cargo_estimate(vessel)
+        if cargo_info:
+            share = cargo_info.get("load_share")
+            if share is None:
+                lines.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т; "
+                             f"доля дедвейта неизвестна — полную осадку судна "
+                             f"программа ещё не видела")
+            else:
+                lines.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т "
+                             f"({round(share * 100)} % дедвейта ≈ "
+                             f"{fmt_tons(cargo_info['deadweight_t'])} т)")
+            lines.append(f"  расчёт: {fmt_number(cargo_info['length_m'])} × "
+                         f"{fmt_number(cargo_info['beam_m'])} м, Cb "
+                         f"{cargo_info['block_coefficient']:.2f}, осадка "
+                         f"{fmt_number(cargo_info['draft_m'])} из "
+                         f"{fmt_number(cargo_info['full_draft_m'])} м "
+                         f"({cargo_info['full_draft_source']}), "
+                         f"порожнее ≈ {fmt_tons(cargo_info['lightship_t'])} т")
+            if cargo_info.get("in_ballast"):
+                lines.append("  похоже, судно идёт в балласте: груза мало, "
+                             "остальное — балласт и запасы")
+        elif vessel.get("draft"):
+            lines.append("Груз (оценка): нет длины и ширины корпуса — "
+                         "судно их ещё не передавало")
+
+        kind, kind_detail = cargo.cargo_kind(vessel.get("type_code"))
+        if kind:
+            lines.append(f"Что везёт: {kind} — {kind_detail}")
+            lines.append("  (название груза AIS не передаёт: подпись по типу судна)")
+        target = self._targets.get(mmsi)
+        if target and target.get("eta_calc"):
+            lines.append(f"Прибытие (расчёт): {fmt_moment(target['eta_calc'])} "
+                         f"{duration_text(target.get('eta_hours'))}, "
+                         f"{fmt_number(target.get('distance_km'))} км")
+        lines.append("")
+        # Ссылки на другие сервисы для проверки реальности судна
+        links = []
+        imo_l = vessel.get('imo') or mmsi
+        links.append(f"• VesselFinder: https://www.vesselfinder.com/vessels/details/{imo_l}")
+        links.append(f"• MarineTraffic: https://www.marinetraffic.com/en/ais/details/ships/mmsi:{mmsi}")
+        links.append(f"• MyShipTracking: https://www.myshiptracking.com/vessels?mmsi={mmsi}")
+        links.append(f"• AIS Stream: https://aisstream.io/v0/stream?mmsi={mmsi}")
+        links.append(f"• AIS Hub: https://www.aishub.net/vessels/mmsi:{mmsi}")
+        links.append(f"• Digitraffic: https://www.digitraffic.fi/en/marine-traffic/?mmsi={mmsi}")
+        links.append(f"• OpenCpn: https://www.opencpn.org/")
+        lines.append("Проверка в других сервисах:")
+        for l in links:
+            lines.append(f"  {l}")
+        lines.append("")
+        if target:
+            lines += [
+                "СТАТУС: ЦЕЛЬ",
+                f"Маршрут: {target['origin']} → {target['destination_port']}",
+                f"Вышел из порта: {self.fmt_time(target.get('departed_at'))}",
+                "",
+            ]
+        else:
+            lines += ["СТАТУС: не цель", self.explain(vessel), ""]
+        departures = self.store.departures(mmsi, 5)
+        if departures:
+            lines.append("Визиты в порты (время стоянки):")
+            for visit in departures:
+                entered = parse_iso(visit.get("entered_at"))
+                left_at = parse_iso(visit.get("left_at"))
+                left = self.fmt_time(visit.get("left_at")) if left_at else "на месте"
+                span = ""
+                if entered:
+                    end = left_at or datetime.now()
+                    span = f", {span_text((end - entered).total_seconds() / 3600)}"
+                if left_at is None:
+                    span += " (идёт)"
+                visit_cargo = visit.get("cargo_kind") or ""
+                drafts = ""
+                if visit.get("draft_in") is not None or visit.get("draft_out") is not None:
+                    drafts = (f" · осадка {fmt_number(visit.get('draft_in'))} → "
+                              f"{fmt_number(visit.get('draft_out'))} м")
+                lines.append(f"  {visit['port']}: {self.fmt_time(visit.get('entered_at'))} → {left}{span}"
+                             + (f" · {visit_cargo}" if visit_cargo else "") + drafts)
+        return "\n".join(lines)
+
+    def explain(self, vessel) -> str:
+        if not ais_feed.is_tanker_code(vessel.get("type_code")):
+            return "не танкер: нужен AIS Type 80–89."
+        destination = vessel.get("destination") or ""
+        if not port_matches(destination, self.config.get("filter_destinations")):
+            return (f"назначение «{destination or '—'}» не входит в "
+                    f"{', '.join(self.config.get('filter_destinations') or [])}.")
+        departure = self.store.last_departure(vessel["mmsi"],
+                                             self.config.get("trip_window_hours") or 96)
+        if not departure:
+            return ("танкер идёт куда нужно, но откуда он вышел — пока неизвестно: "
+                    "нужно, чтобы судно прошло через геозону порта при работающей программе.")
+        if not port_matches(departure["port"], self.config.get("filter_origins")):
+            return (f"вышел из {departure['port']}, а нужны "
+                    f"{', '.join(self.config.get('filter_origins') or [])}.")
+        if (vessel.get("sog") or 0) < float(self.config.get("min_speed_knots") or 0):
+            return "скорость ниже порога: судно стоит."
+        if vessel.get("port") and port_matches(vessel["port"],
+                                               self.config.get("filter_destinations")):
+            return "уже в порту назначения."
+        return "условия выполняются, но алерт уже был или выключен."
+
+    def fmt_time(self, value) -> str:
+        moment = parse_iso(value)
+        return moment.strftime("%d.%m.%Y %H:%M") if moment else "—"
+
+    @staticmethod
+    def short_error(error) -> str:
+        """Короткая причина для шапки окна: подробности остаются в журнале."""
+        text = str(error or "")
+        if "429" in text:
+            return "· лимит подключений (429), ждём"
+        if "401" in text or "403" in text:
+            return "· ключ не принят"
+        if "ключ" in text.lower():
+            return "· нужен ключ AISStream"
+        if not text:
+            return ""
+        return "· " + text.split(".")[0][:60]
+
+    def eta_text(self, target) -> str:
+        """Компактное прибытие для таблицы: расчёт + заявленный срок из AIS."""
+        parts = []
+        if target.get("eta_calc"):
+            parts.append(f"{target['eta_calc']:%d.%m %H:%M} "
+                         f"({duration_text(target.get('eta_hours'))})")
+        declared = parse_iso(target.get("eta_declared"))
+        if declared:
+            parts.append(f"AIS: {declared:%d.%m %H:%M}")
+        return " · ".join(parts) if parts else "—"
+
+    # -- периодические обновления
+    def fast_tick(self):
+        try:
+            self._fast_tick()
+        except Exception as error:
+            self.log(f"Обновление окна: {error}")
+        finally:
+            try:
+                self.root.after(700, self.fast_tick)
+            except Exception:
+                pass
+
+    def _fast_tick(self):
+        state = self.core.feed_state()
+        if getattr(self.core, "feed_elsewhere", False) and not self.core.running():
+            conn = "поток: принимает другой процесс · данные из общей базы"
+        elif not state["running"]:
+            conn = "поток остановлен"
+        elif state["connected"]:
+            conn = "поток: на связи"
+        else:
+            conn = f"поток: переподключение {self.short_error(state.get('error'))}".strip()
+        conn += " · живой AIS: реальные суда"
+        self.conn_var.set(conn)
+        self.update_feed_status()
+        self.stats_var.set(
+            f"сообщений AIS: {self.core.stats['events']} · точек записано: "
+            f"{self.core.stats['positions']} · алертов: {self.core.stats['alerts']}")
+        self.redraw_map()
+
+    def update_feed_status(self):
+        """Показывает состояние каждого канала на вкладке «Подключение»."""
+        labels = getattr(self, "feed_status", None)
+        if not labels:
+            return
+        states = {}
+        try:
+            for state in self.core.feeds_state():
+                name = state.get("name") or ""
+                if name.startswith("AISStream"):
+                    states["ais"] = state
+                elif name.startswith("Open Waters"):
+                    states["ow"] = state
+                elif name.startswith("Снимок"):
+                    states["snap"] = state
+        except Exception:
+            states = {}
+        running = self.core.running()
+        elsewhere = bool(getattr(self.core, "feed_elsewhere", False))
+        service_state = getattr(self.core, "service_status", {}) or {}
+        for key, var in labels.items():
+            if key not in ("ais", "ow", "snap"):
+                # внешние API: берём актуальный статус из ядра (в том числе
+                # если сигнал пришёл раньше, чем окно успело его показать)
+                text = service_state.get(key)
+                if not text:
+                    text = self.service_status_text(key)
+                if var.get() != text:
+                    var.set(text)
+                continue
+            state = states.get(key)
+            if not running:
+                text = "принимает другой процесс (общая база)" if elsewhere else "не запущен"
+            elif not state:
+                text = "отключён в настройках"
+            elif state.get("connected"):
+                text = f"на связи, сообщений {state.get('events', 0)}"
+            elif state.get("error"):
+                text = f"переподключение: {self.short_error(state.get('error'))}".strip()
+            else:
+                text = "переподключение"
+            if var.get() != text:
+                var.set(text)
+
+    def slow_tick(self):
+        try:
+            self._slow_tick()
+        except Exception as error:
+            self.log(f"Обновление таблиц: {error}")
+        finally:
+            try:
+                self.root.after(3000, self.slow_tick)
+            except Exception:
+                pass
+
+    def _slow_tick(self):
+        try:
+            self._targets = {target["mmsi"]: target for target in self.core.targets()}
+        except Exception as error:
+            self.log(f"Расчёт целей: {error}")
+            self._targets = {}
+        if hasattr(self, "targets_tree"):
+            self.refresh_targets_table()
+        self.refresh_vessels_table()
+        self.refresh_visits()
+        self.refresh_alerts()
+        self.update_detail()
+        self.update_track()
+        self.redraw_map()
+
+    def refresh_targets_table(self):
+        tree = self.targets_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for target in self._targets.values():
+            tree.insert("", "end", tags=(target["mmsi"],), values=(
+                target.get("name") or "—",
+                flags.flag_text(target["mmsi"]),
+                target.get("imo") or "—",
+                target.get("origin") or "—",
+                self.fmt_time(target.get("departed_at")),
+                target.get("destination") or "—",
+                fmt_number(target.get("sog")),
+                fmt_number(target.get("draft")),
+                self.eta_text(target),
+                self.fmt_time(target.get("updated_at")),
+            ))
+        self.targets_info.set(
+            f"Целей сейчас: {len(self._targets)}. Цель = танкер, который идёт в порт из "
+            f"списка «назначение» и вышел из порта из списка «отправление» (вкладка "
+            f"«Настройки»). Прибытие — расчёт по расстоянию и скорости "
+            f"(курс по прямой), в скобках — срок из AIS, если судно его передало.")
+
+    def refresh_vessels_table(self):
+        tree = self.vessels_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for vessel in self.core.related_vessels(500):
+            tree.insert("", "end", tags=(vessel["mmsi"],), values=(
+                vessel.get("name") or "—",
+                flags.flag_text(vessel["mmsi"]),
+                vessel.get("type_label") or "—",
+                self.size_text(vessel),
+                vessel.get("destination") or "—",
+                self.voyage_text(vessel),
+                self.stay_text(vessel),
+                self.cargo_text(vessel),
+                self.cargo_kind_text(vessel),
+                fmt_number(vessel.get("sog")),
+                vessel.get("port") or "—",
+                self.fmt_time(vessel.get("updated_at")),
+                vessel.get("mmsi"),
+            ))
+
+    def size_text(self, vessel):
+        """Габариты корпуса из AIS: длина × ширина в метрах."""
+        length = vessel.get("length_m")
+        beam = vessel.get("beam_m")
+        if length and beam:
+            return f"{fmt_number(length)} × {fmt_number(beam)} м"
+        if length:
+            return f"{fmt_number(length)} м (ширина не передана)"
+        if beam:
+            return f"ширина {fmt_number(beam)} м (длина не передана)"
+        return "судно ещё не передавало"
+
+    def voyage_text(self, vessel):
+        """Сколько осталось идти до порта назначения (по прямой и текущей скорости)."""
+        try:
+            voyage = self.core.voyage(vessel)
+        except Exception:
+            return "—"
+        if not voyage:
+            return "—"
+        if voyage.get("in_port"):
+            return "уже в порту"
+        if voyage.get("hours") is None:
+            return "нет расчёта"
+        return f"{duration_text(voyage['hours'])} → {voyage['port']}"
+
+    def stay_text(self, vessel):
+        """Сколько судно стоит (и пробудет) в порту назначения."""
+        try:
+            stay = self.core.port_stay(vessel)
+        except Exception:
+            return "—"
+        if not stay:
+            return "—"
+        current = stay.get("current_hours")
+        typical = stay.get("typical_hours")
+        if current is not None and typical:
+            return f"{span_text(current)} из ≈{span_text(typical)}"
+        if current is not None:
+            return f"стоит {span_text(current)}"
+        if typical:
+            return f"обычно ≈{span_text(typical)}"
+        return "нет наблюдений"
+
+    def cargo_text(self, vessel):
+        """Короткая оценка груза для таблицы «Все суда»."""
+        try:
+            info = self.core.cargo_estimate(vessel)
+        except Exception:
+            return "—"
+        if not info:
+            return "—"
+        text = f"≈{fmt_tons(info['cargo_t'])} т"
+        share = info.get("load_share")
+        if share is not None:
+            text += f" ({round(share * 100)} %)"
+        if info.get("in_ballast"):
+            text += " балласт"
+        return text
+
+    def cargo_kind_text(self, vessel):
+        """Что за груз везёт судно — по типу AIS и по имени судна (поиск по ключевым словам)."""
+        # 1) По коду типа AIS (надежный источник: танкер 80 = нефть/нефтепродукты)
+        kind, _ = cargo.cargo_kind((vessel or {}).get("type_code"))
+        # 2) Доп. подсказка по имени судна (AIS не передаёт груз, но имя часто содержит подсказку)
+        name_hint = ""
+        name = (vessel or {}).get("name") or ""
+        if name and kind:
+            lower = name.lower()
+            # Простые ключевые слова в имени судна
+            keywords = [
+                ("oil", "нефть"), ("chem", "химия"), ("carrier", "танкер"),
+                ("gas", "газ"), ("bulk", "балк"), ("product", "продукт"),
+            ]
+            for en, ru in keywords:
+                if en in lower:
+                    name_hint = f" (по имени: {ru})"
+                    break
+        # Если тип АIS известен, используем его, иначе — подсказка по имени
+        if kind:
+            return kind + name_hint
+        if name_hint:
+            return name_hint.strip().lstrip('(').rstrip(')')
+        return "—"
+
+    def refresh_alerts(self):
+        tree = self.alerts_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for alert in self.store.alerts(200):
+            tree.insert("", "end", values=(
+                self.fmt_time(alert.get("sent_at")),
+                alert.get("name") or "—",
+                f"{alert.get('origin') or '—'} → {alert.get('destination') or '—'}",
+                "отправлен" if alert.get("ok") else
+                ("в окне" if (alert.get("error") or "").startswith("только в окне") else "ошибка"),
+                alert.get("error") or "",
+            ))
+
+    # -- настройки
+    def collect_config(self) -> dict:
+        try:
+            boxes = parse_bboxes(self.var_bboxes.get())
+            ports = parse_ports(self.ports_text.get("1.0", "end"))
+        except AppError as error:
+            self.messagebox.showwarning("Проверьте настройки", str(error))
+            raise
+        try:
+            window = float(str(self.var_window.get()).replace(",", "."))
+            speed = float(str(self.var_speed.get()).replace(",", "."))
+            cooldown = float(str(self.var_cooldown.get()).replace(",", "."))
+            history = float(str(self.var_history.get()).replace(",", "."))
+            interval = float(str(self.var_interval.get()).replace(",", "."))
+            stale = float(str(self.var_stale.get()).replace(",", "."))
+            watch_km = float(str(getattr(self, "var_watch_km", None).get() or 50).replace(",", "."))
+            snapshot_minutes = float(str(getattr(self, "var_snapshot_minutes", None).get() or 10)
+                                     .replace(",", "."))
+        except ValueError:
+            self.messagebox.showwarning("Проверьте настройки",
+                                        "Числовые поля должны быть числами.")
+            raise AppError("числовые поля")
+
+        # Приоритет — чекбоксы, если они есть
+        dests = []
+        origs = []
+        if getattr(self, "port_dest_vars", None):
+            for pname, var in self.port_dest_vars.items():
+                try:
+                    if var.get():
+                        dests.append(pname)
+                except Exception:
+                    pass
+        else:
+            dests = split_list(self.var_dest.get())
+        if getattr(self, "port_orig_vars", None):
+            for pname, var in self.port_orig_vars.items():
+                try:
+                    if var.get():
+                        origs.append(pname)
+                except Exception:
+                    pass
+        else:
+            origs = split_list(self.var_orig.get())
+
+        # Store service checkbox states
+        self.config["use_vf"] = bool(getattr(self, "var_use_vf", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_mt"] = bool(getattr(self, "var_use_mt", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_mst"] = bool(getattr(self, "var_use_mst", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
+        # Ключи API внешних сервисов
+        for key, field in SERVICE_KEY_FIELDS.items():
+            var = getattr(self, field, None)
+            if var is not None:
+                self.config[f"{key}_key"] = var.get().strip()
+
+        self.config.update({
+            "api_key": self.var_key.get().strip(),
+            "openwaters_token": getattr(self, "var_ow_token", None).get().strip() if getattr(self, "var_ow_token", None) else self.config.get("openwaters_token", ""),
+            "use_openwaters": bool(getattr(self, "var_use_ow", None).get()) if getattr(self, "var_use_ow", None) else bool(self.config.get("use_openwaters", True)),
+            "use_snapshot": bool(getattr(self, "var_use_snapshot", None).get()) if getattr(self, "var_use_snapshot", None) else bool(self.config.get("use_snapshot", True)),
+            "snapshot_minutes": max(1.0, snapshot_minutes),
+            "bounding_boxes": boxes,
+            "ports": ports,
+            "filter_destinations": dests,
+            "filter_origins": origs,
+            "trip_window_hours": window,
+            "min_speed_knots": speed,
+            "alert_cooldown_hours": cooldown,
+            "history_days": history,
+            "position_interval_seconds": interval,
+            "stale_minutes": max(0.0, stale),
+            "port_watch_km": max(0.0, watch_km),
+            "telegram_token": self.var_token.get().strip(),
+            "telegram_chat_id": self.var_chat.get().strip(),
+            "telegram_commands": bool(self.var_commands.get()),
+        })
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as error:
+            self.messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {error}")
+            raise AppError(str(error))
+        return self.config
+
+    # ----------------------------------------------- статусы внешних сервисов
+
+    def service_status_text(self, key) -> str:
+        """Что показать в статусе сервиса до запуска потока."""
+        var = getattr(self, f"var_use_{key}", None)
+        enabled = bool(var.get()) if var is not None else False
+        if not enabled:
+            return "не подключен"
+        key_var = service_key_var(self, key)
+        if key_var is not None and not key_var.get().strip():
+            return "нужен ключ API"
+        return "ожидает запуска"
+
+    def _on_service_toggle(self, key, var):
+        self.feed_status[key].set(self.service_status_text(key))
+
+    def _on_service_status(self, key, text):
+        """Поток сервиса сообщает реальный статус — обновляем окно."""
+        if key not in getattr(self, "feed_status", {}):
+            return
+        try:
+            self.root.after(0, lambda: self.feed_status[key].set(text))
+        except Exception:
+            pass
+
+    def save_settings(self) -> bool:
+        try:
+            self.collect_config()
+        except AppError:
+            return False
+        self.log("Настройки сохранены.")
+        self.redraw_map()
+        self.start_bot(restart=True)
+        if self.core.running():
+            self.restart_core()
+        return True
+
+    def save_and_restart(self):
+        if self.save_settings() and not self.core.running():
+            self.start_core()
+
+    def restart_core(self):
+        self.core.stop()
+        self.core.start()
+        self.log("Поток AIS перезапущен.")
+
+    def start_core(self):
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        self.core.start()
+        self.start_bot()
+        self.log("Поток AIS запущен.")
+
+    def stop_core(self):
+        self.core.stop()
+        self.log("Поток AIS остановлен.")
+
+    def check_key(self):
+        if getattr(self, "_key_checking", False):
+            self.log("Проверка ключа уже идёт — подождите 15 секунд.")
+            return
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        self._key_checking = True
+        threading.Thread(target=self._check_key_worker, daemon=True).start()
+
+    def check_openwaters(self):
+        if getattr(self, "_ow_checking", False):
+            self.log("Проверка Open Waters уже идёт — подождите 15 секунд.")
+            return
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        self._ow_checking = True
+        threading.Thread(target=self._check_openwaters_worker, daemon=True).start()
+
+    def _check_openwaters_worker(self):
+        ow_token = (self.config.get("openwaters_token") or "").strip()
+        api_key = (self.config.get("api_key") or "").strip()
+        token = ow_token or api_key or "public"
+        if not (self.config.get("use_openwaters", True)):
+            self._ow_checking = False
+            self.log("Open Waters отключён в настройках.")
+            return
+        was_running = self.core.running()
+        if was_running:
+            self.core.stop()
+            self.log("Проверка Open Waters: основной поток на время проверки остановлен.")
+        self.log("Проверка Open Waters: подключаюсь на 15 секунд…")
+        stop = threading.Event()
+        received = {"count": 0, "ships": []}
+
+        def on_event(event):
+            received["count"] += 1
+            name = (event.get("name") or "").strip()
+            mmsi = event.get("mmsi") or ""
+            if name and len(received["ships"]) < 3:
+                received["ships"].append(f"{name} ({flags.flag_text(mmsi)}, MMSI {mmsi})")
+
+        try:
+            feed = ais_feed.AISStreamFeed(token, self.config.get("bounding_boxes"),
+                                          self.config.get("message_types"), on_event,
+                                          self.log, stop,
+                                          stream_url=ais_feed.OPENWATERS_URL, name="ais-feed-ow-check")
+            feed.start()
+            deadline = time.time() + 15
+            while time.time() < deadline and received["count"] == 0 and not feed.last_error:
+                time.sleep(0.5)
+            connected, error = feed.connected, feed.last_error
+        finally:
+            stop.set()
+        try:
+            feed.join(timeout=5)
+        except Exception:
+            pass
+        if connected and received["count"] > 0:
+            self.log(f"Open Waters: подключение работает, получено сообщений {received['count']}.")
+            for ship in received["ships"]:
+                self.log(f"  реальное судно: {ship}")
+        elif connected:
+            self.log("Open Waters: подключение установлено, но за 15 секунд сообщений не было — возможно тихий район.")
+        else:
+            self.log(f"Open Waters: не подключился: {error or 'сервер закрыл соединение'}.")
+        self._ow_checking = False
+        if was_running:
+            try:
+                self.core.start()
+                self.log("Основной поток снова запущен.")
+            except Exception:
+                pass
+
+
+    def _check_key_worker(self):
+        key = (self.config.get("api_key") or "").strip()
+        if not key:
+            self._key_checking = False
+            self.log("Проверка ключа: ключ не задан.")
+            return
+        # AISStream разрешает 3 подключения на аккаунт: своё основное соединение
+        # на время проверки освобождаем, иначе оба получают HTTP 429
+        was_running = self.core.running()
+        if was_running:
+            self.core.stop()
+            self.log("Проверка ключа: основной поток на время проверки остановлен.")
+        self.log("Проверка ключа: подключаюсь к AISStream на 15 секунд…")
+        stop = threading.Event()
+        received = {"count": 0, "ships": []}
+
+        def on_event(event):
+            received["count"] += 1
+            name = (event.get("name") or "").strip()
+            mmsi = event.get("mmsi") or ""
+            if name and len(received["ships"]) < 3:
+                received["ships"].append(f"{name} ({flags.flag_text(mmsi)}, MMSI {mmsi})")
+
+        feed = ais_feed.AISStreamFeed(key, self.config.get("bounding_boxes"),
+                                      self.config.get("message_types"), on_event,
+                                      self.log, stop)
+        try:
+            feed.start()
+            deadline = time.time() + 15
+            while time.time() < deadline and received["count"] == 0 and not feed.last_error:
+                time.sleep(0.5)
+            connected, error = feed.connected, feed.last_error
+        finally:
+            stop.set()
+        feed.join(timeout=5)
+        if connected and received["count"] > 0:
+            self.log(f"Ключ рабочий: за сеанс получено сообщений {received['count']} — "
+                     f"это живые данные настоящих судов.")
+            for ship in received["ships"]:
+                self.log(f"  реальное судно: {ship}")
+        elif connected:
+            self.log("Ключ принят, но сообщений за 15 секунд не было — "
+                     "в этом районе сейчас тихо, попробуйте позже.")
+        else:
+            self.log(f"Ключ не принят: {error or 'сервер закрыл соединение'}.")
+        self._key_checking = False
+        if was_running:
+            self.core.start()
+            self.log("Основной поток снова запущен.")
+
+    def test_telegram(self):
+        """Проверка Telegram в фоне: окно не замирает на время сетевых запросов."""
+        if getattr(self, "_tg_checking", False):
+            self.log("Проверка Telegram уже идёт — подождите.")
+            return
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        self._tg_checking = True
+        threading.Thread(target=self._test_telegram_worker, daemon=True,
+                         name="tg-test").start()
+
+    def _test_telegram_worker(self):
+        token = self.config.get("telegram_token")
+        chat = str(self.config.get("telegram_chat_id") or "").strip()
+        try:
+            if not chat:
+                if self.bot and self.bot.is_alive():
+                    # поток команд уже слушает getUpdates — второй запрос даст 409
+                    raise AppError("chat_id не задан. Напишите боту в Telegram команду /id — "
+                                   "он пришлёт chat_id, вставьте его в поле и повторите.")
+                updates = telegram_call(token, "getUpdates", params={"timeout": 1},
+                                        timeout=15) or []
+                chat_ids = []
+                for update in updates:
+                    message = update.get("message") or {}
+                    chat_id = (message.get("chat") or {}).get("id")
+                    if chat_id and chat_id not in chat_ids:
+                        chat_ids.append(chat_id)
+                if not chat_ids:
+                    raise AppError("chat_id пуст, и сообщений боту ещё не было. "
+                                   "Напишите боту любое сообщение и повторите.")
+                chat = str(chat_ids[-1])
+                self.root.after(0, lambda value=chat: self._apply_found_chat(value))
+            send_telegram(token, chat,
+                          "✅ Ship Tracker на связи. Алерты будут приходить сюда.")
+        except AppError as error:
+            self.log(f"Тест Telegram: {error}")
+            text = str(error)
+            self.root.after(0, lambda: self.messagebox.showerror("Telegram", text))
+        else:
+            self.log("Тест Telegram: сообщение отправлено.")
+            self.root.after(0, lambda: self.messagebox.showinfo(
+                "Telegram", "Сообщение отправлено — проверьте чат с ботом."))
+        finally:
+            self._tg_checking = False
+
+    def _apply_found_chat(self, chat):
+        self.var_chat.set(str(chat))
+        self.config["telegram_chat_id"] = str(chat)
+        save_config(self.config, self.config_path)
+        self.log(f"chat_id найден и сохранён: {chat}")
+
+    # -- телеграм-команды
+    def start_bot(self, restart=False):
+        if restart and self.bot and self.bot.is_alive():
+            # даём старому поллеру выйти из getUpdates, иначе Telegram ответит 409
+            old = self.bot
+            self.bot = None
+            old.stop_event.set()
+            threading.Thread(target=self._restart_bot_worker, args=(old,),
+                             daemon=True, name="tg-restart").start()
+            return
+        if not self.config.get("telegram_commands"):
+            return
+        if not (self.config.get("telegram_token") or "").strip():
+            return
+        if self.bot and self.bot.is_alive():
+            return
+        self.bot = BotCommander(self.config, self.store, self.core, log=self.log)
+        self.bot.start()
+
+    def _restart_bot_worker(self, old):
+        old.join(timeout=30)
+        lock = getattr(old, "_lock", None)
+        if lock is not None:
+            try:
+                lock.close()
+            except OSError:
+                pass
+        self.start_bot()
+
+
+    def check_snapshot(self):
+        """Одна проверка снимка района: сколько судов вокруг портов сейчас известно."""
+        if getattr(self, "_snap_checking", False):
+            self.log("Проверка снимка района уже идёт — подождите.")
+            return
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        self._snap_checking = True
+        threading.Thread(target=self._check_snapshot_worker, daemon=True).start()
+    def _check_snapshot_worker(self):
+        boxes = ais_feed.tile_boxes(self.config.get("bounding_boxes"))
+        if not boxes:
+            self._snap_checking = False
+            self.log("Снимок района: не задан район подписки.")
+            return
+        self.log(f"Снимок района ({len(boxes)} часть(ей) подписки): "
+                 "запрашиваю последние позиции судов…")
+        feed = ais_feed.SnapshotFeed(
+            boxes, lambda event: None, self.log, threading.Event(),
+            interval_minutes=self.config.get("snapshot_minutes") or 10,
+            max_age_hours=self.config.get("snapshot_max_age_hours") or 6,
+            name="snapshot-check")
+        ships = feed.fetch_once()
+        if feed.last_error:
+            self.log(f"Снимок района: {feed.last_error}")
+        elif ships:
+            self.log(f"Снимок района: доступен, судов в районе сейчас {ships}.")
+        else:
+            self.log("Снимок района: доступен, но свежих судов в районе портов нет "
+                     "(данные старше допустимого возраста пропущены).")
+        self._snap_checking = False
+
+    def check_service(self, key):
+        """Одна проверка дополнительного подключения: один запрос и число судов."""
+        checking = getattr(self, "_service_checking", None)
+        if checking is None:
+            checking = self._service_checking = set()
+        title = services_feed.SERVICE_TITLES.get(key, key)
+        if key in checking:
+            self.log(f"Проверка {title} уже идёт — подождите.")
+            return
+        try:
+            self.collect_config()
+        except AppError:
+            return
+        checking.add(key)
+        threading.Thread(target=self._check_service_worker, args=(key,),
+                         daemon=True).start()
+
+    def _check_service_worker(self, key):
+        title = services_feed.SERVICE_TITLES.get(key, key)
+        api_key = (self.config.get(f"{key}_key") or "").strip()
+        self._on_service_status(key, f"проверка {title.lower()}…")
+
+        def finish(text):
+            self._on_service_status(key, text)
+            self._service_checking.discard(key)
+
+        if services_feed.needs_key(key) and not api_key:
+            self.log(f"{title}: не задан ключ API — проверка невозможна.")
+            finish("нужен ключ API")
+            return
+        feed = services_feed.build(
+            key, lambda event: None, self.log, threading.Event(),
+            api_key=api_key, bboxes=self.config.get("bounding_boxes"))
+        if feed is None:
+            self.log(f"{title}: нет доступного API.")
+            finish("нет доступного API")
+            return
+        self.log(f"{title}: проверяю подключение (один запрос)…")
+        try:
+            feed.poll_once()
+        except Exception as error:
+            text = str(error).strip() or error.__class__.__name__
+            self.log(f"{title}: не подключился — {text}")
+            finish(f"ошибка: {text[:60]}")
+            return
+        status = feed.status or f"подключен, судов {feed.events}"
+        self.log(f"{title}: {status}.")
+        finish(status)
+
+    def close(self):
+        try:
+            self.core.stop()
+            if self.bot:
+                self.bot.stop_event.set()
+                self.bot.join(timeout=3)
+        except Exception:
+            pass
+        finally:
+            self.store.close()
+            self.root.destroy()
+
+
+# ------------------------------------------------------------------------ вход
+
+def gui():
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except ImportError:
+        raise AppError("Не найден Tkinter — установите Python с python.org (галочка tcl/tk).")
+
+    config_path = CONFIG_PATH
+    config = load_config(config_path)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        save_config(config, config_path)
+    store = Store(DB_PATH)
+
+    root = tk.Tk()
+    try:
+        app = App(tk, ttk, messagebox, root, config, store, config_path)
+    except Exception:
+        store.close()
+        raise
+    root.mainloop()
+    return app
+
+
+def report_startup_error(error: BaseException) -> Path:
+    """Показывает причину сбоя запуска и пишет её в data/errors.log.
+
+    Без этого окно приложения просто исчезает вместе с консолью, и по
+    сообщению «мигнуло и закрылось» причину не найти.
+    """
+    import traceback
+
+    text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    log_path = DATA_DIR / "errors.log"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+            handle.write(text)
+    except OSError:
+        pass
+    console_log(f"ОШИБКА ЗАПУСКА: {error.__class__.__name__}: {error}")
+    console_log(text.strip())
+
+    summary = f"{error.__class__.__name__}: {error}"
+    body = (f"Приложение не смогло запуститься.\n\n{summary}\n\n"
+            f"Подробности сохранены в файл:\n{log_path}")
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, body, "Ship Tracker — ошибка запуска", 0x10)
+            return log_path
+        except Exception:
+            pass
+    try:
+        from tkinter import messagebox
+        messagebox.showerror("Ship Tracker — ошибка запуска", body)
+    except Exception:
+        pass
+    return log_path
+
+
+def headless(args) -> int:
+    config_path = Path(args.config) if args.config else CONFIG_PATH
+    config = load_config(config_path)
+    if args.api_key:
+        config["api_key"] = args.api_key
+    save_config(config, config_path)
+
+    store = Store(Path(config_path).parent / DB_PATH.name)
+    core = RadarCore(config, store, log=console_log,
+                     on_alert=lambda alert: console_log(
+                         f"АЛЕРТ: {alert['name']} {alert['origin']} → {alert['destination']} "
+                         f"({fmt_number(alert.get('sog'))} уз)"
+                         + (" [Telegram]" if alert.get("ok") else
+                            f" [в окно: {alert.get('error')}]")))
+
+    minutes = float(args.minutes or 1)
+    console_log(f"Запуск без окна на {minutes:g} мин, источник: живой AISStream.")
+    if not (config.get("api_key") or "").strip():
+        console_log("Внимание: ключ AISStream не задан, живой поток не подключится.")
+    core.start()
+    deadline = time.time() + minutes * 60
+    try:
+        while time.time() < deadline:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console_log("Остановка по Ctrl+C.")
+    core.stop()
+
+    counts = store.counts()
+    targets = core.targets()
+    console_log(f"Итог: судов {counts['vessels']}, позиций {counts['positions']}, "
+                f"визитов в порты {counts['visits']}, целей сейчас {len(targets)}, "
+                f"алертов поднято за сеанс {core.stats['alerts']}, "
+                f"отправлено в Telegram сегодня {store.alerts_count_today()}.")
+    for target in targets:
+        console_log(f"  цель: {target['name']} ({target['mmsi']}) "
+                    f"{target['origin']} → {target['destination']} "
+                    f"{fmt_number(target['sog'])} уз, вышел {target.get('departed_at')}")
+    for alert in store.alerts(5):
+        console_log(f"  алерт: {alert['sent_at']} {alert['name']} "
+                    f"{alert['origin']} → {alert['destination']} "
+                    f"{'отправлен' if alert['ok'] else alert['error']}")
+    store.close()
+    return 0
+
+
+def test_telegram_cli(config) -> int:
+    try:
+        send_telegram(config.get("telegram_token"), config.get("telegram_chat_id"),
+                      "✅ Ship Tracker на связи.")
+    except AppError as error:
+        console_log(f"ОШИБКА: {error}")
+        return 1
+    console_log("Тестовое сообщение отправлено.")
+    return 0
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        description="Ship Tracker — наблюдение за судами по живому AIS")
+    parser.add_argument("--headless", action="store_true", help="без окна, только поток и база")
+    parser.add_argument("--minutes", type=float, default=60,
+                        help="сколько минут работать в режиме без окна")
+    parser.add_argument("--api-key", help="ключ AISStream (сохранится в настройки)")
+    parser.add_argument("--config", help="путь к своему config.json")
+    parser.add_argument("--test-telegram", action="store_true", help="проверить Telegram")
+    args = parser.parse_args()
+
+    if args.test_telegram:
+        path = Path(args.config) if args.config else CONFIG_PATH
+        sys.exit(test_telegram_cli(load_config(path)))
+    if args.headless:
+        sys.exit(headless(args))
+    try:
+        gui()
+    except KeyboardInterrupt:
+        pass
+    except SystemExit:
+        raise
+    except BaseException as error:
+        # Любой сбой запуска должен быть виден, а не закрывать окно молча.
+        report_startup_error(error)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+

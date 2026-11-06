@@ -1,0 +1,587 @@
+"""Дополнительные подключения: данные из HTTP-API внешних AIS-сервисов.
+
+Каждый сервис опрашивается своим потоком и отдаёт те же события
+(position / static), что и живые потоки AISStream и Open Waters, поэтому
+данные сразу попадают в общую базу, на карту, в «Все суда» и в «Стоянки».
+
+Что реально умеет каждый сервис (проверено по документации):
+
+  * Digitraffic (Финляндия) — открытый API без ключа, район только Балтика;
+  * MyShipTracking — триал на 2000 кредитов: расширенный ответ /vessel стоит
+    3 кредита за судно, поэтому канал не сканирует район, а обогащает суда,
+    которые уже есть в базе, и не выходит за дневной лимит кредитов;
+  * VesselFinder — API по ключу, /livedata отдаёт суда района подписки;
+  * MarineTraffic — API по ключу, район задаётся в личном кабинете.
+
+Добавить новый сервис — значит дописать здесь класс с методом poll_once
+и зарегистрировать его в PROVIDERS: остальная цепочка уже готова.
+"""
+
+import json
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Названия для журнала и статусов.
+SERVICE_TITLES = {
+    "vf": "VesselFinder",
+    "mt": "MarineTraffic",
+    "mst": "MyShipTracking",
+    "dt": "Digitraffic",
+}
+
+DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
+VESSELFINDER_URL = "https://api.vesselfinder.com/livedata"
+MARINETRAFFIC_URL = "https://services.marinetraffic.com/api/exportvessels-custom-area"
+MYSHIPTRACKING_URL = "https://api.myshiptracking.com/api/v2/vessel/zone"
+MYSHIPTRACKING_VESSEL_URL = "https://api.myshiptracking.com/api/v2/vessel"
+
+
+def _number(value):
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+def _mmsi(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    text = "".join(ch for ch in text if ch.isdigit())
+    if not text:
+        return None
+    return text.zfill(9)
+
+
+def _heading(value):
+    value = _number(value)
+    if value is None:
+        return None
+    value = int(value)
+    return value if 0 <= value <= 359 else None
+
+
+def _time(value):
+    """Время из ISO-строки сервиса в локальное время без часового пояса."""
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone().replace(tzinfo=None)
+    return moment
+
+
+def _position(mmsi, lat, lon, sog=None, cog=None, heading=None, name=None, source="",
+              at=None):
+    lat, lon = _number(lat), _number(lon)
+    if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return None
+    if abs(lat) < 0.001 and abs(lon) < 0.001:
+        return None
+    return {
+        "kind": "position",
+        "mmsi": mmsi,
+        "lat": lat,
+        "lon": lon,
+        "sog": _number(sog),
+        "cog": _number(cog),
+        "heading": heading,
+        "name": name or "",
+        "at": at or datetime.now(),
+        "source": source,
+    }
+
+
+def _static(mmsi, name=None, imo=None, callsign=None, type_code=None,
+            destination=None, draft=None, length_m=None, beam_m=None, source="",
+            eta_declared=None, at=None):
+    return {
+        "kind": "static",
+        "mmsi": mmsi,
+        "name": name or "",
+        "imo": str(imo or "").strip(),
+        "callsign": str(callsign or "").strip(),
+        "type_code": type_code,
+        "destination": destination or "",
+        "draft": _number(draft),
+        "length_m": _number(length_m),
+        "beam_m": _number(beam_m),
+        "eta_declared": eta_declared,
+        "at": at or datetime.now(),
+        "source": source,
+    }
+
+
+def _type_code(value):
+    number = _number(value)
+    if number is None:
+        return None
+    return int(number)
+
+
+class ServiceFeed(threading.Thread):
+    """Опрос одного внешнего сервиса с паузой между запросами."""
+
+    key = ""
+    interval = 300.0
+    # внешний API, а не AIS-поток: не участвует в состоянии «поток на связи»
+    service = True
+
+    def __init__(self, on_event, log, stop_event, api_key="", bboxes=None,
+                 on_status=None, name=None, **options):
+        super().__init__(daemon=True, name=name or f"service-{self.key}")
+        self.on_event = on_event
+        self.log = log or (lambda message: None)
+        self.stop_event = stop_event
+        self.api_key = (api_key or "").strip()
+        self.bboxes = list(bboxes or [])
+        self.on_status = on_status or (lambda key, text: None)
+        self.status = "не подключен"
+        self.events = 0
+        self.last_error = ""
+        self.last_count = -1
+
+    # ------------------------------------------------------------- служебное
+
+    @property
+    def title(self):
+        return SERVICE_TITLES.get(self.key, self.key)
+
+    def set_status(self, text):
+        if text != self.status:
+            self.status = text
+            self.on_status(self.key, text)
+
+    def emit(self, event):
+        if not event:
+            return
+        self.events += 1
+        self.on_event(event)
+
+    def sleep_until_next(self):
+        return self.stop_event.wait(self.interval)
+
+    def fail(self, error):
+        text = str(error).strip() or error.__class__.__name__
+        if text != self.last_error:
+            self.last_error = text
+            self.log(f"{self.title}: {text}")
+        self.set_status(f"ошибка: {text[:60]}")
+
+    def ok(self, count, detail=""):
+        self.last_error = ""
+        tail = f", {detail}" if detail else ""
+        self.set_status(f"подключен, судов {count}{tail}")
+        if count != self.last_count:
+            self.last_count = count
+            self.log(f"{self.title}: получено судов {count}{tail}.")
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                self.poll_once()
+            except Exception as error:  # сеть, лимит, формат — ждём следующий цикл
+                self.fail(error)
+            if self.sleep_until_next():
+                break
+
+    # -------------------------------------------------------------- запросы
+
+    def request(self, url, params=None, headers=None, timeout=30):
+        import requests
+
+        merged = {"User-Agent": "ShipTracker/1.0"}
+        merged.update(headers or {})
+        response = requests.get(url, params=params, headers=merged, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def boxes_lat_lon(self):
+        """Районы подписки [[[lat, lon], [lat, lon]], …]."""
+        result = []
+        for box in self.bboxes:
+            try:
+                (lat1, lon1), (lat2, lon2) = box
+            except (TypeError, ValueError):
+                continue
+            try:
+                result.append((float(lat1), float(lon1), float(lat2), float(lon2)))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def poll_once(self):
+        raise NotImplementedError
+
+
+class DigitrafficFeed(ServiceFeed):
+    """Открытые данные Финляндии: ключ не нужен, район — Балтика."""
+
+    key = "dt"
+    interval = 60.0
+
+    def poll_once(self):
+        data = self.request(
+            DIGITRAFFIC_URL,
+            headers={"Digitraffic-User": "ShipTracker/1.0",
+                     "Accept-Encoding": "gzip"},
+            timeout=40)
+        features = data.get("features") if isinstance(data, dict) else None
+        if not isinstance(features, list):
+            raise RuntimeError("неожиданный ответ сервера")
+
+        boxes = self.boxes_lat_lon()
+        count = 0
+        for feature in features:
+            props = feature.get("properties") or {}
+            coords = (feature.get("geometry") or {}).get("coordinates") or []
+            if len(coords) < 2:
+                continue
+            mmsi = _mmsi(props.get("mmsi") or feature.get("mmsi"))
+            if not mmsi:
+                continue
+            lon, lat = _number(coords[0]), _number(coords[1])
+            if lat is None or lon is None:
+                continue
+            if boxes and not any(
+                    min(a, c) <= lat <= max(a, c) and min(b, d) <= lon <= max(b, d)
+                    for a, b, c, d in boxes):
+                continue
+            count += 1
+            self.emit(_position(mmsi, lat, lon,
+                                sog=props.get("sog"), cog=props.get("cog"),
+                                heading=_heading(props.get("heading")),
+                                source="digitraffic"))
+        detail = "вне района подписки (Балтика)" if count == 0 else ""
+        self.ok(count, detail)
+
+
+class ApiError(RuntimeError):
+    """Отказ API с машинным кодом и HTTP-статусом."""
+
+    def __init__(self, message, code="", status=0):
+        super().__init__(message)
+        self.code = code or ""
+        self.status = int(status or 0)
+
+
+class MyShipTrackingFeed(ServiceFeed):
+    """API v2: расширенные данные по нашим судам с учётом кредитов триала.
+
+    Триал даёт 2000 кредитов на 10 дней, расширенный ответ стоит 3 кредита
+    за судно. Сканировать район бессмысленно и дорого (там сотни чужих
+    судов), поэтому канал обогащает те суда, что уже попали в базу:
+    назначение, ETA, последний/следующий порт, осадка, габариты, флаг.
+    Дневной лимит (mst_daily_coins) растягивает кредиты на весь срок.
+    """
+
+    key = "mst"
+    interval = 7200.0
+
+    def __init__(self, *args, vessels=None, minutes=None, daily_coins=None,
+                 max_vessels=None, state_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vessels = vessels or (lambda: [])
+        self.daily_coins = max(0, int(daily_coins or 0))
+        self.max_vessels = max(1, int(max_vessels or 40))
+        self.state_path = Path(state_path) if state_path else None
+        self.exhausted = False
+        if minutes:
+            self.interval = max(300.0, float(minutes) * 60.0)
+
+    # ------------------------------------------------------- кредиты триала
+
+    def credit_state(self):
+        if not self.state_path:
+            return {}
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def spent_today(self):
+        day = self.credit_state().get("mst") or {}
+        if day.get("date") != datetime.now().strftime("%Y-%m-%d"):
+            return 0
+        try:
+            return int(day.get("spent") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def spent_total(self):
+        try:
+            return int((self.credit_state().get("mst") or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def add_coins(self, coins):
+        if coins <= 0:
+            return
+        state = self.credit_state()
+        today = datetime.now().strftime("%Y-%m-%d")
+        day = state.get("mst") if isinstance(state.get("mst"), dict) else {}
+        if day.get("date") != today:
+            day = {"date": today, "total": day.get("total") or 0}
+        day["spent"] = int(day.get("spent") or 0) + coins
+        day["total"] = int(day.get("total") or 0) + coins
+        state["mst"] = day
+        if not self.state_path:
+            return
+        try:
+            tmp = self.state_path.with_name(self.state_path.name + ".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(self.state_path)
+        except OSError:
+            pass
+
+    # -------------------------------------------------------------- запросы
+
+    def fetch_vessel(self, mmsi):
+        """Один расширенный ответ по MMSI: (данные, списанные кредиты)."""
+        import requests
+
+        response = requests.get(
+            MYSHIPTRACKING_VESSEL_URL,
+            params={"mmsi": mmsi, "response": "extended"},
+            headers={"x-api-key": self.api_key, "Accept": "application/json",
+                     "User-Agent": "ShipTracker/1.0"},
+            timeout=30)
+        try:
+            charged = int(response.headers.get("X-Credit-Charged") or 0)
+        except (TypeError, ValueError):
+            charged = 0
+        try:
+            payload = response.json()
+        except ValueError:
+            raise ApiError(f"HTTP {response.status_code}: неожиданный ответ",
+                           status=response.status_code)
+        if not isinstance(payload, dict) or payload.get("status") != "success":
+            code = str(payload.get("code") or "") if isinstance(payload, dict) else ""
+            message = str(payload.get("message") or "") if isinstance(payload, dict) else ""
+            raise ApiError(message or code or f"HTTP {response.status_code}",
+                           code=code, status=response.status_code)
+        row = payload.get("data")
+        return (row if isinstance(row, dict) else None), charged
+
+    def emit_vessel(self, row):
+        mmsi = _mmsi(row.get("mmsi"))
+        if not mmsi:
+            return False
+        name = str(row.get("vessel_name") or "").strip()
+        at = _time(row.get("received"))
+        position = _position(mmsi, row.get("lat"), row.get("lng"),
+                             sog=row.get("speed"), cog=row.get("course"),
+                             name=name, source="myshiptracking", at=at)
+        if position is None:
+            return False
+        self.emit(position)
+
+        length = beam = None
+        a, b = _number(row.get("size_a")), _number(row.get("size_b"))
+        if a is not None and b is not None and a + b > 0:
+            length = a + b
+        c, d = _number(row.get("size_c")), _number(row.get("size_d"))
+        if c is not None and d is not None and c + d > 0:
+            beam = c + d
+        eta = _time(row.get("eta"))
+        self.emit(_static(mmsi, name=name,
+                          imo=row.get("imo") or None,
+                          callsign=row.get("callsign") or None,
+                          # vtype — это группа 0-9, а не код AIS: берём ais_type
+                          type_code=_type_code(row.get("ais_type")),
+                          destination=row.get("destination") or None,
+                          draft=row.get("draught"),
+                          length_m=length, beam_m=beam,
+                          eta_declared=eta.isoformat(timespec="minutes") if eta else None,
+                          source="myshiptracking", at=at))
+        return True
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан ключ API")
+        if self.exhausted:
+            self.set_status("кредиты триала закончились")
+            return
+        mmsis = []
+        for value in self.vessels() or []:
+            mmsi = _mmsi(value)
+            if mmsi and mmsi not in mmsis:
+                mmsis.append(mmsi)
+            if len(mmsis) >= self.max_vessels:
+                break
+        if not mmsis:
+            self.set_status("нет судов в базе для обогащения")
+            return
+        spent = self.spent_today()
+        if self.daily_coins and spent >= self.daily_coins:
+            self.set_status(f"дневной лимит кредитов: {spent}/{self.daily_coins}")
+            return
+        enriched = 0
+        coins = 0
+        last_error = None
+        for mmsi in mmsis:
+            if self.daily_coins and spent + coins + 3 > self.daily_coins:
+                break
+            try:
+                row, charged = self.fetch_vessel(mmsi)
+            except ApiError as error:
+                if error.code == "ERR_NO_CREDITS":
+                    self.add_coins(coins)
+                    self.exhausted = True
+                    self.set_status("кредиты триала закончились")
+                    self.log(f"{self.title}: кредиты триала закончились — обогащение остановлено.")
+                    return
+                if error.code in ("ERR_INVALID_KEY", "ERR_NO_KEY", "ERR_NOACCESS"):
+                    self.add_coins(coins)
+                    raise RuntimeError(str(error))
+                if error.code == "ERR_RATE_LIMIT":
+                    time.sleep(5)
+                    continue
+                last_error = error
+                continue
+            except Exception as error:
+                last_error = error
+                continue
+            coins += charged
+            if row and self.emit_vessel(row):
+                enriched += 1
+            time.sleep(0.4)  # 90 запросов в минуту на триале — с запасом
+        self.add_coins(coins)
+        spent += coins
+        if not enriched and last_error is not None:
+            raise last_error
+        self.ok(enriched, f"кредитов сегодня {spent}/{self.daily_coins}, "
+                          f"всего {self.spent_total()}")
+
+
+class VesselFinderFeed(ServiceFeed):
+    """API VesselFinder: /livedata отдаёт суда района подписки."""
+
+    key = "vf"
+    interval = 300.0
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан ключ API")
+        data = self.request(VESSELFINDER_URL,
+                            params={"userkey": self.api_key, "format": "json"},
+                            timeout=60)
+        if isinstance(data, dict):
+            error = data.get("error") or data.get("message")
+            if error:
+                raise RuntimeError(str(error))
+            data = data.get("vessels") or data.get("data") or []
+        if not isinstance(data, list):
+            raise RuntimeError("неожиданный ответ сервера")
+
+        count = 0
+        for row in data:
+            ais = row.get("AIS") if isinstance(row, dict) else None
+            if not isinstance(ais, dict):
+                continue
+            mmsi = _mmsi(ais.get("MMSI"))
+            if not mmsi:
+                continue
+            count += 1
+            self.emit(_position(mmsi, ais.get("LATITUDE"), ais.get("LONGITUDE"),
+                                sog=ais.get("SPEED"), cog=ais.get("COURSE"),
+                                heading=_heading(ais.get("HEADING")),
+                                name=ais.get("NAME"),
+                                source="vesselfinder"))
+            master = row.get("MASTERDATA") or {}
+            self.emit(_static(mmsi, name=ais.get("NAME") or master.get("NAME"),
+                              imo=ais.get("IMO") or master.get("IMO"),
+                              callsign=ais.get("CALLSIGN"),
+                              type_code=_type_code(ais.get("TYPE")),
+                              destination=ais.get("DESTINATION"),
+                              draft=ais.get("DRAUGHT") or master.get("MAXDRAUGHT"),
+                              length_m=master.get("LENGTH"),
+                              beam_m=master.get("BEAM"),
+                              source="vesselfinder"))
+        self.ok(count)
+
+
+class MarineTrafficFeed(ServiceFeed):
+    """API MarineTraffic: ключ в пути, район задаётся в кабинете."""
+
+    key = "mt"
+    interval = 600.0
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан ключ API")
+        data = self.request(
+            f"{MARINETRAFFIC_URL}/{self.api_key}",
+            params={"v": 2, "protocol": "jsono", "timespan": 15, "limit": 2000},
+            timeout=60)
+        if isinstance(data, dict) and data.get("errors"):
+            errors = data.get("errors")
+            text = errors if isinstance(errors, str) else "; ".join(map(str, errors))
+            raise RuntimeError(text)
+        rows = data.get("DATA") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise RuntimeError("неожиданный ответ сервера")
+
+        count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            mmsi = _mmsi(row.get("MMSI"))
+            if not mmsi:
+                continue
+            count += 1
+            speed = _number(row.get("SPEED"))
+            if speed is not None and speed > 60:
+                speed = speed / 10.0  # MarineTraffic отдаёт скорость в десятых узла
+            self.emit(_position(mmsi, row.get("LAT"), row.get("LON"),
+                                sog=speed, cog=row.get("COURSE"),
+                                heading=_heading(row.get("HEADING")),
+                                name=row.get("SHIPNAME"),
+                                source="marinetraffic"))
+            self.emit(_static(mmsi, name=row.get("SHIPNAME"),
+                              imo=row.get("IMO"), callsign=row.get("CALLSIGN"),
+                              type_code=_type_code(row.get("SHIPTYPE")),
+                              destination=row.get("DESTINATION"),
+                              draft=row.get("DRAUGHT"),
+                              length_m=row.get("LENGTH"), beam_m=row.get("WIDTH"),
+                              source="marinetraffic"))
+        self.ok(count)
+
+
+# Ключ настройки с ключом API: vf_key / mt_key / mst_key.
+PROVIDERS = {
+    "vf": VesselFinderFeed,
+    "mt": MarineTrafficFeed,
+    "mst": MyShipTrackingFeed,
+    "dt": DigitrafficFeed,
+}
+
+
+def needs_key(key):
+    return key in ("vf", "mt", "mst")
+
+
+def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=None,
+          vessels=None, minutes=None, daily_coins=None, max_vessels=None,
+          state_path=None):
+    """Создаёт поток опроса сервиса. None — если сервис не умеет отдавать данные."""
+    provider = PROVIDERS.get(key)
+    if provider is None:
+        return None
+    return provider(on_event, log, stop_event, api_key=api_key, bboxes=bboxes,
+                    on_status=on_status, name=f"service-{key}", vessels=vessels,
+                    minutes=minutes, daily_coins=daily_coins,
+                    max_vessels=max_vessels, state_path=state_path)
