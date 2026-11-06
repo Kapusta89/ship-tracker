@@ -300,10 +300,16 @@ class Store:
         return dict(row) if row else None
 
     def departures(self, mmsi: str, limit=10):
+        """Последние визиты судна с осадкой на входе и выходе.
+
+        Осадка и вид груза нужны карточке: по разнице видно, загрузилось
+        судно в порту или выгрузилось.
+        """
         with self._lock:
             rows = self.conn.execute(
-                """SELECT port, entered_at, left_at FROM port_visits
-                   WHERE mmsi = ? ORDER BY id DESC LIMIT ?""", (mmsi, limit)).fetchall()
+                """SELECT port, entered_at, left_at, draft_in, draft_out, cargo_kind
+                   FROM port_visits WHERE mmsi = ? ORDER BY id DESC LIMIT ?""",
+                (mmsi, limit)).fetchall()
         return [dict(row) for row in rows]
 
     def ended_visits(self, port: str, mmsi: str = None, limit=200):
