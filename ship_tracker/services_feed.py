@@ -23,9 +23,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import geo
+
 # Названия для журнала и статусов.
 SERVICE_TITLES = {
     "vf": "VesselFinder",
+    "vfa": "VesselFinder: ожидаемые прибытия",
     "mt": "MarineTraffic",
     "mst": "MyShipTracking",
     "dt": "Digitraffic",
@@ -33,6 +36,7 @@ SERVICE_TITLES = {
 
 DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
 VESSELFINDER_URL = "https://api.vesselfinder.com/livedata"
+VESSELFINDER_ARRIVALS_URL = "https://api.vesselfinder.com/expectedarrivals"
 MARINETRAFFIC_URL = "https://services.marinetraffic.com/api/exportvessels-custom-area"
 MYSHIPTRACKING_URL = "https://api.myshiptracking.com/api/v2/vessel/zone"
 MYSHIPTRACKING_VESSEL_URL = "https://api.myshiptracking.com/api/v2/vessel"
@@ -514,6 +518,152 @@ class VesselFinderFeed(ServiceFeed):
         self.ok(count)
 
 
+class VesselFinderArrivals(ServiceFeed):
+    """Ожидаемые прибытия: суда, у которых в Destination стоит наш порт.
+
+    Это единственный канал, который находит цель до того, как она подойдёт
+    к порту: /expectedarrivals отдаёт суда по UN/LOCODE порта, независимо от
+    расстояния до него. Стоит 5 кредитов за каждую запись AIS (PortCall и
+    Voyage — отдельно), поэтому опрос редкий и с дневным лимитом кредитов.
+
+    Ключ тот же, что у VesselFinder (vf_key), но включение отдельное: у одних
+    есть подписка LiveData, у других — купленные кредиты.
+    """
+
+    key = "vfa"
+    interval = 43200.0          # 12 часов по умолчанию
+    CREDITS_PER_RECORD = 5     # AIS dataset в ExpectedArrivals
+
+    def __init__(self, *args, ports=None, lookahead_minutes=None,
+                 max_records=None, daily_coins=None, state_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ports = list(ports or []) or list(geo.DEFAULT_PORTS)
+        self.lookahead = max(60, int(lookahead_minutes or 720))
+        self.max_records = max(1, int(max_records or 40))
+        self.daily_coins = max(0, int(daily_coins or 0))
+        self.state_path = Path(state_path) if state_path else None
+        if kwargs.get("minutes"):
+            self.interval = max(900.0, float(kwargs["minutes"]) * 60.0)
+
+    # ------------------------------------------------------------- кредиты
+
+    def credit_state(self):
+        if not self.state_path:
+            return {}
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def spent_today(self):
+        day = self.credit_state().get("vfa") or {}
+        if day.get("date") != datetime.now().strftime("%Y-%m-%d"):
+            return 0
+        try:
+            return int(day.get("spent") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def add_coins(self, coins):
+        if coins <= 0 or not self.state_path:
+            return
+        state = self.credit_state()
+        today = datetime.now().strftime("%Y-%m-%d")
+        day = state.get("vfa") if isinstance(state.get("vfa"), dict) else {}
+        if day.get("date") != today:
+            day = {"date": today, "total": day.get("total") or 0}
+        day["spent"] = int(day.get("spent") or 0) + coins
+        day["total"] = int(day.get("total") or 0) + coins
+        state["vfa"] = day
+        try:
+            tmp = self.state_path.with_name(self.state_path.name + ".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+            tmp.replace(self.state_path)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------ запросы
+
+    def fetch_port(self, locode):
+        data = self.request(
+            VESSELFINDER_ARRIVALS_URL,
+            params={"userkey": self.api_key, "locode": locode,
+                    "interval": self.lookahead, "format": "json"},
+            timeout=60)
+        if isinstance(data, dict):
+            error = data.get("error") or data.get("message")
+            if error:
+                raise RuntimeError(str(error))
+            data = data.get("vessels") or data.get("data") or []
+        if not isinstance(data, list):
+            raise RuntimeError("неожиданный ответ сервера")
+        return data
+
+    def emit_arrival(self, row, port_name):
+        ais = row.get("AIS") if isinstance(row, dict) else None
+        if not isinstance(ais, dict):
+            return False
+        mmsi = _mmsi(ais.get("MMSI"))
+        if not mmsi:
+            return False
+        at = _time(ais.get("TIMESTAMP"))
+        position = _position(mmsi, ais.get("LATITUDE"), ais.get("LONGITUDE"),
+                             sog=ais.get("SPEED"), cog=ais.get("COURSE"),
+                             heading=_heading(ais.get("HEADING")),
+                             name=ais.get("NAME"), source="vesselfinder-arrivals",
+                             at=at)
+        if position is None:
+            return False
+        self.emit(position)
+        eta = _time(ais.get("ETA"))
+        destination = ais.get("DESTINATION") or port_name
+        self.emit(_static(mmsi, name=ais.get("NAME"), imo=ais.get("IMO"),
+                          callsign=ais.get("CALLSIGN"),
+                          type_code=_type_code(ais.get("TYPE")),
+                          destination=destination,
+                          draft=ais.get("DRAUGHT"),
+                          eta_declared=eta.isoformat(timespec="minutes") if eta else None,
+                          source="vesselfinder-arrivals", at=at))
+        return True
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан ключ API")
+        ports = [port for port in self.ports if (port.get("locode") or "").strip()]
+        if not ports:
+            self.set_status("нет портов с UN/LOCODE")
+            return
+        spent = self.spent_today()
+        if self.daily_coins and spent >= self.daily_coins:
+            self.set_status(f"дневной лимит кредитов: {spent}/{self.daily_coins}")
+            return
+
+        found = 0
+        credits = 0
+        for port in ports:
+            if self.stop_event.is_set():
+                break
+            if found >= self.max_records:
+                break
+            if self.daily_coins and spent + credits + self.CREDITS_PER_RECORD > self.daily_coins:
+                break
+            rows = self.fetch_port(str(port["locode"]).strip())
+            credits += len(rows) * self.CREDITS_PER_RECORD
+            for row in rows:
+                if found >= self.max_records:
+                    break
+                if self.emit_arrival(row, port.get("name") or ""):
+                    found += 1
+            time.sleep(0.4)
+
+        self.add_coins(credits)
+        spent += credits
+        detail = (f"портов {len(ports)}, кредитов сегодня {spent}"
+                  + (f"/{self.daily_coins}" if self.daily_coins else ""))
+        self.ok(found, detail)
+
+
 class MarineTrafficFeed(ServiceFeed):
     """API MarineTraffic: ключ в пути, район задаётся в кабинете."""
 
@@ -564,6 +714,7 @@ class MarineTrafficFeed(ServiceFeed):
 # Ключ настройки с ключом API: vf_key / mt_key / mst_key.
 PROVIDERS = {
     "vf": VesselFinderFeed,
+    "vfa": VesselFinderArrivals,
     "mt": MarineTrafficFeed,
     "mst": MyShipTrackingFeed,
     "dt": DigitrafficFeed,
@@ -571,12 +722,12 @@ PROVIDERS = {
 
 
 def needs_key(key):
-    return key in ("vf", "mt", "mst")
+    return key in ("vf", "vfa", "mt", "mst")
 
 
 def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=None,
           vessels=None, minutes=None, daily_coins=None, max_vessels=None,
-          state_path=None):
+          state_path=None, ports=None, lookahead_minutes=None, max_records=None):
     """Создаёт поток опроса сервиса. None — если сервис не умеет отдавать данные."""
     provider = PROVIDERS.get(key)
     if provider is None:
@@ -584,4 +735,6 @@ def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=Non
     return provider(on_event, log, stop_event, api_key=api_key, bboxes=bboxes,
                     on_status=on_status, name=f"service-{key}", vessels=vessels,
                     minutes=minutes, daily_coins=daily_coins,
-                    max_vessels=max_vessels, state_path=state_path)
+                    max_vessels=max_vessels, state_path=state_path,
+                    ports=ports, lookahead_minutes=lookahead_minutes,
+                    max_records=max_records)

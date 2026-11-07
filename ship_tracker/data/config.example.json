@@ -32,7 +32,9 @@
   "message_types": [
     "PositionReport",
     "ExtendedClassBPositionReport",
-    "ShipStaticData"
+    "StandardClassBPositionReport",
+    "ShipStaticData",
+    "StaticDataReport"
   ],
   "ports": [
     {
@@ -40,42 +42,48 @@
       "label": "RENI",
       "lat": 45.4528,
       "lon": 28.2822,
-      "radius_km": 5.0
+      "radius_km": 5.0,
+      "locode": "UARNI"
     },
     {
       "name": "IZMAIL",
       "label": "IZMAIL",
       "lat": 45.3517,
       "lon": 28.8367,
-      "radius_km": 5.0
+      "radius_km": 5.0,
+      "locode": "UAIZM"
     },
     {
       "name": "VYLKOVE",
       "label": "VYLKOVE",
       "lat": 45.3975,
       "lon": 29.5853,
-      "radius_km": 4.0
+      "radius_km": 4.0,
+      "locode": "UAVYL"
     },
     {
       "name": "CHORNOMORSK",
       "label": "CHORNOMORSK",
       "lat": 46.3,
       "lon": 30.6667,
-      "radius_km": 8.0
+      "radius_km": 8.0,
+      "locode": "UAILK"
     },
     {
       "name": "ODESSA",
       "label": "ODESSA",
       "lat": 46.4825,
       "lon": 30.7233,
-      "radius_km": 8.0
+      "radius_km": 8.0,
+      "locode": "UAODS"
     },
     {
       "name": "YUZHNY",
       "label": "YUZHNY",
       "lat": 46.6233,
       "lon": 31.0167,
-      "radius_km": 8.0
+      "radius_km": 8.0,
+      "locode": "UAYUZ"
     }
   ],
   "filter_destinations": [
@@ -103,5 +111,10 @@
   "forget_vessels_hours": 24,
   "telegram_token": "",
   "telegram_chat_id": "",
-  "telegram_commands": true
+  "telegram_commands": true,
+  "use_vfa": false,
+  "vfa_minutes": 720,
+  "vfa_lookahead_minutes": 720,
+  "vfa_max_records": 40,
+  "vfa_daily_coins": 300
 }

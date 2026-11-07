@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "port_watch_km": 30,
     "use_history": True,
     "use_vf": False,
+    "use_vfa": False,
     "use_mt": False,
     "use_mst": False,
     "use_dt": False,
@@ -61,8 +62,15 @@ DEFAULT_CONFIG = {
     "mst_minutes": 120,
     "mst_daily_coins": 150,
     "mst_max_vessels": 40,
+    # ожидаемые прибытия VesselFinder: суда с нашим портом в Destination
+    "vfa_minutes": 720,
+    "vfa_lookahead_minutes": 720,
+    "vfa_max_records": 40,
+    "vfa_daily_coins": 300,
     "bounding_boxes": geo.DEFAULT_BOUNDING_BOXES,
-    "message_types": ["PositionReport", "ExtendedClassBPositionReport", "ShipStaticData"],
+    "message_types": ["PositionReport", "ExtendedClassBPositionReport",
+                      "StandardClassBPositionReport", "ShipStaticData",
+                      "StaticDataReport"],
     "ports": geo.DEFAULT_PORTS,
     "filter_destinations": ["IZMAIL", "RENI"],
     "filter_origins": ["ODESSA", "CHORNOMORSK"],
@@ -90,9 +98,15 @@ def merge_ports(saved, defaults) -> list:
     """Дополняет список портов новыми по умолчанию, не трогая свои геозоны."""
     result = []
     seen = set()
+    defaults_by_name = {str(port["name"]).strip().upper(): port for port in defaults}
     for port in list(saved or []):
         if not isinstance(port, dict) or not port.get("name"):
             continue
+        port = dict(port)
+        # UN/LOCODE нужен внешним API; в старых настройках его нет
+        default = defaults_by_name.get(str(port["name"]).strip().upper())
+        if default and not port.get("locode") and default.get("locode"):
+            port["locode"] = default["locode"]
         result.append(port)
         seen.add(str(port["name"]).strip().upper())
     for port in defaults:
@@ -482,11 +496,14 @@ class RadarCore:
         """Поднимает опрос выбранных внешних сервисов (см. services_feed)."""
         config = self.config
         self.service_status = {}
-        for key in ("vf", "mt", "mst", "dt"):
+        for key in ("vf", "vfa", "mt", "mst", "dt"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
             api_key = (config.get(f"{key}_key") or "").strip()
+            if key == "vfa" and not api_key:
+                # ожидаемые прибытия — тот же ключ VesselFinder
+                api_key = (config.get("vf_key") or "").strip()
             if services_feed.needs_key(key) and not api_key:
                 self._set_service_status(key, "нужен ключ API")
                 self.log(f"{title}: не задан ключ API — поток не запущен.")
@@ -498,9 +515,13 @@ class RadarCore:
                 on_status=self._set_service_status,
                 vessels=self.tracked_mmsis,
                 minutes=config.get(f"{key}_minutes"),
-                daily_coins=config.get("mst_daily_coins"),
+                daily_coins=(config.get("vfa_daily_coins") if key == "vfa"
+                             else config.get("mst_daily_coins")),
                 max_vessels=config.get(f"{key}_max_vessels"),
-                state_path=DATA_DIR / "credits.json")
+                state_path=DATA_DIR / "credits.json",
+                ports=config.get("ports"),
+                lookahead_minutes=config.get("vfa_lookahead_minutes"),
+                max_records=config.get("vfa_max_records"))
             if feed is None:
                 self._set_service_status(key, "нет доступного API")
                 continue

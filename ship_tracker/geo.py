@@ -4,13 +4,21 @@ import math
 
 # Порты наблюдения: Дунай и северо-западное Причерноморье (включая Южный).
 # radius_km — радиус геозоны вокруг точки: вход в неё = судно в порту.
+# locode — код UN/LOCODE: по нему порт запрашивается во внешних API
+# (VesselFinder ожидаемые прибытия), поэтому код должен быть настоящим.
 DEFAULT_PORTS = [
-    {"name": "RENI", "label": "Рени", "lat": 45.4528, "lon": 28.2822, "radius_km": 5.0},
-    {"name": "IZMAIL", "label": "Измаил", "lat": 45.3517, "lon": 28.8367, "radius_km": 5.0},
-    {"name": "VYLKOVE", "label": "Вилково", "lat": 45.3975, "lon": 29.5853, "radius_km": 4.0},
-    {"name": "CHORNOMORSK", "label": "Черноморск", "lat": 46.3000, "lon": 30.6667, "radius_km": 8.0},
-    {"name": "ODESSA", "label": "Одесса", "lat": 46.4825, "lon": 30.7233, "radius_km": 8.0},
-    {"name": "YUZHNY", "label": "Южный", "lat": 46.6233, "lon": 31.0167, "radius_km": 8.0},
+    {"name": "RENI", "label": "Рени", "lat": 45.4528, "lon": 28.2822,
+     "radius_km": 5.0, "locode": "UARNI"},
+    {"name": "IZMAIL", "label": "Измаил", "lat": 45.3517, "lon": 28.8367,
+     "radius_km": 5.0, "locode": "UAIZM"},
+    {"name": "VYLKOVE", "label": "Вилково", "lat": 45.3975, "lon": 29.5853,
+     "radius_km": 4.0, "locode": "UAVYL"},
+    {"name": "CHORNOMORSK", "label": "Черноморск", "lat": 46.3000, "lon": 30.6667,
+     "radius_km": 8.0, "locode": "UAILK"},
+    {"name": "ODESSA", "label": "Одесса", "lat": 46.4825, "lon": 30.7233,
+     "radius_km": 8.0, "locode": "UAODS"},
+    {"name": "YUZHNY", "label": "Южный", "lat": 46.6233, "lon": 31.0167,
+     "radius_km": 8.0, "locode": "UAYUZ"},
 ]
 
 # Район подписки по умолчанию: [[юг/запад], [север/восток]] в формате AISStream.
@@ -60,11 +68,12 @@ def port_at(lat, lon, ports):
 # Как порты пишутся в поле Destination у судов: коды UN/LOCODE и устоявшиеся
 # написания. Нужно, чтобы судно, идущее в наш порт, не считалось чужим.
 PORT_ALIASES = {
-    "RENI": ("UDREN", "RENY"),
-    "IZMAIL": ("UDIZM", "IZMAIL."),
-    "VYLKOVE": ("UDVYL", "VILKOVO"),
-    "CHORNOMORSK": ("CHORNOMORSK", "ILLICHIVSK", "ILICHEVSK"),
-    "ODESSA": ("UDODS", "ODESA"),
+    # настоящие UN/LOCODE Украины + старые написания, которые ещё встречаются
+    "RENI": ("UARNI", "UDREN", "RENY"),
+    "IZMAIL": ("UAIZM", "UDIZM", "IZMAIL."),
+    "VYLKOVE": ("UAVYL", "UDVYL", "VILKOVO", "UST-DUNAISK"),
+    "CHORNOMORSK": ("UAILK", "CHERNOMORSK", "ILLICHIVSK", "ILICHEVSK"),
+    "ODESSA": ("UAODS", "UDODS", "ODESA"),
     "YUZHNY": ("UAYUZ", "PIVDENNYI", "PIVDENNY", "YUZHNYY", "YUZHNYI"),
 }
 

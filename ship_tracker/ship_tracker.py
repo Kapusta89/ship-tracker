@@ -55,11 +55,14 @@ AIRSTREAM_SITE = "https://aisstream.io"
 PHOTO_DIR = DATA_DIR / "photos"
 
 # Поля с ключами API тех сервисов, которым они нужны.
-SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "mt": "var_mt_key", "mst": "var_mst_key"}
+SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "vfa": "var_vf_key",
+                      "mt": "var_mt_key", "mst": "var_mst_key"}
 
 # Дополнительные подключения: название, ключ настройки, описание и сайт с ключом.
 SERVICE_BLOCKS = [
     ("VesselFinder", "vf", "API по ключу: LiveData — только по подписке"),
+    ("VesselFinder: ожидаемые прибытия", "vfa",
+     "суда с нашим портом в Destination — по кредитам, 5 за запись"),
     ("MarineTraffic", "mt", "живой API по ключу, район задаётся в кабинете"),
     ("MyShipTracking", "mst", "триал 2000 кредитов: расширенные данные по нашим судам"),
     ("Digitraffic", "dt", "открытые данные Финляндии, только Балтика"),
@@ -67,6 +70,7 @@ SERVICE_BLOCKS = [
 
 SERVICE_SITES = {
     "vf": ("vesselfinder.com", "https://www.vesselfinder.com/"),
+    "vfa": ("API VesselFinder", "https://api.vesselfinder.com/expectedarrivals.html"),
     "mt": ("marinetraffic.com", "https://www.marinetraffic.com/"),
     "mst": ("myshiptracking.com", "https://www.myshiptracking.com/"),
     "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
@@ -876,6 +880,7 @@ class App:
         # Additional service toggles
         self.feed_status = {}
         self.var_use_vf = tk.BooleanVar(value=bool(self.config.get("use_vf", False)))
+        self.var_use_vfa = tk.BooleanVar(value=bool(self.config.get("use_vfa", False)))
         self.var_use_mt = tk.BooleanVar(value=bool(self.config.get("use_mt", False)))
         self.var_use_mst = tk.BooleanVar(value=bool(self.config.get("use_mst", False)))
         self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
@@ -884,7 +889,7 @@ class App:
         self.var_mt_key = tk.StringVar(value=self.config.get("mt_key", ""))
         self.var_mst_key = tk.StringVar(value=self.config.get("mst_key", ""))
         self.feed_status.update({
-            "vf": tk.StringVar(), "mt": tk.StringVar(),
+            "vf": tk.StringVar(), "vfa": tk.StringVar(), "mt": tk.StringVar(),
             "mst": tk.StringVar(), "dt": tk.StringVar(),
         })
         for key in self.feed_status:
@@ -1949,6 +1954,7 @@ class App:
 
         # Store service checkbox states
         self.config["use_vf"] = bool(getattr(self, "var_use_vf", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_vfa"] = bool(getattr(self, "var_use_vfa", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_mt"] = bool(getattr(self, "var_use_mt", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_mst"] = bool(getattr(self, "var_use_mst", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
@@ -2323,7 +2329,10 @@ class App:
             return
         feed = services_feed.build(
             key, lambda event: None, self.log, threading.Event(),
-            api_key=api_key, bboxes=self.config.get("bounding_boxes"))
+            api_key=api_key, bboxes=self.config.get("bounding_boxes"),
+            ports=self.config.get("ports"),
+            # проверка не должна тратить много кредитов: только 5 записей
+            max_records=5)
         if feed is None:
             self.log(f"{title}: нет доступного API.")
             finish("нет доступного API")
