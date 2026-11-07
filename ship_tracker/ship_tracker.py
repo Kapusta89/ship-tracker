@@ -37,6 +37,10 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+# Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
+# запущена ли текущая копия или где-то лежит старая сборка.
+APP_VERSION = "2026.11.08"
+
 import ais_feed
 import cargo
 import flags
@@ -582,7 +586,7 @@ class App:
         self._photo_image = None
         self._photo_for = None
 
-        self.root.title("Ship Tracker")
+        self.root.title(f"Ship Tracker — версия {APP_VERSION}")
         self.root.geometry("1240x820")
         self.root.minsize(1000, 680)
 
@@ -1006,6 +1010,8 @@ class App:
             self.feed_status[key].set(self.service_status_text(key))
 
         ttk.Label(box, text="Подключения").grid(row=4, column=0, sticky="nw", pady=(16, 4))
+        ttk.Label(box, text=f"версия {APP_VERSION} · папка: {APP_DIR}",
+                  foreground="#777").grid(row=3, column=1, sticky="w", pady=(8, 0))
         links = ttk.LabelFrame(box, text="Каналы данных")
         links.grid(row=4, column=1, sticky="ew", pady=(16, 4))
         links.columnconfigure(1, weight=1)
