@@ -287,18 +287,23 @@ def check_source(source, timeout=25, log=None) -> dict:
             size = response.headers.get("Content-Length")
             head = next(response.iter_content(2048), b"") or b""
             is_pdf = head.lstrip()[:5] == b"%PDF-"
-            result["ok"] = status < 400 and is_pdf
             parts = [f"HTTP {status}"]
             if is_pdf:
                 parts.append("PDF")
                 if size:
                     parts.append(_human_size(size))
+                parts.append("скан, без текстового слоя")
             result["detail"] = ", ".join(parts)
+            if status < 400 and is_pdf:
+                # файл живой, но разобрать его автоматически нельзя
+                result["warn"] = True
         else:
             result["detail"] = f"HTTP {status}"
             if status < 400:
-                result["ok"] = True
-            elif status < 500:
+                # сайт открывается, но таблицы/формы рисует браузер
+                result["warn"] = True
+                result["detail"] = f"HTTP {status}"
+            elif 400 <= status < 500:
                 result["warn"] = True
                 result["detail"] = (f"HTTP {status}: сайт отвечает, но закрыт "
                                     "для автоматических запросов")
