@@ -1,0 +1,13 @@
+# Батники Windows ломаются с LF-переводами строк: cmd склеивает строки и
+# выдаёт «'ship_tracker.py.' is not recognized». В репозитории и при
+# checkout на любой машине они должны быть с CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Остальное — обычный текст, LF.
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

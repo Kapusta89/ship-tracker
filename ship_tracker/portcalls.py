@@ -248,6 +248,26 @@ def clean_gfw_token(value) -> str:
     return text
 
 
+def gfw_profile_text(entry) -> str:
+    """Строка с профилем судна из GFW: имя, флаг, IMO и когда проверено."""
+    entry = entry or {}
+    parts = []
+    name = _clean(entry.get("name"))
+    flag = _clean(entry.get("flag"))
+    imo = _clean(entry.get("imo"))
+    if name:
+        parts.append(name)
+    if flag:
+        parts.append(f"флаг {flag}")
+    if imo:
+        parts.append(f"IMO {imo}")
+    text = "GFW: " + (" · ".join(parts) if parts else "профиль судна найден")
+    checked = _clean(str(entry.get("checked") or "").replace("T", " ")[:16])
+    if checked:
+        text += f" (проверено {checked})"
+    return text
+
+
 def gfw_gap_text(entry) -> str:
     """Короткая фраза про последний разрыв AIS по данным GFW."""
     gap = (entry or {}).get("gap") or {}

@@ -1,9 +1,8 @@
-"""Карта-картинка для бота: все суда, включая те, у кого нет координат.
+"""Карта-картинка для бота: порты и суда с реальными координатами.
 
-Зачем: в приложении карта есть, а в Telegram её нет. Заказчику удобно получить
-одну картинку со всеми судами. Судно без позиции (AIS-catcher отдаёт только
-список ожидаемых) рисуется у порта назначения кружком с пунктиром — честно
-видно, что место приблизительное, но видно каждое судно.
+Суда без позиции (список AIS-catcher) на карту не наносятся: точки у порта
+забивали карту и выглядели как выдуманные. Они остаются в списках — в
+приложении, в кнопках портов и в командах бота (/expected, /sources).
 """
 
 import math
@@ -11,8 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
-
-import geo
 
 WIDTH, HEIGHT = 1500, 940
 PAD = 80
@@ -22,8 +19,6 @@ GRID_TEXT = "#33596b"
 PORT = "#35d08a"
 PORT_TEXT = "#7fe0b3"
 LIVE = "#ff8a65"
-APPROX = "#f0a020"
-APPROX_TEXT = "#ffd79a"
 TEXT = "#d7e6ee"
 DIM = "#5f8ea3"
 
@@ -42,48 +37,24 @@ def _font(size, bold=False):
         return ImageFont.load_default()
 
 
-def port_for(value, ports):
-    """Порт по строке Destination: название, русская подпись или код UN/LOCODE."""
-    text = str(value or "").upper()
-    if not text:
-        return None
-    for port in ports or []:
-        name = str(port.get("name") or "").upper()
-        variants = [port.get("name"), port.get("label"),
-                    *(port.get("aliases") or []), *geo.PORT_ALIASES.get(name, ())]
-        for variant in variants:
-            variant = str(variant or "").upper().strip()
-            if variant and variant in text:
-                return port
-    return None
-
-
-def _base_points(vessels, ports):
-    """Точки без раскладки: (lat, lon, подпись, приблизительная ли, ключ порта)."""
+def _points(vessels):
+    """Только суда с координатами: (lat, lon, подпись)."""
     points = []
     for vessel in vessels:
         lat, lon = vessel.get("lat"), vessel.get("lon")
-        name = str(vessel.get("name") or vessel.get("mmsi") or "?")
-        if lat is not None and lon is not None:
-            try:
-                points.append((float(lat), float(lon), name, False, None))
-                continue
-            except (TypeError, ValueError):
-                pass
-        port = port_for(vessel.get("destination"), ports)
-        if not port:
+        if lat is None or lon is None:
             continue
         try:
-            key = str(port.get("name") or port.get("lon"))
-            points.append((float(port["lat"]), float(port["lon"]), name, True, key))
-        except (KeyError, TypeError, ValueError):
+            points.append((float(lat), float(lon),
+                           str(vessel.get("name") or vessel.get("mmsi") or "?")))
+        except (TypeError, ValueError):
             continue
     return points
 
 
 def _bounds(points, ports):
     lats, lons = [], []
-    for lat, lon, _name, _approx, _key in points:
+    for lat, lon, _name in points:
         lats.append(lat)
         lons.append(lon)
     for port in ports or []:
@@ -100,10 +71,10 @@ def _bounds(points, ports):
     return lat_min - pad, lat_max + pad, lon_min - pad, lon_max + pad
 
 
-def render(vessels, ports, path):
+def render(vessels, ports, path, without_position=0):
     """Рисует карту в PNG и возвращает путь."""
     path = Path(path)
-    points = _base_points(vessels, ports)
+    points = _points(vessels)
     lat_min, lat_max, lon_min, lon_max = _bounds(points, ports)
     center_lat = (lat_min + lat_max) / 2
     center_lon = (lon_min + lon_max) / 2
@@ -138,9 +109,9 @@ def render(vessels, ports, path):
 
     placed = []
 
-    def put_text(x, y, text, font, fill, anchor):
+    def put_text(x, y, text, font, fill, anchor="lm"):
         """Подпись без наложений: пробуем несколько сдвигов по вертикали."""
-        sign = 0 if anchor.endswith("m") else (1 if anchor.startswith("l") else -1)
+        sign = 1 if anchor.startswith("l") else -1
         for shift in (0, -16, 16, -32, 32, -48, 48):
             box = draw.textbbox((x + sign * 13, y + shift), text, font=font, anchor=anchor)
             if not any(box[0] < other[2] and other[0] < box[2]
@@ -152,7 +123,7 @@ def render(vessels, ports, path):
         placed.append(box)
         draw.text((x + sign * 13, y + 48), text, font=font, fill=fill, anchor=anchor)
 
-    # порты: подпись под точкой, суда раскладываются вокруг
+    # порты
     for port in ports or []:
         try:
             x, y = to_px(float(port["lat"]), float(port["lon"]))
@@ -165,43 +136,24 @@ def render(vessels, ports, path):
         placed.append((x - width / 2, y + 9, x + width / 2, y + 26))
         draw.text((x, y + 15), port_name, font=label, fill=PORT_TEXT, anchor="mm")
 
-    # суда без позиции: кольцо вокруг порта, подписи расходятся от центра
-    slots = {}
-    approx = 0
-    live = 0
-    for lat, lon, name, approximate, key in points:
-        if approximate:
-            slot = slots.get(key, 0)
-            slots[key] = slot + 1
-            ring = (58 + 78 * (slot // 4)) / scale
-            angle = (slot % 4) / 4 * 2 * math.pi + (slot // 4) * (math.pi / 4)
-            lat = lat + math.sin(angle) * ring
-            lon = lon + math.cos(angle) * ring / max(0.2, math.cos(math.radians(lat)))
+    # суда с реальной позицией
+    for lat, lon, name in points:
         x, y = to_px(lat, lon)
         if not (0 <= x <= WIDTH and 0 <= y <= HEIGHT):
             continue
-        if approximate:
-            approx += 1
-            draw.ellipse([x - 9, y - 9, x + 9, y + 9], outline=APPROX, width=1)
-            draw.ellipse([x - 5, y - 5, x + 5, y + 5], outline=APPROX, width=2)
-            put_text(x, y, name, name_font, APPROX_TEXT,
-                     "lm" if math.cos(angle) >= 0 else "rm")
-        else:
-            live += 1
-            draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=LIVE)
-            put_text(x, y, name, name_font, TEXT, "lm")
+        draw.ellipse([x - 4, y - 4, x + 4, y + 4], fill=LIVE)
+        put_text(x, y, name, name_font, TEXT, "lm")
 
     now = datetime.now(timezone.utc)
-    draw.text((PAD - 44, 20), "Ship Tracker — все суда", font=title_font, fill=TEXT)
-    draw.text((PAD - 44, 52), f"{now:%d.%m.%Y %H:%M} UTC · судов: {len(points)}",
+    draw.text((PAD - 44, 20), "Ship Tracker — карта", font=title_font, fill=TEXT)
+    draw.text((PAD - 44, 52),
+              f"{now:%d.%m.%Y %H:%M} UTC · судов с позицией: {len(points)}",
               font=small, fill=DIM)
-    draw.text((PAD - 44, HEIGHT - 70),
-              f"● с позицией: {live}    ○ без позиции, у порта назначения: {approx}",
-              font=small, fill=DIM)
-    draw.text((PAD - 44, HEIGHT - 50),
-              "Источник: AIS-catcher (без ключа) и живые AIS-потоки. "
-              "○ — точное место неизвестно, точка у порта.",
-              font=tiny, fill=DIM)
+    note = "Источник: живые AIS-потоки (AISStream, Open Waters)."
+    if without_position:
+        note += (f" Суда без позиции ({without_position}) на карту не нанесены — "
+                 "их список в /expected.")
+    draw.text((PAD - 44, HEIGHT - 50), note, font=tiny, fill=DIM)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path)

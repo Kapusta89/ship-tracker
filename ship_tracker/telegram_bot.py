@@ -325,7 +325,10 @@ def vessel_card(vessel: dict, core) -> str:
         if expected:
             lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
                          f"{expected.get('eta') or '—'} (AIS-catcher)")
-        gfw_text = portcalls.gfw_gap_text(portcalls.gfw_vessel(None, mmsi))
+        gfw_entry = portcalls.gfw_vessel(None, mmsi)
+        if gfw_entry:
+            lines.append(portcalls.gfw_profile_text(gfw_entry))
+        gfw_text = portcalls.gfw_gap_text(gfw_entry)
         if gfw_text:
             lines.append(gfw_text)
 
@@ -574,7 +577,7 @@ async def cmd_help(message: Message):
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
         "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
-        "/map — карта-картинка со всеми судами (в том числе без позиции).\n"
+        "/map — карта-картинка с портами и судами, у которых есть позиция.\n"
         "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
         "/start — вернуть клавиатуру портов.",
         reply_markup=make_port_keyboard(),
@@ -668,19 +671,17 @@ async def cmd_map(message: Message):
     config = reload_config()
     vessels = await asyncio.to_thread(lambda: get_core().related_vessels(1000))
     ports = config.get("ports") or []
+    without = sum(1 for vessel in vessels
+                  if vessel.get("lat") is None or vessel.get("lon") is None)
     try:
-        await asyncio.to_thread(mapimage.render, vessels, ports, MAP_PATH)
+        await asyncio.to_thread(mapimage.render, vessels, ports, MAP_PATH, without)
     except Exception as error:
         log.warning("Карта не нарисована: %s", error)
         await message.answer(f"Карту не удалось нарисовать: {error}")
         return
-    without = sum(1 for vessel in vessels
-                  if vessel.get("lat") is None or vessel.get("lon") is None)
-    caption = ("🗺 <b>Карта: все суда</b>\n"
-               f"Всего: <b>{len(vessels)}</b> · с позицией: {len(vessels) - without} · "
-               f"без позиции (○ у порта): {without}\n"
-               "○ — судно без координат, показано у порта назначения "
-               "(AIS-catcher, без ключа).")
+    caption = ("🗺 <b>Карта</b>\n"
+               f"Судов с позицией на карте: <b>{len(vessels) - without}</b>\n"
+               f"Без позиции (только в списках): {without}")
     await message.answer_photo(FSInputFile(str(MAP_PATH)), caption=caption)
 
 

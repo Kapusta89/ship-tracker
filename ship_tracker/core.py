@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
     "gfw_key": "",
     "gfw_minutes": 720,
     "gfw_days": 7,
-    "gfw_max_vessels": 10,
+    "gfw_max_vessels": 20,
     # платные/ключевые источники: Datalastic (x-api-key) и AISHub (логин)
     "use_dat": False,
     "dat_key": "",

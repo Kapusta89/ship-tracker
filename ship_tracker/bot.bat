@@ -1,4 +1,5 @@
 @echo off
+rem Файл должен оставаться с переводами строк CRLF (см. .gitattributes).
 chcp 65001 >nul
 setlocal EnableExtensions
 title Ship Radar Bot
