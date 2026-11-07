@@ -92,6 +92,9 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None) -> dict:
                                     headers=HEADERS, timeout=timeout)
             response.raise_for_status()
             entry["vessels"] = parse_expected_page(response.text)
+            if not entry["vessels"] and "expected-table" not in response.text:
+                # вместо страницы порта пришла заглушка (Cloudflare, ошибка сайта)
+                entry["error"] = "страница без таблицы Expected"
         except Exception as error:                     # сеть, Cloudflare, формат
             status = getattr(getattr(error, "response", None), "status_code", None)
             if status == 404:
@@ -103,6 +106,15 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None) -> dict:
                     log(f"AIS-catcher {locode}: {entry['error']}")
         result["ports"][locode] = entry
         time.sleep(max(0.0, pause))
+    # Пустой ответ по всем портам — почти всегда сбой сайта, а не уход судов:
+    # оставляем прошлый список, чтобы вкладка и бот не опустели.
+    if not any(entry.get("vessels") for entry in result["ports"].values()):
+        previous = load_cache()
+        if expected_rows(previous):
+            previous = dict(previous)
+            previous["stale"] = True
+            previous["stale_reason"] = "портовые страницы сейчас отдают 0 судов"
+            return previous
     return result
 
 

@@ -765,9 +765,12 @@ class App:
     def build_vessels(self):
         ttk = self.ttk
         frame = self.tab_vessels
-        ttk.Label(frame, text="Только суда, связанные с нашими портами: стоят или проходят "
-                              "рядом, идут в порт или вышли из него, либо уже были в нём "
-                              "(свежие сверху).", foreground="#555").pack(
+        ttk.Label(frame, text="Суда, связанные с нашими портами: стоят или проходят рядом, "
+                              "идут в порт или вышли из него, либо уже были в нём. "
+                              "Если в Destination наш порт — расстояние не важно, судно "
+                              "в списке на любом удалении; те, у кого пока нет позиции "
+                              "в живых потоках, добавлены снизу из ожидаемых AIS-catcher.",
+                  foreground="#555", wraplength=1100, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
         self.vessels_tree = self.make_tree(
             frame, (                    ("name", "Судно", 170), ("flag", "Флаг", 140), ("type", "Тип", 100),
@@ -904,6 +907,9 @@ class App:
             info += f" Не ответили: {', '.join(failed)}."
         if missing:
             info += f" Нет страницы у AIS-catcher: {', '.join(missing)}."
+        if cache.get("stale"):
+            info += (" Сейчас страницы отдают 0 судов — показан прошлый список "
+                     f"от {(cache.get('updated') or '—')[:16].replace('T', ' ')}.")
         if rows:
             info += (" Заявленный ETA — то, что передал капитан (UTC); у некоторых "
                      "судов он устарел — смотрите колонку «Последний сигнал».")
@@ -945,11 +951,40 @@ class App:
             frame, (("time", "Время", 120), ("name", "Судно", 190), ("route", "Маршрут", 220),
                     ("status", "Статус", 90), ("error", "Ошибка", 260)))
 
+    def scrollable_tab(self, frame):
+        """Внутренний фрейм с полосой прокрутки: вкладка выше окна не помещается."""
+        tk, ttk = self.tk, self.ttk
+        canvas = tk.Canvas(frame, highlightthickness=0)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
+        scroll.pack(side="right", fill="y", padx=(0, 10), pady=8)
+
+        def wheel(event):
+            # колесо работает и над полями/кнопками внутри вкладки
+            widget = canvas.winfo_containing(event.x_root, event.y_root)
+            while widget is not None:
+                if widget is inner:
+                    canvas.yview_scroll(int(-event.delta / 120), "units")
+                    return "break"
+                widget = getattr(widget, "master", None)
+            return None
+
+        canvas.bind_all("<MouseWheel>", wheel, add="+")
+        return inner
+
     def build_connection(self):
         tk, ttk = self.tk, self.ttk
         frame = self.tab_connection
-        box = ttk.Frame(frame)
-        box.pack(fill="x", padx=10, pady=8)
+        inner = self.scrollable_tab(frame)
+        box = ttk.Frame(inner)
+        box.pack(fill="x", padx=0, pady=0)
         box.columnconfigure(1, weight=1)
 
         self.var_key = tk.StringVar(value=self.config.get("api_key", ""))
@@ -1167,8 +1202,8 @@ class App:
             "3. Вставьте его выше и нажмите «Проверить».\n\n"
             "Ключи хранятся только в data/config.json на этом компьютере."
         )
-        ttk.Label(frame, text=hint, justify="left", foreground="#444").pack(
-            anchor="w", padx=12, pady=(16, 0))
+        ttk.Label(inner, text=hint, justify="left", wraplength=980,
+                  foreground="#444").pack(anchor="w", padx=12, pady=(16, 0))
 
     def build_filters(self):
         tk, ttk = self.tk, self.ttk
@@ -1635,6 +1670,25 @@ class App:
                     "Жёлтые — танкеры. Серые — остальные суда.")
         vessel = self.store.vessel(mmsi)
         if not vessel:
+            expected = portcalls.expected_for_mmsi(mmsi)
+            if expected:
+                lines = [
+                    expected.get("name") or mmsi,
+                    f"MMSI: {mmsi}",
+                    f"Флаг: {flags.flag_text(mmsi)}",
+                    f"Тип: {expected.get('type') or '—'}",
+                    f"Назначение: {expected.get('port') or '—'} (наш порт)",
+                    f"Заявленный ETA: {expected.get('eta') or '—'} (UTC, передал капитан)",
+                    f"Последний сигнал: {expected.get('last_heard') or '—'}",
+                    "",
+                    "Позиции нет: судно в зоне, которую живые потоки пока не "
+                    "покрывают. Список ведёт AIS-catcher (открытая сеть приёмников).",
+                    "",
+                    "Проверка в других сервисах:",
+                ]
+                for title, url in portcalls.registry_links(None, mmsi):
+                    lines.append(f"  • {title}: {url}")
+                return "\n".join(lines)
             return "Судно не найдено — возможно, оно ушло из района."
         country, iso2, emoji = flags.flag_for_mmsi(mmsi)
         lines = [
@@ -1959,7 +2013,9 @@ class App:
         tree = self.vessels_tree
         for item in tree.get_children():
             tree.delete(item)
+        seen = set()
         for vessel in self.core.related_vessels(500):
+            seen.add(str(vessel.get("mmsi")))
             tree.insert("", "end", tags=(vessel["mmsi"],), values=(
                 vessel.get("name") or "—",
                 flags.flag_text(vessel["mmsi"]),
@@ -1974,6 +2030,30 @@ class App:
                 vessel.get("port") or "—",
                 self.fmt_time(vessel.get("updated_at")),
                 vessel.get("mmsi"),
+            ))
+        # Ожидаемые: у них наш порт в Destination, но в бесплатных потоках
+        # позиции нет. Всё равно показываем — без координат и карты.
+        rows = portcalls.expected_rows()
+        updated = (rows[0].get("updated") or "")[:16].replace("T", " ") if rows else ""
+        for row in rows:
+            mmsi = str(row.get("mmsi") or "")
+            if not mmsi or mmsi in seen:
+                continue
+            seen.add(mmsi)
+            tree.insert("", "end", tags=(mmsi,), values=(
+                row.get("name") or "—",
+                flags.flag_text(mmsi),
+                row.get("type") or "—",
+                "нет позиции",
+                row.get("port") or "—",
+                f"ETA {row.get('eta') or '—'}",
+                "—",
+                "—",
+                "—",
+                "—",
+                "ожидается",
+                f"сигнал {row.get('last_heard') or '—'} · AIS-catcher {updated}",
+                mmsi,
             ))
 
     def size_text(self, vessel):

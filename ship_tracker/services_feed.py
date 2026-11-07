@@ -702,6 +702,8 @@ class AiscatcherExpected(ServiceFeed):
         detail = f"портов {len(data.get('ports') or {})}"
         if failed:
             detail += f", с ошибкой {len(failed)}"
+        if data.get("stale"):
+            detail += ", сохранён прошлый список"
         self.ok(total, detail)
 
 
