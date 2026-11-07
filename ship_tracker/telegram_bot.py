@@ -93,7 +93,9 @@ def get_core():
     global _core
     if _core is None:
         core_module = _import("core")
-        _core = core_module.RadarCore(CONFIG, get_store())
+        # без журнала ошибки AIS и внешних сервисов молчали бы: в фоне их
+        # не видно ни в окне, ни в консоли
+        _core = core_module.RadarCore(CONFIG, get_store(), log=logging.info)
     return _core
 
 
