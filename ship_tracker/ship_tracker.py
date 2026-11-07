@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.09"
+APP_VERSION = "2026.11.10"
 
 import ais_feed
 import cargo
@@ -343,41 +343,46 @@ class RadarCanvas:
         now = datetime.now()
         drawn = 0
         stale_count = 0
+        approx_count = 0
+        approx_slots = {}
         for vessel in vessels:
             lat, lon = vessel.get("lat"), vessel.get("lon")
-            # Если нет координат попадания, но есть назначение порта — помещаем порт в центр цели
-            if lat is None or lon is None:
-                destination = vessel.get("destination") or ""
-                if destination:
-                    # Ищем порт по названию назначения
-                    ports = self.config.get("ports") or []
-                    for port in ports:
-                        if port.get("name") and destination.lower().find(port.get("name").lower()) >= 0:
-                            lat = port.get("lat")
-                            lon = port.get("lon")
-                            break
-                    if lat is None:
-                        # Если порт не найден по названию, берём точку последнего визита
-                        visit = self._last_visit(vessel.get("mmsi"))
-                        if visit:
-                            lat = visit.get("lat")
-                            lon = visit.get("lon")
-                if lat is None or lon is None:
+            approximate = lat is None or lon is None
+            if approximate:
+                # Позиции нет, но судно надо показать на карте: ставим точку
+                # у порта назначения (или у последнего известного визита).
+                position = self._approx_position(vessel)
+                if not position:
                     continue
+                lat, lon = position
             is_target = vessel["mmsi"] in target_mmsi
             if self.targets_only and not is_target:
                 continue
             x, y = projector.to_screen(lat, lon)
+            if approximate:
+                # Иначе суда одного порта сливаются в одну точку: раскладываем
+                # их кольцом вокруг порта, чтобы было видно каждое.
+                key = (round(float(lat), 3), round(float(lon), 3))
+                slot = approx_slots.get(key, 0)
+                approx_slots[key] = slot + 1
+                ring = 16 + 11 * (slot // 10)
+                angle = (slot % 10) / 10 * 2 * math.pi + (slot // 10) * 0.55
+                x += math.cos(angle) * ring
+                y += math.sin(angle) * ring
             if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
                 continue
             drawn += 1
+            if approximate:
+                approx_count += 1
             self._hits.append((x, y, vessel["mmsi"]))
             updated = parse_iso(vessel.get("updated_at"))
             stale = not updated or (now - updated).total_seconds() > self.stale_seconds()
-            if stale:
+            if stale and not approximate:
                 stale_count += 1
             # Цвета в зависимости от типа и схемatical режима
-            if is_target:
+            if approximate:
+                color, radius = "#f0a020", 4
+            elif is_target:
                 color, radius = "#ff3b30", 5
             elif ais_feed.is_tanker_code(vessel.get("type_code")):
                 color, radius = "#ffd166", 4
@@ -388,28 +393,67 @@ class RadarCanvas:
                 if color == "#ff3b30": color = "#c62828"
                 elif color == "#ffd166": color = "#fb8c00"
                 elif color == "#7fa8bf": color = "#42a5f5"
-            if stale:
+            if stale and not approximate:
                 color = "#4b6472"
             if vessel["mmsi"] == self.selected:
                 canvas.create_oval(x - 11, y - 11, x + 11, y + 11, outline="#ffffff", width=2)
-            course = vessel.get("cog")
-            if course is None:
-                course = vessel.get("heading")
-            if course is not None:
-                angle = math.radians(float(course))
-                dx, dy = math.sin(angle), -math.cos(angle)
-                canvas.create_line(x, y, x + dx * 14, y + dy * 14, fill=color, width=1 if self.schematic_view else 1)
-            canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
-                               fill=color, outline="" if self.schematic_view else "")
-            if drawn % 7 == 0 and vessel.get("name"):
-                if self.schematic_view:
+            if approximate:
+                # Кружок с пунктиром и «?»: видно, что точное место неизвестно
+                # и точка стоит у порта назначения.
+                canvas.create_oval(x - radius - 3, y - radius - 3, x + radius + 3, y + radius + 3,
+                                   outline=color, dash=(2, 2), tags=("vessel", "approx"))
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                   outline=color, width=2, fill="",
+                                   tags=("vessel", "approx"))
+                canvas.create_oval(x - 1, y - 1, x + 1, y + 1, fill=color, outline="",
+                                   tags=("vessel", "approx"))
+            else:
+                course = vessel.get("cog")
+                if course is None:
+                    course = vessel.get("heading")
+                if course is not None:
+                    angle = math.radians(float(course))
+                    dx, dy = math.sin(angle), -math.cos(angle)
+                    canvas.create_line(x, y, x + dx * 14, y + dy * 14, fill=color,
+                                       width=1, tags=("vessel",))
+                canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
+                                   fill=color, outline="", tags=("vessel",))
+            # Суда без позиции подписываем всегда: их немного, и заказчику
+            # нужно видеть названия у порта.
+            if vessel.get("name") and (approximate or drawn % 7 == 0):
+                if self.schematic_view and not approximate:
                     canvas.create_text(x + 7, y - 7, text="", anchor="w",
                                        fill="#5d7280", font=("Consolas", 5))
                 else:
-                    canvas.create_text(x + 7, y - 7, text=vessel["name"], anchor="w",
-                                       fill="#d7e6ee" if not stale else "#5d7280",
+                    canvas.create_text(x + radius + 5, y - 7, text=vessel["name"], anchor="w",
+                                       fill=("#ffd79a" if approximate
+                                             else ("#d7e6ee" if not stale else "#5d7280")),
                                        font=("Consolas", 7))
-        self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_count)
+        self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_count,
+                          approx_count)
+
+    def _approx_position(self, vessel):
+        """Где показать судно без координат: порт назначения или последний визит."""
+        ports = self.config.get("ports") or []
+        destination = vessel.get("destination") or ""
+        if destination:
+            for port in ports:
+                name = str(port.get("name") or "").upper()
+                variants = [port.get("name"), port.get("label"),
+                            *(port.get("aliases") or []), *geo.PORT_ALIASES.get(name, ())]
+                if not port_matches(destination, [v for v in variants if v]):
+                    continue
+                try:
+                    return float(port["lat"]), float(port["lon"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+        visit = self._last_visit(vessel.get("mmsi"))
+        try:
+            if visit and visit.get("lat") is not None and visit.get("lon") is not None:
+                return float(visit["lat"]), float(visit["lon"])
+        except (TypeError, ValueError):
+            pass
+        return None
 
     def _last_visit(self, mmsi):
         """Последний визит судна (или None): у точки входа колонки lat/lon."""
@@ -547,15 +591,16 @@ class RadarCanvas:
             return float("inf")
         return minutes * 60
 
-    def _draw_legend(self, width, height, vessels, targets, drawn, stale):
-        fresh = drawn - stale
-        self.canvas.create_text(
-            10, 10, anchor="nw",
-            text=(f"источник: живой AIS (AISStream)\n"
-                  f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
-                  f"свежих: {fresh}   без данных > {self._stale_label()}: {stale}\n"
-                  f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}"),
-            fill="#5f8ea3", font=("Consolas", 8))
+    def _draw_legend(self, width, height, vessels, targets, drawn, stale, approximate=0):
+        fresh = drawn - stale - approximate
+        text = (f"источник: AIS-catcher (без ключа) и живые AIS-потоки\n"
+                f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
+                f"свежих: {fresh}   без данных > {self._stale_label()}: {stale}\n")
+        if approximate:
+            text += (f"без позиции у порта (○): {approximate} — AIS-catcher и списки портов\n")
+        text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
+        self.canvas.create_text(10, 10, anchor="nw", text=text,
+                                fill="#5f8ea3", font=("Consolas", 8))
 
     def _stale_label(self):
         seconds = self.stale_seconds()
@@ -1710,6 +1755,10 @@ class App:
             f"Координаты: {fmt_number(vessel.get('lat'))}, {fmt_number(vessel.get('lon'))}",
             f"Обновлено: {self.fmt_time(vessel.get('updated_at'))}",
         ]
+        if vessel.get("lat") is None or vessel.get("lon") is None:
+            lines.append("Позиция: неизвестна — на карте судно стоит у порта "
+                         f"{vessel.get('destination') or 'назначения'} (точка приблизительная; "
+                         "координаты не передаются ни одним бесплатным потоком)")
         declared = parse_iso(vessel.get("eta_declared"))
         voyage = self.core.voyage(vessel)
         if voyage:

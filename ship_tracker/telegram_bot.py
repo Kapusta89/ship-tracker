@@ -29,7 +29,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup
+from aiogram.types import FSInputFile, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,8 +39,10 @@ PHOTO_DIR = BASE_DIR / "data" / "photos"
 SENT_PATH = BASE_DIR / "data" / "bot_messages.json"
 LOCK_PATH = BASE_DIR / "data" / "bot.lock"
 EXPECTED_SEEN_PATH = BASE_DIR / "data" / "aci_seen.json"
+MAP_PATH = BASE_DIR / "data" / "map.png"
 
 CAPTION_LIMIT = 1024
+MAP_BUTTON = "🗺 Карта"
 
 DEFAULT_PORT_NAMES: List[str] = [
     "RENI", "IZMAIL", "VYLKOVE", "CHORNOMORSK", "ODESSA", "YUZHNY",
@@ -106,6 +108,7 @@ def make_port_keyboard() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     for name in DEFAULT_PORT_NAMES:
         builder.button(text=name)
+    builder.button(text=MAP_BUTTON)
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
@@ -555,7 +558,8 @@ async def cmd_start(message: Message):
         return
     sent = await message.answer(
         "🛳 <b>Ship Radar Bot</b>\n\n"
-        "Выберите порт — покажу все суда, которые в него идут.",
+        "Выберите порт — покажу все суда, которые в него идут.\n"
+        "Или нажмите «🗺 Карта» — пришлю картинку со всеми судами.",
         reply_markup=make_port_keyboard(),
     )
     remember(message.chat.id, sent)
@@ -570,6 +574,7 @@ async def cmd_help(message: Message):
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
         "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
+        "/map — карта-картинка со всеми судами (в том числе без позиции).\n"
         "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
         "/start — вернуть клавиатуру портов.",
         reply_markup=make_port_keyboard(),
@@ -651,6 +656,32 @@ async def cmd_expected(message: Message):
                      "показан прошлый список.")
     lines.append("ETA — заявленный капитаном, время UTC.")
     await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_map(message: Message):
+    """Карта-картинка: все суда, включая те, у кого нет координат."""
+    try:
+        mapimage = _import("mapimage")
+    except Exception as error:
+        await message.answer(f"Карта недоступна: {error}")
+        return
+    config = reload_config()
+    vessels = await asyncio.to_thread(lambda: get_core().related_vessels(1000))
+    ports = config.get("ports") or []
+    try:
+        await asyncio.to_thread(mapimage.render, vessels, ports, MAP_PATH)
+    except Exception as error:
+        log.warning("Карта не нарисована: %s", error)
+        await message.answer(f"Карту не удалось нарисовать: {error}")
+        return
+    without = sum(1 for vessel in vessels
+                  if vessel.get("lat") is None or vessel.get("lon") is None)
+    caption = ("🗺 <b>Карта: все суда</b>\n"
+               f"Всего: <b>{len(vessels)}</b> · с позицией: {len(vessels) - without} · "
+               f"без позиции (○ у порта): {without}\n"
+               "○ — судно без координат, показано у порта назначения "
+               "(AIS-catcher, без ключа).")
+    await message.answer_photo(FSInputFile(str(MAP_PATH)), caption=caption)
 
 
 async def cmd_sources(message: Message):
@@ -794,6 +825,8 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_expected, Command("expected"))
+    dp.message.register(cmd_map, Command("map"))
+    dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_sources, Command("sources"))
     dp.message.register(handle_port, F.text.in_(DEFAULT_PORT_NAMES))
     dp.message.register(fallback)

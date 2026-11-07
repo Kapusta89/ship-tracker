@@ -36,3 +36,4 @@ output.txt
 # Кэш проверки источников без ключа и журнал отправленных уведомлений
 **/data/sources.json
 **/data/aci_seen.json
+**/data/map.png
