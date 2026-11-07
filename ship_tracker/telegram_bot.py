@@ -16,6 +16,7 @@
 """
 
 import asyncio
+import html
 import importlib
 import json
 import logging
@@ -37,6 +38,7 @@ DB_PATH = BASE_DIR / "data" / "ship_tracker.db"
 PHOTO_DIR = BASE_DIR / "data" / "photos"
 SENT_PATH = BASE_DIR / "data" / "bot_messages.json"
 LOCK_PATH = BASE_DIR / "data" / "bot.lock"
+EXPECTED_SEEN_PATH = BASE_DIR / "data" / "aci_seen.json"
 
 CAPTION_LIMIT = 1024
 
@@ -606,6 +608,24 @@ async def handle_port(message: Message):
     state["task"] = asyncio.create_task(refresher(bot, chat_id, port_name))
 
 
+def _expected_lines(rows) -> list:
+    """Строки для сообщения: по портам, с ETA, MMSI и последним сигналом."""
+    by_port: dict = {}
+    for row in rows:
+        by_port.setdefault(row.get("port") or row.get("locode"), []).append(row)
+    lines = []
+    for port, items in by_port.items():
+        lines.append(f"\n<b>{port}</b> — {len(items)}")
+        for row in items[:10]:
+            tail = f" · MMSI {row['mmsi']}" if row.get("mmsi") else ""
+            heard = row.get("last_heard") or "—"
+            lines.append(f"• {html.escape(str(row.get('name') or '—'))} — "
+                         f"ETA {row.get('eta') or '—'} · сигнал {heard}{tail}")
+        if len(items) > 10:
+            lines.append(f"  …и ещё {len(items) - 10}")
+    return lines
+
+
 async def cmd_expected(message: Message):
     """Ожидаемые прибытия по всем нашим портам из бесплатного AIS-catcher."""
     try:
@@ -619,17 +639,17 @@ async def cmd_expected(message: Message):
             "Списка ожидаемых пока нет — его собирает приложение "
             "(включён канал «AIS-catcher: ожидаемые прибытия»).")
         return
-    by_port: dict = {}
-    for row in rows:
-        by_port.setdefault(row.get("port") or row.get("locode"), []).append(row)
     lines = ["⏱ <b>Ожидаемые прибытия</b>",
-             "Источник: AIS-catcher (открытая сеть приёмников)."]
-    for port, items in by_port.items():
-        lines.append(f"\n<b>{port}</b> — {len(items)}")
-        for row in items[:10]:
-            tail = f" · MMSI {row['mmsi']}" if row.get("mmsi") else ""
-            lines.append(f"• {row.get('name')} — ETA {row.get('eta') or '—'}{tail}")
-    lines.append("\nETA — заявленный капитаном, время UTC.")
+             f"Всего судов: <b>{len(rows)}</b>. Источник: AIS-catcher (без ключа)."]
+    lines += _expected_lines(rows)
+    cache = portcalls.load_cache()
+    when = (cache.get("updated") or "")[:16].replace("T", " ")
+    if when:
+        lines.append(f"\nСписок обновлён: {when} UTC.")
+    if cache.get("stale"):
+        lines.append("Сейчас страницы AIS-catcher отдают 0 судов — "
+                     "показан прошлый список.")
+    lines.append("ETA — заявленный капитаном, время UTC.")
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -677,6 +697,22 @@ async def cmd_sources(message: Message):
         await message.answer("\n".join(lines + [f"Проверка не удалась: {error}"]),
                              disable_web_page_preview=True)
         return
+    # 3. Что реально нашёл бесплатный AIS-catcher — главный источник без ключа
+    try:
+        expected = portcalls.expected_rows()
+        cache = portcalls.load_cache()
+        when = (cache.get("updated") or "")[:16].replace("T", " ")
+        if expected:
+            lines.append("")
+            lines.append("<b>AIS-catcher: найденные суда</b>")
+            lines.append(f"В Destination наш порт: <b>{len(expected)}</b>"
+                         + (f" (список от {when} UTC)" if when else ""))
+            lines += _expected_lines(expected)
+            if cache.get("stale"):
+                lines.append("Страницы сейчас отдают 0 — показан прошлый список.")
+    except Exception as error:
+        lines.append(f"AIS-catcher: список не прочитан ({error}).")
+
     for result in results:
         if result.get("ok"):
             icon = "✅"
@@ -692,6 +728,58 @@ async def cmd_sources(message: Message):
     lines.append("✅ читается автоматически, ⚠️ сайт жив, но только глазами, "
                  "❌ не отвечает. Ключи задаются во вкладке «Подключение».")
     await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+def _load_expected_seen() -> dict:
+    try:
+        data = json.loads(EXPECTED_SEEN_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_expected_seen(data: dict) -> None:
+    tmp = EXPECTED_SEEN_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, EXPECTED_SEEN_PATH)
+    except OSError:
+        pass
+
+
+async def expected_watcher(bot: Bot) -> None:
+    """Сам показывает в чате результат бесплатного AIS-catcher.
+
+    Раз в 2 минуты смотрит на data/expected.json: если появились новые суда
+    (или список пришёл впервые), отправляет их в чат. Те же MMSI повторно
+    не присылает — журнал в data/aci_seen.json.
+    """
+    await asyncio.sleep(10)
+    while True:
+        try:
+            portcalls = _import("portcalls")
+            rows = portcalls.expected_rows()
+            chat_id = (reload_config().get("telegram_chat_id") or "").strip()
+            if rows and chat_id:
+                seen = _load_expected_seen()
+                known = {str(m) for m in (seen.get("mmsi") or [])}
+                current = {str(row.get("mmsi")) for row in rows if row.get("mmsi")}
+                fresh = [row for row in rows
+                         if str(row.get("mmsi")) not in known]
+                if fresh:
+                    lines = ["🆕 <b>AIS-catcher: суда с нашим портом в назначении</b>",
+                             f"Новых: <b>{len(fresh)}</b> · всего в списке: {len(rows)}."]
+                    lines += _expected_lines(fresh)
+                    when = (rows[0].get("updated") or "")[:16].replace("T", " ")
+                    if when:
+                        lines.append(f"\nСписок обновлён: {when} UTC.")
+                    await bot.send_message(int(chat_id), "\n".join(lines),
+                                          disable_web_page_preview=True)
+                _save_expected_seen({"mmsi": sorted(current),
+                                     "updated": rows[0].get("updated") or ""})
+        except Exception as error:
+            logging.warning("AIS-catcher: уведомление не отправлено (%s)", error)
+        await asyncio.sleep(120)
 
 
 async def fallback(message: Message):
@@ -766,10 +854,12 @@ async def run_bot():
         return
     bot, dp = make_dispatcher()
     ingesting = start_ingest()
+    watcher = asyncio.create_task(expected_watcher(bot))
     logging.info("Ship Radar Bot запущен, ожидаю сообщения.")
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
+        watcher.cancel()
         await bot.session.close()
         if ingesting:
             try:

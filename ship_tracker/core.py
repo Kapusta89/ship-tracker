@@ -27,6 +27,7 @@ import analysis
 import cargo
 import flags
 import geo
+import portcalls
 import services_feed
 from store import Store, parse_iso
 
@@ -766,11 +767,49 @@ class RadarCore:
             forgotten = self.store.forget_vessels(self.config.get("forget_vessels_hours") or 24)
             if forgotten:
                 self.log(f"Убрано из списка судов без связи: {forgotten}.")
+            added = self.sync_expected()
+            if added:
+                self.log(f"AIS-catcher: в базу добавлено ожидаемых судов {added}.")
             dropped = self.purge_unrelated()
             if dropped:
                 self.log(f"Убрано судов вне наших портов: {dropped}.")
         except Exception as error:
             self.log(f"Обслуживание базы: {error}")
+
+    def sync_expected(self) -> int:
+        """Заносит суда из бесплатного AIS-catcher в базу — без координат.
+
+        Портовые страницы AIS-catcher — единственный источник без ключа,
+        который знает наши суда. Координат он не отдаёт, поэтому судно живёт
+        в базе с пустой позицией: на карту оно не попадает, зато видно в
+        списках приложения и в боте. Возвращает число новых судов.
+        """
+        try:
+            stamp = portcalls.EXPECTED_PATH.stat().st_mtime
+        except OSError:
+            return 0
+        if stamp == getattr(self, "_expected_stamp", None):
+            return 0
+        rows = portcalls.expected_rows()
+        self._expected_stamp = stamp
+        added = 0
+        for row in rows:
+            mmsi = str(row.get("mmsi") or "").strip()
+            if not mmsi.isdigit():
+                continue
+            port = row.get("port") or row.get("locode")
+            if not port:
+                continue
+            known = self.store.vessel(mmsi)
+            values = {"destination": port}
+            if not known:
+                values["name"] = row.get("name") or None
+                if row.get("type"):
+                    values["type_label"] = row["type"]
+                added += 1
+            self.store.upsert_static(mmsi, **values)
+            self.store.set_tracked(mmsi, True)
+        return added
 
     def process(self, event):
         kind = event.get("kind")

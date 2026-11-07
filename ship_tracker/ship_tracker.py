@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.08"
+APP_VERSION = "2026.11.09"
 
 import ais_feed
 import cargo
@@ -2013,28 +2013,34 @@ class App:
         tree = self.vessels_tree
         for item in tree.get_children():
             tree.delete(item)
+        rows = portcalls.expected_rows()
+        updated = (rows[0].get("updated") or "")[:16].replace("T", " ") if rows else ""
+        expected_map = {str(row.get("mmsi") or ""): row for row in rows}
         seen = set()
         for vessel in self.core.related_vessels(500):
-            seen.add(str(vessel.get("mmsi")))
+            mmsi = str(vessel.get("mmsi"))
+            seen.add(mmsi)
+            info = expected_map.get(mmsi)
+            # судно из AIS-catcher: координат у него нет, вместо расчёта — заявленный ETA
+            no_position = info and (vessel.get("lat") is None or vessel.get("lon") is None)
             tree.insert("", "end", tags=(vessel["mmsi"],), values=(
                 vessel.get("name") or "—",
                 flags.flag_text(vessel["mmsi"]),
                 vessel.get("type_label") or "—",
-                self.size_text(vessel),
+                "нет позиции" if no_position else self.size_text(vessel),
                 vessel.get("destination") or "—",
-                self.voyage_text(vessel),
-                self.stay_text(vessel),
+                (f"ETA {info.get('eta') or '—'}" if no_position
+                 else self.voyage_text(vessel)),
+                "—" if no_position else self.stay_text(vessel),
                 self.cargo_text(vessel),
                 self.cargo_kind_text(vessel),
                 fmt_number(vessel.get("sog")),
-                vessel.get("port") or "—",
-                self.fmt_time(vessel.get("updated_at")),
+                "ожидается" if no_position else (vessel.get("port") or "—"),
+                (f"сигнал {info.get('last_heard') or '—'} · AIS-catcher {updated}"
+                 if no_position else self.fmt_time(vessel.get("updated_at"))),
                 vessel.get("mmsi"),
             ))
-        # Ожидаемые: у них наш порт в Destination, но в бесплатных потоках
-        # позиции нет. Всё равно показываем — без координат и карты.
-        rows = portcalls.expected_rows()
-        updated = (rows[0].get("updated") or "")[:16].replace("T", " ") if rows else ""
+        # Если база ещё не успела принять список — показываем строки напрямую.
         for row in rows:
             mmsi = str(row.get("mmsi") or "")
             if not mmsi or mmsi in seen:

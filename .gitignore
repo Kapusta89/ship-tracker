@@ -33,5 +33,6 @@ output.txt
 **/data/expected.json
 **/data/gfw.json
 
-# Кэш проверки источников без ключа
+# Кэш проверки источников без ключа и журнал отправленных уведомлений
 **/data/sources.json
+**/data/aci_seen.json
