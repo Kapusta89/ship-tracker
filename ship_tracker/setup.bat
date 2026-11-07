@@ -6,7 +6,7 @@ title Ship Tracker — подготовка окружения
 cd /d "%~dp0"
 
 set "PY="
-call "%~dp0env.bat"
+call "%~dp0env.bat" app
 if errorlevel 1 goto failed
 
 echo.

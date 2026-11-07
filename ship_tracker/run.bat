@@ -14,7 +14,7 @@ if not exist "ship_tracker.py" (
 if not exist "%~dp0data" mkdir "%~dp0data" >nul 2>nul
 
 set "PY="
-call "%~dp0env.bat"
+call "%~dp0env.bat" app
 if errorlevel 1 goto failed
 
 "%PY%" -X utf8 "ship_tracker.py" %*

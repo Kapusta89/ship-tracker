@@ -6,7 +6,7 @@ title Ship Radar Bot
 cd /d "%~dp0"
 
 set "PY="
-call "%~dp0env.bat"
+call "%~dp0env.bat" bot
 if errorlevel 1 goto failed
 
 echo.

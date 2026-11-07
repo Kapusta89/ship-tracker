@@ -21,6 +21,7 @@ __pycache__/
 **/data/credits*.json
 **/data/errors.log
 **/data/headless_check.log
+**/data/diagnose.txt
 
 # Служебное Freebuff и артефакты сборки
 .freebuff/

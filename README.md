@@ -22,9 +22,11 @@
 | `run.bat` | приложение с окном (карта, суда, стоянки, настройки) |
 | `bot.bat` | телеграм-бот |
 | `setup.bat` | только подготовить окружение, ничего не запускать |
+| `check.bat` | самопроверка: отчёт `data/diagnose.txt` о том, что мешает запуску |
 
 Первый запуск на новом компьютере занимает 1–3 минуты: скрипт находит Python,
-создаёт папку `.venv` и ставит зависимости. Дальше запуск мгновенный.
+создаёт окружение **вне папки проекта** — `%LOCALAPPDATA%\ShipTracker\venv` —
+и ставит зависимости. Дальше запуск мгновенный.
 Приложение и бот можно держать открытыми одновременно: AIS принимает только
 один процесс, второй читает ту же базу (`data/feed.lock`).
 
@@ -49,15 +51,16 @@
 
 Приложение можно запустить и напрямую, минуя bat-файл (аргументы те же):
 
-    .venv\Scripts\python.exe -X utf8 ship_tracker.py
-    .venv\Scripts\python.exe -X utf8 ship_tracker.py --headless --minutes 60
-    .venv\Scripts\python.exe -X utf8 telegram_bot.py
+    %LOCALAPPDATA%\ShipTracker\venv\Scripts\python.exe -X utf8 ship_tracker.py
+    %LOCALAPPDATA%\ShipTracker\venv\Scripts\python.exe -X utf8 ship_tracker.py --headless --minutes 60
+    %LOCALAPPDATA%\ShipTracker\venv\Scripts\python.exe -X utf8 telegram_bot.py
 
 В PowerShell те же команды пишутся с `.\`:
 
     .\run.bat
     .\bot.bat
-    .venv\Scripts\python.exe -X utf8 ship_tracker.py
+    .\check.bat
+    & "$env:LOCALAPPDATA\ShipTracker\venv\Scripts\python.exe" -X utf8 ship_tracker.py
 
 На Linux/macOS:
 
@@ -74,14 +77,18 @@
 
 ## Если проблемы с окружением
 
-Папка `.venv` привязана к конкретному компьютеру и к пути, поэтому переносить
-её нельзя. Копируйте проект **без** `.venv` и `.venv_old` — окружение соберётся
-заново.
+Окружение (Python и пакеты) хранится **вне проекта**:
+`%LOCALAPPDATA%\ShipTracker\venv`, журнал подготовки —
+`%LOCALAPPDATA%\ShipTracker\env.log`. Раньше оно лежало в папке проекта
+(`.venv`), синхронизировалось через OneDrive и приезжало на другой компьютер
+битым — из-за этого приложение «не открывалось». Теперь папку проекта можно
+спокойно копировать и переносить: посторонних файлов в ней нет.
 
-**«Окружение .venv не подходит этому компьютеру — собираю заново»**
-Это нормальное сообщение: скрипт сам переименовал старое окружение в
-`.venv_old` и ставит новое. Дождитесь окончания. Папку `.venv_old` после
-успешного запуска можно удалить — она больше не нужна и занимает ~100 МБ.
+**Начните с `check.bat`.** Он готовит окружение и проверяет по порядку: Python
+и его разрядность, tkinter, пакеты, `data/config.json`, запись в базу, доступ к
+api.telegram.org, aiscatcher.org, GFW и aisstream.io. Итог сохраняется в
+`data/diagnose.txt` и сразу открывается в блокноте — этот файл можно переслать
+вместе с `data/errors.log`.
 
 **«Не найден Python 3»**
 Установите Python с https://www.python.org/downloads/windows/, при установке
@@ -95,27 +102,32 @@
 Нужен 3.9 или новее, лучше 3.11–3.13. Установите новый Python и запустите
 `run.bat` снова. Старый можно не удалять.
 
-**«Не удалось установить зависимости из requirements.txt»**
-Проверьте интернет, VPN/прокси и антивирус. Затем повторите:
+**«Python установлен без библиотеки tkinter»**
+Окно открыться не может: установщик python.org был без tcl/tk. Переустановите
+Python и отметьте при установке **tcl/tk and IDLE**. Если нужен только бот —
+`bot.bat` работает и без tkinter.
 
+**«Не удалось установить пакеты из requirements.txt»**
+Проверьте интернет, VPN/прокси и антивирус, затем повторите `setup.bat`.
+Журнал установки — `%LOCALAPPDATA%\ShipTracker\env.log`. Если в отдельное
+окружение поставить не удалось, скрипт сам пробует системный Python с `--user`.
+Установить вручную и увидеть текст ошибки:
+
+    "%LOCALAPPDATA%\ShipTracker\venv\Scripts\python.exe" -m pip install -r requirements.txt
+
+**Окружение испортилось (обновили Python, скопировали папку)**
+Проверка идёт при каждом запуске: если окружение не подходит этому компьютеру,
+скрипт собирает его заново сам. Полный сброс вручную:
+
+    rmdir /s /q "%LOCALAPPDATA%\ShipTracker\venv"
     setup.bat
 
-Если не помогло — установите вручную и посмотрите текст ошибки:
-
-    .venv\Scripts\python.exe -m pip install -r requirements.txt
-
-**«Не удалось создать .venv»**
-Чаще всего мешает OneDrive (папка синхронизируется) или антивирус. Приостановите
-синхронизацию OneDrive на время установки, затем повторите `setup.bat`.
-Полный сброс окружения:
-
-    rmdir /s /q .venv
-    rmdir /s /q .venv_old
-    setup.bat
+Старую папку `.venv` внутри проекта (если она осталась от предыдущих версий)
+можно удалить — она больше не используется и занимает ~80 МБ.
 
 **Проверить, что окружение собрано правильно**
 
-    .venv\Scripts\python.exe -c "import tkinter, requests, websockets, PIL, aiogram"
+    "%LOCALAPPDATA%\ShipTracker\venv\Scripts\python.exe" -c "import tkinter, requests, websockets, PIL, aiogram"
 
 Если команда завершилась без ошибок — всё на месте. Если ругается на `tkinter`,
 переустановите Python с python.org (в стандартном установщике tcl/tk включён).
@@ -134,7 +146,8 @@ or external command»**
 `git rm --cached -r . && git reset --hard`.
 
 **«Приложение мигнуло и закрылось»**
-Причина пишется в `data/errors.log`. Откройте файл и посмотрите последнюю
+Запустите `check.bat` — он покажет проблему и сохранит отчёт. Причина также
+пишется в `data/errors.log`. Откройте файл и посмотрите последнюю
 запись. Также помогает запуск из `cmd` — текст ошибки останется в консоли.
 
 **Бот не отвечает / «второй экземпляр»**
@@ -165,7 +178,9 @@ Open Waters работают без ключа. Если статусы «на �
       telegram_bot.py        бот: порт → суда в этот порт, карточки, автообновление
       mapimage.py            карта-картинка для бота (/map и кнопка «Карта»)
       store.py               SQLite: суда, позиции, визиты
-      env.bat                проверка и сборка .venv (вызывают run/bot/setup)
+      env.bat                проверка Python и сборка окружения (вызывают run/bot/setup)
+      check.bat              самопроверка запуска, отчёт в data/diagnose.txt
+      diagnose.py            проверки для check.bat: tkinter, пакеты, ключи, сеть
       data/                  настройки и база (не коммитятся)
     open_ship_tracker.py     запуск приложения из корня
     ship_tracker/README.md   подробное описание, каналы данных и лимиты
