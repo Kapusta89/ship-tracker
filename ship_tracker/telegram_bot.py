@@ -309,6 +309,18 @@ def vessel_card(vessel: dict, core) -> str:
     declared = store_module.parse_iso(vessel.get("eta_declared"))
     lines.append(f"Срок прибытия (AIS): {core_module.fmt_moment(declared) if declared else '—'} "
                  f"(передаёт капитан, в UTC)")
+    try:
+        portcalls = _import("portcalls")
+    except Exception:
+        portcalls = None
+    if portcalls is not None:
+        expected = portcalls.expected_for_mmsi(mmsi)
+        if expected:
+            lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
+                         f"{expected.get('eta') or '—'} (AIS-catcher)")
+        gfw_text = portcalls.gfw_gap_text(portcalls.gfw_vessel(None, mmsi))
+        if gfw_text:
+            lines.append(gfw_text)
 
     stay = core.port_stay(vessel)
     if stay:
@@ -350,6 +362,10 @@ def vessel_card(vessel: dict, core) -> str:
     if vessel.get("imo") or mmsi:
         lines.append(f"VesselFinder: https://www.vesselfinder.com/vessels/details/"
                      f"{vessel.get('imo') or mmsi}")
+    if portcalls is not None:
+        lines.append("<b>Проверить в реестрах:</b>")
+        for title, url in portcalls.registry_links(vessel.get("imo"), mmsi)[:3]:
+            lines.append(f'• <a href="{url}">{title}</a>')
     return "\n".join(lines)
 
 
@@ -549,6 +565,7 @@ async def cmd_help(message: Message):
         "В карточке есть маршрут: текущие координаты и прогноз на 5 дней.\n"
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
+        "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
         "/start — вернуть клавиатуру портов.",
         reply_markup=make_port_keyboard(),
     )
@@ -586,6 +603,33 @@ async def handle_port(message: Message):
     state["task"] = asyncio.create_task(refresher(bot, chat_id, port_name))
 
 
+async def cmd_expected(message: Message):
+    """Ожидаемые прибытия по всем нашим портам из бесплатного AIS-catcher."""
+    try:
+        portcalls = _import("portcalls")
+    except Exception as error:
+        await message.answer(f"Список ожидаемых недоступен: {error}")
+        return
+    rows = portcalls.expected_rows()
+    if not rows:
+        await message.answer(
+            "Списка ожидаемых пока нет — его собирает приложение "
+            "(включён канал «AIS-catcher: ожидаемые прибытия»).")
+        return
+    by_port: dict = {}
+    for row in rows:
+        by_port.setdefault(row.get("port") or row.get("locode"), []).append(row)
+    lines = ["⏱ <b>Ожидаемые прибытия</b>",
+             "Источник: AIS-catcher (открытая сеть приёмников)."]
+    for port, items in by_port.items():
+        lines.append(f"\n<b>{port}</b> — {len(items)}")
+        for row in items[:10]:
+            tail = f" · MMSI {row['mmsi']}" if row.get("mmsi") else ""
+            lines.append(f"• {row.get('name')} — ETA {row.get('eta') or '—'}{tail}")
+    lines.append("\nETA — заявленный капитаном, время UTC.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
 async def fallback(message: Message):
     await message.answer("Выберите порт:", reply_markup=make_port_keyboard())
 
@@ -597,6 +641,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp = Dispatcher()
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_expected, Command("expected"))
     dp.message.register(handle_port, F.text.in_(DEFAULT_PORT_NAMES))
     dp.message.register(fallback)
     return bot, dp

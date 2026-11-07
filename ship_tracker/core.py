@@ -56,6 +56,15 @@ DEFAULT_CONFIG = {
     "use_mt": False,
     "use_mst": False,
     "use_dt": False,
+    # бесплатные открытые источники: ожидаемые прибытия AIS-catcher,
+    # профили и разрывы AIS в Global Fishing Watch (нужен токен)
+    "use_aci": True,
+    "aci_minutes": 60,
+    "use_gfw": False,
+    "gfw_key": "",
+    "gfw_minutes": 720,
+    "gfw_days": 7,
+    "gfw_max_vessels": 10,
     "vf_key": "",
     "mt_key": "",
     "mst_key": "",
@@ -496,7 +505,7 @@ class RadarCore:
         """Поднимает опрос выбранных внешних сервисов (см. services_feed)."""
         config = self.config
         self.service_status = {}
-        for key in ("vf", "vfa", "mt", "mst", "dt"):
+        for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
@@ -521,7 +530,10 @@ class RadarCore:
                 state_path=DATA_DIR / "credits.json",
                 ports=config.get("ports"),
                 lookahead_minutes=config.get("vfa_lookahead_minutes"),
-                max_records=config.get("vfa_max_records"))
+                max_records=config.get("vfa_max_records"),
+                cache_path=(DATA_DIR / "expected.json" if key == "aci"
+                            else DATA_DIR / "gfw.json" if key == "gfw" else None),
+                days=config.get("gfw_days"))
             if feed is None:
                 self._set_service_status(key, "нет доступного API")
                 continue

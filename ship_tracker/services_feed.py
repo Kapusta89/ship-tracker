@@ -24,9 +24,12 @@ from datetime import datetime
 from pathlib import Path
 
 import geo
+import portcalls
 
 # Названия для журнала и статусов.
 SERVICE_TITLES = {
+    "aci": "AIS-catcher: ожидаемые прибытия",
+    "gfw": "Global Fishing Watch (разрывы AIS)",
     "vf": "VesselFinder",
     "vfa": "VesselFinder: ожидаемые прибытия",
     "mt": "MarineTraffic",
@@ -664,6 +667,150 @@ class VesselFinderArrivals(ServiceFeed):
         self.ok(found, detail)
 
 
+class AiscatcherExpected(ServiceFeed):
+    """Ожидаемые прибытия из сети AIS-catcher: бесплатно, без ключа.
+
+    Страница порта во вкладке Expected отдаёт таблицу судов, у которых
+    в AIS записан наш порт, с заявленным ETA и временем последнего сигнала.
+    Канал не пишет в базу позиции (их там нет), а обновляет файл
+    data/expected.json — его читают вкладка «Ожидаемые» и бот.
+    """
+
+    key = "aci"
+    interval = 3600.0
+
+    def __init__(self, *args, ports=None, cache_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ports = list(ports or []) or list(geo.DEFAULT_PORTS)
+        self.cache_path = Path(cache_path) if cache_path else portcalls.EXPECTED_PATH
+        if kwargs.get("minutes"):
+            self.interval = max(900.0, float(kwargs["minutes"]) * 60.0)
+
+    def poll_once(self):
+        data = portcalls.fetch_expected(self.ports, log=self.log)
+        portcalls.save_cache(data, self.cache_path)
+        total = sum(len(entry.get("vessels") or [])
+                    for entry in (data.get("ports") or {}).values())
+        failed = [entry for entry in (data.get("ports") or {}).values()
+                  if entry.get("error")]
+        if failed and len(failed) == len(data.get("ports") or {}):
+            raise RuntimeError(failed[0].get("error") or "страницы портов недоступны")
+        detail = f"портов {len(data.get('ports') or {})}"
+        if failed:
+            detail += f", с ошибкой {len(failed)}"
+        self.ok(total, detail)
+
+
+class GfwFeed(ServiceFeed):
+    """Global Fishing Watch: профиль судна и разрывы AIS (нужен токен).
+
+    API v3 по бесплатному токену: поиск судна по MMSI в реестровом датасете
+    и события GAP (пропажа AIS) за последние дни. Данные кладутся в
+    data/gfw.json и показываются в карточке судна.
+    """
+
+    key = "gfw"
+    interval = 43200.0
+
+    def __init__(self, *args, vessels=None, max_vessels=None, days=None,
+                 cache_path=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vessels = vessels or (lambda: [])
+        self.max_vessels = max(1, int(max_vessels or 10))
+        self.days = max(1, int(days or 7))
+        self.cache_path = Path(cache_path) if cache_path else portcalls.GFW_PATH
+        if kwargs.get("minutes"):
+            self.interval = max(3600.0, float(kwargs["minutes"]) * 60.0)
+
+    def headers(self):
+        return {"Authorization": f"Bearer {self.api_key}",
+                "Accept": "application/json"}
+
+    def vessel_id(self, mmsi):
+        data = self.request(
+            portcalls.GFW_SEARCH_URL,
+            params={"query": mmsi, "datasets[0]": portcalls.GFW_IDENTITY_DATASET,
+                    "limit": 1},
+            headers=self.headers(), timeout=45)
+        entries = (data or {}).get("entries") or []
+        if not entries:
+            return None
+        entry = entries[0] if isinstance(entries[0], dict) else {}
+        info = entry.get("selfReportedInfo") or []
+        info = info[0] if info and isinstance(info[0], dict) else {}
+        vessel_id = info.get("id") or entry.get("id")
+        if not vessel_id:
+            return None
+        return {"id": str(vessel_id), "name": info.get("shipName") or "",
+                "flag": info.get("flag") or "", "imo": info.get("imo") or ""}
+
+    def last_gap(self, vessel_id):
+        from datetime import timedelta
+
+        today = datetime.now().date()
+        start = (today - timedelta(days=self.days)).isoformat()
+        data = self.request(
+            portcalls.GFW_EVENTS_URL,
+            params={"datasets[0]": portcalls.GFW_GAPS_DATASET,
+                    "vessels[0]": vessel_id, "start-date": start,
+                    "end-date": today.isoformat(), "limit": 5},
+            headers=self.headers(), timeout=45)
+        entries = (data or {}).get("entries") or []
+        gaps = [entry for entry in entries if isinstance(entry, dict)]
+        if not gaps:
+            return None
+        gaps.sort(key=lambda entry: str(entry.get("end") or ""), reverse=True)
+        gap = gaps[0]
+        position = gap.get("position") or {}
+        hours = None
+        try:
+            begin, end = _time(gap.get("start")), _time(gap.get("end"))
+            if begin and end:
+                hours = round((end - begin).total_seconds() / 3600, 1)
+        except (TypeError, ValueError):
+            hours = None
+        where = ""
+        if position.get("lat") is not None and position.get("lon") is not None:
+            where = f"{float(position['lat']):.2f}, {float(position['lon']):.2f}"
+        return {"start": str(gap.get("start") or ""),
+                "end": str(gap.get("end") or "")[:16].replace("T", " "),
+                "hours": hours, "position_text": where}
+
+    def poll_once(self):
+        cache = portcalls.load_gfw(self.cache_path)
+        known = cache.get("vessels") if isinstance(cache.get("vessels"), dict) else {}
+        found = gaps = 0
+        errors = 0
+        for mmsi in list(self.vessels())[:self.max_vessels]:
+            if self.stop_event.is_set():
+                break
+            mmsi = str(mmsi or "")
+            if not mmsi:
+                continue
+            try:
+                profile = self.vessel_id(mmsi)
+                if not profile:
+                    continue
+                record = dict(known.get(mmsi) or {})
+                record.update(profile)
+                record["gap"] = self.last_gap(profile["id"])
+                record["checked"] = datetime.now().isoformat(timespec="seconds")
+                known[mmsi] = record
+                found += 1
+                gaps += 1 if record.get("gap") else 0
+            except Exception as error:
+                errors += 1
+                if errors == 1:
+                    self.log(f"{self.title}: {error}")
+            self.stop_event.wait(1.0)
+        cache["vessels"] = known
+        cache["updated"] = datetime.now().isoformat(timespec="seconds")
+        portcalls.save_gfw(cache, self.cache_path)
+        if found == 0 and errors:
+            raise RuntimeError("профили не получены (проверьте токен GFW)")
+        self.ok(found, f"с разрывами AIS {gaps}")
+
+
 class MarineTrafficFeed(ServiceFeed):
     """API MarineTraffic: ключ в пути, район задаётся в кабинете."""
 
@@ -718,16 +865,19 @@ PROVIDERS = {
     "mt": MarineTrafficFeed,
     "mst": MyShipTrackingFeed,
     "dt": DigitrafficFeed,
+    "aci": AiscatcherExpected,
+    "gfw": GfwFeed,
 }
 
 
 def needs_key(key):
-    return key in ("vf", "vfa", "mt", "mst")
+    return key in ("vf", "vfa", "mt", "mst", "gfw")
 
 
 def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=None,
           vessels=None, minutes=None, daily_coins=None, max_vessels=None,
-          state_path=None, ports=None, lookahead_minutes=None, max_records=None):
+          state_path=None, ports=None, lookahead_minutes=None, max_records=None,
+          cache_path=None, days=None):
     """Создаёт поток опроса сервиса. None — если сервис не умеет отдавать данные."""
     provider = PROVIDERS.get(key)
     if provider is None:
@@ -737,4 +887,4 @@ def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=Non
                     minutes=minutes, daily_coins=daily_coins,
                     max_vessels=max_vessels, state_path=state_path,
                     ports=ports, lookahead_minutes=lookahead_minutes,
-                    max_records=max_records)
+                    max_records=max_records, cache_path=cache_path, days=days)

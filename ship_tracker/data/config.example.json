@@ -116,5 +116,12 @@
   "vfa_minutes": 720,
   "vfa_lookahead_minutes": 720,
   "vfa_max_records": 40,
-  "vfa_daily_coins": 300
+  "vfa_daily_coins": 300,
+  "use_aci": true,
+  "aci_minutes": 60,
+  "use_gfw": false,
+  "gfw_key": "",
+  "gfw_minutes": 720,
+  "gfw_days": 7,
+  "gfw_max_vessels": 10
 }

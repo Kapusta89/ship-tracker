@@ -43,6 +43,7 @@ import flags
 import forecast
 import geo
 import photos
+import portcalls
 import services_feed
 from core import (AppError, BotCommander, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
                   duration_text, fmt_moment, fmt_number, fmt_tons, load_config, span_text,
@@ -56,7 +57,8 @@ PHOTO_DIR = DATA_DIR / "photos"
 
 # Поля с ключами API тех сервисов, которым они нужны.
 SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "vfa": "var_vf_key",
-                      "mt": "var_mt_key", "mst": "var_mst_key"}
+                      "mt": "var_mt_key", "mst": "var_mst_key",
+                      "gfw": "var_gfw_token"}
 
 # Дополнительные подключения: название, ключ настройки, описание и сайт с ключом.
 SERVICE_BLOCKS = [
@@ -66,6 +68,10 @@ SERVICE_BLOCKS = [
     ("MarineTraffic", "mt", "живой API по ключу, район задаётся в кабинете"),
     ("MyShipTracking", "mst", "триал 2000 кредитов: расширенные данные по нашим судам"),
     ("Digitraffic", "dt", "открытые данные Финляндии, только Балтика"),
+    ("AIS-catcher: ожидаемые прибытия", "aci",
+     "бесплатно, без ключа: суда, идущие в наши порты"),
+    ("Global Fishing Watch", "gfw",
+     "бесплатный токен: профиль судна и разрывы AIS"),
 ]
 
 SERVICE_SITES = {
@@ -74,6 +80,8 @@ SERVICE_SITES = {
     "mt": ("marinetraffic.com", "https://www.marinetraffic.com/"),
     "mst": ("myshiptracking.com", "https://www.myshiptracking.com/"),
     "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
+    "aci": ("AIS-catcher", "https://www.aiscatcher.org/port/UAIZM?tab=expected"),
+    "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
 }
 
 
@@ -645,6 +653,7 @@ class App:
         self.tab_vessels = ttk.Frame(notebook)
         self.tab_alerts = ttk.Frame(notebook)
         self.tab_visits = ttk.Frame(notebook)
+        self.tab_expected = ttk.Frame(notebook)
         self.tab_connection = ttk.Frame(notebook)
         self.tab_filters = ttk.Frame(notebook)
         self.tab_telegram = ttk.Frame(notebook)
@@ -652,6 +661,7 @@ class App:
         self.tab_log = ttk.Frame(notebook)
         for tab, title in ((self.tab_radar, "Радар"),
                            (self.tab_vessels, "Все суда"), (self.tab_visits, "Стоянки"),
+                           (self.tab_expected, "Ожидаемые"),
                            (self.tab_alerts, "Алерты"),
                            (self.tab_connection, "Подключение"), (self.tab_filters, "Фильтры"),
                            (self.tab_telegram, "Telegram"), (self.tab_services, "Сервисы"),
@@ -661,6 +671,7 @@ class App:
         self.build_radar()
         self.build_vessels()
         self.build_visits()
+        self.build_expected()
         self.build_alerts()
         self.build_connection()
         self.build_filters()
@@ -828,6 +839,79 @@ class App:
         finally:
             self._history_loading = False
 
+    def build_expected(self):
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_expected
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="Кто указал наш порт пунктом назначения — таблица портовых "
+                            "страниц AIS-catcher (открытая сеть приёмников, без ключа).",
+                  foreground="#555").pack(side="left")
+        ttk.Button(top, text="Обновить сейчас", command=self.refresh_expected_now
+                   ).pack(side="right")
+        self.expected_info = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.expected_info, foreground="#555").pack(
+            anchor="w", padx=8, pady=(0, 4))
+        self.expected_tree = self.make_tree(
+            frame, (("port", "Порт", 110), ("name", "Судно", 180),
+                    ("type", "Тип", 130), ("eta", "Заявленный ETA", 140),
+                    ("heard", "Последний сигнал", 150), ("mmsi", "MMSI", 100),
+                    ("updated", "Обновлено", 130)))
+        self.refresh_expected()
+
+    def refresh_expected(self):
+        tree = getattr(self, "expected_tree", None)
+        if not tree:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        rows = portcalls.expected_rows()
+        for row in rows:
+            at = portcalls.load_cache().get("updated") or ""
+            when = at[:16].replace("T", " ") if at else "—"
+            tree.insert("", "end", values=(
+                row.get("port"), row.get("name"), row.get("type") or "—",
+                row.get("eta") or "—", row.get("last_heard") or "—",
+                row.get("mmsi"), when))
+        cache = portcalls.load_cache()
+        ports = cache.get("ports") or {}
+        failed = [entry.get("name") for entry in ports.values() if entry.get("error")]
+        missing = [entry.get("name") for entry in ports.values() if entry.get("unsupported")]
+        info = (f"Ожидается судов: {len(rows)} в портах: {len(ports)}."
+                if ports else "Данных пока нет: нажмите «Обновить сейчас».")
+        if failed:
+            info += f" Не ответили: {', '.join(failed)}."
+        if missing:
+            info += f" Нет страницы у AIS-catcher: {', '.join(missing)}."
+        if rows:
+            info += (" Заявленный ETA — то, что передал капитан (UTC); у некоторых "
+                     "судов он устарел — смотрите колонку «Последний сигнал».")
+        self.expected_info.set(info)
+
+    def refresh_expected_now(self):
+        if getattr(self, "_expected_loading", False):
+            self.log("Обновление ожидаемых уже идёт — подождите.")
+            return
+        self._expected_loading = True
+        threading.Thread(target=self._expected_worker, daemon=True).start()
+
+    def _expected_worker(self):
+        self.log("AIS-catcher: запрашиваю ожидаемые прибытия по нашим портам…")
+        try:
+            data = portcalls.fetch_expected(self.config.get("ports"), log=self.log)
+            portcalls.save_cache(data)
+            total = sum(len(entry.get("vessels") or [])
+                        for entry in (data.get("ports") or {}).values())
+            self.log(f"AIS-catcher: ожидаемых судов {total}.")
+        except Exception as error:
+            self.log(f"AIS-catcher: ошибка — {error}")
+        finally:
+            self._expected_loading = False
+            try:
+                self.root.after(0, self.refresh_expected)
+            except Exception:
+                pass
+
     def build_alerts(self):
         ttk = self.ttk
         frame = self.tab_alerts
@@ -884,13 +968,17 @@ class App:
         self.var_use_mt = tk.BooleanVar(value=bool(self.config.get("use_mt", False)))
         self.var_use_mst = tk.BooleanVar(value=bool(self.config.get("use_mst", False)))
         self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
+        self.var_use_aci = tk.BooleanVar(value=bool(self.config.get("use_aci", True)))
+        self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
         # Ключи API сервисов, которым они нужны
         self.var_vf_key = tk.StringVar(value=self.config.get("vf_key", ""))
         self.var_mt_key = tk.StringVar(value=self.config.get("mt_key", ""))
         self.var_mst_key = tk.StringVar(value=self.config.get("mst_key", ""))
+        self.var_gfw_token = tk.StringVar(value=self.config.get("gfw_key", ""))
         self.feed_status.update({
             "vf": tk.StringVar(), "vfa": tk.StringVar(), "mt": tk.StringVar(),
             "mst": tk.StringVar(), "dt": tk.StringVar(),
+            "aci": tk.StringVar(), "gfw": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -1513,6 +1601,14 @@ class App:
                              f"({fmt_number(voyage['distance_km'])} км до {port_name})")
         lines.append(f"Срок прибытия (AIS): {fmt_moment(declared) if declared else '—'} "
                       f"(передаёт капитан, в UTC)")
+        expected = portcalls.expected_for_mmsi(mmsi)
+        if expected:
+            lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
+                         f"{expected.get('eta') or '—'} (AIS-catcher, последний сигнал "
+                         f"{expected.get('last_heard') or '—'})")
+        gfw_text = portcalls.gfw_gap_text(portcalls.gfw_vessel(None, mmsi))
+        if gfw_text:
+            lines.append(gfw_text)
         stay = self.core.port_stay(vessel)
         if stay:
             stay_port = stay.get("port_label") or stay.get("port")
@@ -1578,6 +1674,8 @@ class App:
         links.append(f"• AIS Hub: https://www.aishub.net/vessels/mmsi:{mmsi}")
         links.append(f"• Digitraffic: https://www.digitraffic.fi/en/marine-traffic/?mmsi={mmsi}")
         links.append(f"• OpenCpn: https://www.opencpn.org/")
+        for title, url in portcalls.registry_links(vessel.get("imo"), mmsi):
+            links.append(f"• {title}: {url}")
         lines.append("Проверка в других сервисах:")
         for l in links:
             lines.append(f"  {l}")
@@ -1958,6 +2056,8 @@ class App:
         self.config["use_mt"] = bool(getattr(self, "var_use_mt", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_mst"] = bool(getattr(self, "var_use_mst", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_aci"] = bool(getattr(self, "var_use_aci", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
         # Ключи API внешних сервисов
         for key, field in SERVICE_KEY_FIELDS.items():
             var = getattr(self, field, None)

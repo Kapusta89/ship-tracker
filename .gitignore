@@ -28,3 +28,7 @@ __pycache__/
 build/
 dist/
 output.txt
+
+# Кэши внешних источников (обновляются на каждом компьютере)
+**/data/expected.json
+**/data/gfw.json
