@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.10"
+APP_VERSION = "2026.11.11"
 
 import ais_feed
 import cargo
@@ -2269,7 +2269,12 @@ class App:
         for key, field in SERVICE_KEY_FIELDS.items():
             var = getattr(self, field, None)
             if var is not None:
-                self.config[f"{key}_key"] = var.get().strip()
+                value = var.get().strip()
+                if key == "gfw":
+                    # вставка поверх старого токена склеивает две строки:
+                    # собираем JWT заново, иначе сервер ответит «invalid token»
+                    value = portcalls.clean_gfw_token(value)
+                self.config[f"{key}_key"] = value
 
         self.config.update({
             "api_key": self.var_key.get().strip(),

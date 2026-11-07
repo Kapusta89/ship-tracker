@@ -19,6 +19,7 @@ Galați, APM Constanța) программного API не дают — для �
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -180,6 +181,71 @@ def load_gfw(path=None) -> dict:
 
 def save_gfw(data, path=None) -> None:
     save_cache(data, path or GFW_PATH)
+
+
+def _jwt_kind(piece: str) -> str:
+    """Что это за кусок JWT: header, payload или ничего (подпись)."""
+    text = piece.strip()
+    if not text:
+        return ""
+    for pad in ("", "=", "==", "==="):
+        try:
+            raw = base64.urlsafe_b64decode(text + pad).decode("utf-8")
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict):
+            if "alg" in data:
+                return "header"
+            if "aud" in data or "data" in data or "userId" in data:
+                return "payload"
+    return ""
+
+
+def clean_gfw_token(value) -> str:
+    """Токен GFW из поля ввода: убирает мусор и склеенные вставки.
+
+    Токен — JWT из трёх частей. Если вставить его дважды или вставить поверх
+    старого, в строке оказываются подпись, заголовок и полезная часть в
+    произвольном порядке — такой токен сервер отвергает («invalid token»).
+    Здесь он собирается заново: заголовок + полезная часть + самая длинная
+    подпись. Правильный токен возвращается без изменений.
+    """
+    text = "".join(ch for ch in str(value or "") if not ch.isspace())
+    if text.lower().startswith("bearer "):
+        text = text[7:]
+    text = text.strip('"').strip("'").strip()
+    if not text:
+        return ""
+    parts = text.split(".")
+    if len(parts) == 3 and all(_jwt_kind(part) in ("header", "", "payload") for part in parts):
+        return text
+
+    header = payload = ""
+    # подпись ищется рядом с заголовком: при склеенной вставке она оказывается
+    # в том же куске строки, что и заголовок, а не отдельным куском
+    near_header = []
+    far = []
+    for part in parts:
+        rest = re.sub(r"eyJ[A-Za-z0-9_-]+", "|", part)
+        chunks = [chunk for chunk in rest.split("|") if len(chunk) >= 20]
+        has_header = False
+        for match in re.finditer(r"eyJ[A-Za-z0-9_-]+", part):
+            piece = match.group(0)
+            kind = _jwt_kind(piece)
+            if kind == "header" and not header:
+                header = piece
+                has_header = True
+            elif kind == "payload" and not payload:
+                payload = piece
+            else:
+                far.append(piece)
+        (near_header if has_header else far).extend(chunks)
+    if header and payload:
+        signature = max(near_header or far, key=len, default="")
+        if signature:
+            return f"{header}.{payload}.{signature}"
+    return text
 
 
 def gfw_gap_text(entry) -> str:

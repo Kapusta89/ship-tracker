@@ -729,7 +729,9 @@ class GfwFeed(ServiceFeed):
             self.interval = max(3600.0, float(kwargs["minutes"]) * 60.0)
 
     def headers(self):
-        return {"Authorization": f"Bearer {self.api_key}",
+        # поле ввода может содержать вставку с мусором — собираем JWT заново
+        token = portcalls.clean_gfw_token(self.api_key)
+        return {"Authorization": f"Bearer {token}",
                 "Accept": "application/json"}
 
     def vessel_id(self, mmsi):
@@ -747,7 +749,10 @@ class GfwFeed(ServiceFeed):
         vessel_id = info.get("id") or entry.get("id")
         if not vessel_id:
             return None
-        return {"id": str(vessel_id), "name": info.get("shipName") or "",
+        # в ответе API поле называется shipname (раньше код читал shipName
+        # и имя всегда оставалось пустым)
+        return {"id": str(vessel_id),
+                "name": info.get("shipname") or info.get("shipName") or "",
                 "flag": info.get("flag") or "", "imo": info.get("imo") or ""}
 
     def last_gap(self, vessel_id):
@@ -757,9 +762,11 @@ class GfwFeed(ServiceFeed):
         start = (today - timedelta(days=self.days)).isoformat()
         data = self.request(
             portcalls.GFW_EVENTS_URL,
+            # offset обязателен, если передан limit: иначе API v3 отвечает
+            # 422 «If you send the limit property then the offset property is required»
             params={"datasets[0]": portcalls.GFW_GAPS_DATASET,
                     "vessels[0]": vessel_id, "start-date": start,
-                    "end-date": today.isoformat(), "limit": 5},
+                    "end-date": today.isoformat(), "limit": 5, "offset": 0},
             headers=self.headers(), timeout=45)
         entries = (data or {}).get("entries") or []
         gaps = [entry for entry in entries if isinstance(entry, dict)]
