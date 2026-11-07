@@ -123,5 +123,12 @@
   "gfw_key": "",
   "gfw_minutes": 720,
   "gfw_days": 7,
-  "gfw_max_vessels": 10
+  "gfw_max_vessels": 10,
+  "use_dat": false,
+  "dat_key": "",
+  "dat_minutes": 600,
+  "dat_max_vessels": 10,
+  "use_aishub": false,
+  "aishub_key": "",
+  "aishub_minutes": 600
 }

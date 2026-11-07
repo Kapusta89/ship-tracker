@@ -30,6 +30,8 @@ import portcalls
 SERVICE_TITLES = {
     "aci": "AIS-catcher: ожидаемые прибытия",
     "gfw": "Global Fishing Watch (разрывы AIS)",
+    "dat": "Datalastic (позиция и рейс)",
+    "aishub": "AISHub (сеть приёмников)",
     "vf": "VesselFinder",
     "vfa": "VesselFinder: ожидаемые прибытия",
     "mt": "MarineTraffic",
@@ -43,6 +45,8 @@ VESSELFINDER_ARRIVALS_URL = "https://api.vesselfinder.com/expectedarrivals"
 MARINETRAFFIC_URL = "https://services.marinetraffic.com/api/exportvessels-custom-area"
 MYSHIPTRACKING_URL = "https://api.myshiptracking.com/api/v2/vessel/zone"
 MYSHIPTRACKING_VESSEL_URL = "https://api.myshiptracking.com/api/v2/vessel"
+DATALASTIC_URL = "https://api.datalastic.com/api/v0/vessel"
+AISHUB_URL = "https://data.aishub.net/ws.php"
 
 
 def _number(value):
@@ -858,6 +862,152 @@ class MarineTrafficFeed(ServiceFeed):
         self.ok(count)
 
 
+class DatalasticFeed(ServiceFeed):
+    """Datalastic: живая позиция и рейс по MMSI, ключ в заголовке x-api-key.
+
+    /api/v0/vessel стоит 1 кредит за судно и отдаёт имя, тип, координаты, ход,
+    пункт назначения и осадку — поэтому канал обогащает уже известные суда,
+    а не сканирует район. Ключ берётся на datalastic.com после регистрации
+    (есть пробный период).
+    """
+
+    key = "dat"
+    interval = 600.0
+
+    def __init__(self, *args, vessels=None, max_vessels=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vessels = vessels or (lambda: [])
+        self.max_vessels = max(1, int(max_vessels or 10))
+        if kwargs.get("minutes"):
+            self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
+
+    def headers(self):
+        return {"x-api-key": self.api_key, "Accept": "application/json"}
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан ключ API")
+        found = 0
+        errors = 0
+        last_error = None
+        for mmsi in list(self.vessels())[:self.max_vessels]:
+            if self.stop_event.is_set():
+                break
+            mmsi = str(mmsi or "").strip()
+            if not mmsi:
+                continue
+            try:
+                data = self.request(DATALASTIC_URL, params={"mmsi": mmsi},
+                                    headers=self.headers(), timeout=30)
+            except Exception as error:
+                status = getattr(getattr(error, "response", None), "status_code", 0)
+                if status in (401, 403):
+                    raise RuntimeError("ключ Datalastic не принят")
+                errors += 1
+                last_error = error
+                continue
+            meta = (data or {}).get("meta") or {}
+            if isinstance(meta, dict) and meta.get("success") is False:
+                errors += 1
+                last_error = RuntimeError(
+                    str((data or {}).get("message") or "отказ API")[:80])
+                continue
+            row = (data or {}).get("data")
+            if isinstance(row, list):
+                row = row[0] if row else None
+            if not isinstance(row, dict):
+                continue
+            vessel_mmsi = _mmsi(row.get("mmsi") or mmsi)
+            if not vessel_mmsi:
+                continue
+            name = row.get("name") or row.get("name_ais") or ""
+            found += 1
+            self.emit(_position(vessel_mmsi, row.get("lat"), row.get("lon"),
+                                sog=row.get("speed"), cog=row.get("course"),
+                                heading=_heading(row.get("heading")),
+                                name=name, source="datalastic",
+                                at=_time(row.get("last_position_utc")
+                                         or row.get("last_position_UTC"))))
+            self.emit(_static(vessel_mmsi, name=name, imo=row.get("imo"),
+                              type_code=_type_code(row.get("type_code")),
+                              destination=row.get("destination"),
+                              draft=row.get("draught"),
+                              length_m=row.get("length"), beam_m=row.get("beam"),
+                              source="datalastic"))
+            self.stop_event.wait(0.3)
+        if found == 0 and errors:
+            raise last_error or RuntimeError("данные не получены")
+        self.ok(found, f"запросов до {self.max_vessels}")
+
+
+class AishubFeed(ServiceFeed):
+    """AISHub: агрегированные позиции сети приёмников по логину участника.
+
+    Ключа API нет: доступ дают за собственный поток NMEA на AISHub, логин
+    приходит после одобрения. Один запрос в минуту — не чаще, поэтому канал
+    опрашивает район подписки не чаще раза в 10 минут.
+    """
+
+    key = "aishub"
+    interval = 600.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if kwargs.get("minutes"):
+            self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
+
+    def poll_once(self):
+        if not self.api_key:
+            raise RuntimeError("не задан логин AISHub")
+        boxes = self.boxes_lat_lon()
+        if not boxes:
+            raise RuntimeError("не задан район подписки")
+        found = 0
+        for lat1, lon1, lat2, lon2 in boxes[:4]:
+            if self.stop_event.is_set():
+                break
+            data = self.request(
+                AISHUB_URL,
+                params={"username": self.api_key, "format": 1, "output": "json",
+                        "compress": 0, "interval": 60,
+                        "latmin": f"{min(lat1, lat2):.4f}",
+                        "latmax": f"{max(lat1, lat2):.4f}",
+                        "lonmin": f"{min(lon1, lon2):.4f}",
+                        "lonmax": f"{max(lon1, lon2):.4f}"},
+                timeout=45)
+            meta, rows = {}, []
+            if isinstance(data, list) and data:
+                meta = data[0] if isinstance(data[0], dict) else {}
+                rows = data[1] if len(data) > 1 and isinstance(data[1], list) else []
+            if isinstance(meta, dict) and meta.get("ERROR"):
+                raise RuntimeError(str(meta.get("ERROR_MESSAGE")
+                                     or "логин AISHub не принят")[:80])
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                mmsi = _mmsi(row.get("MMSI"))
+                if not mmsi:
+                    continue
+                found += 1
+                self.emit(_position(mmsi, row.get("LATITUDE"), row.get("LONGITUDE"),
+                                    sog=row.get("SOG"), cog=row.get("COG"),
+                                    heading=_heading(row.get("HEADING")),
+                                    name=row.get("NAME"), source="aishub"))
+                bow, stern = _number(row.get("A")), _number(row.get("B"))
+                port, starboard = _number(row.get("C")), _number(row.get("D"))
+                length = bow + stern if bow is not None and stern is not None else None
+                beam = (port + starboard if port is not None and starboard is not None
+                        else None)
+                self.emit(_static(mmsi, name=row.get("NAME"), imo=row.get("IMO"),
+                                  callsign=row.get("CALLSIGN"),
+                                  type_code=_type_code(row.get("TYPE")),
+                                  destination=row.get("DEST"),
+                                  draft=row.get("DRAUGHT"), length_m=length,
+                                  beam_m=beam, source="aishub"))
+            self.stop_event.wait(1.0)
+        self.ok(found, f"районов {min(len(boxes), 4)}")
+
+
 # Ключ настройки с ключом API: vf_key / mt_key / mst_key.
 PROVIDERS = {
     "vf": VesselFinderFeed,
@@ -867,11 +1017,13 @@ PROVIDERS = {
     "dt": DigitrafficFeed,
     "aci": AiscatcherExpected,
     "gfw": GfwFeed,
+    "dat": DatalasticFeed,
+    "aishub": AishubFeed,
 }
 
 
 def needs_key(key):
-    return key in ("vf", "vfa", "mt", "mst", "gfw")
+    return key in ("vf", "vfa", "mt", "mst", "gfw", "dat", "aishub")
 
 
 def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=None,

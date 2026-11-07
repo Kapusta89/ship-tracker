@@ -58,7 +58,8 @@ PHOTO_DIR = DATA_DIR / "photos"
 # Поля с ключами API тех сервисов, которым они нужны.
 SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "vfa": "var_vf_key",
                       "mt": "var_mt_key", "mst": "var_mst_key",
-                      "gfw": "var_gfw_token"}
+                      "gfw": "var_gfw_token", "dat": "var_dat_key",
+                      "aishub": "var_aishub_key"}
 
 # Дополнительные подключения: название, ключ настройки, описание и сайт с ключом.
 SERVICE_BLOCKS = [
@@ -72,6 +73,10 @@ SERVICE_BLOCKS = [
      "бесплатно, без ключа: суда, идущие в наши порты"),
     ("Global Fishing Watch", "gfw",
      "бесплатный токен: профиль судна и разрывы AIS"),
+    ("Datalastic", "dat",
+     "API по ключу: позиция и рейс по MMSI, 1 кредит за судно"),
+    ("AISHub", "aishub",
+     "логин участника: позиции района, доступ за свой поток NMEA"),
 ]
 
 SERVICE_SITES = {
@@ -82,6 +87,8 @@ SERVICE_SITES = {
     "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
     "aci": ("AIS-catcher", "https://www.aiscatcher.org/port/UAIZM?tab=expected"),
     "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
+    "dat": ("Datalastic API", "https://datalastic.com/ais-data-api/"),
+    "aishub": ("AISHub", "https://www.aishub.net/join-us"),
 }
 
 
@@ -89,6 +96,16 @@ def service_key_var(app, key):
     """Переменная Tk с ключом API сервиса или None, если ключ не нужен."""
     name = SERVICE_KEY_FIELDS.get(key)
     return getattr(app, name, None) if name else None
+
+
+def service_key_value(app, key) -> str:
+    """Значение ключа сервиса с учётом общих ключей (у vfa ключ от vf)."""
+    var = service_key_var(app, key)
+    value = (var.get() or "").strip() if var is not None else ""
+    if not value and key == "vfa":
+        vf = getattr(app, "var_vf_key", None)
+        value = (vf.get() or "").strip() if vf is not None else ""
+    return value
 
 
 # --------------------------------------------------------------------- утилиты
@@ -970,15 +987,20 @@ class App:
         self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
         self.var_use_aci = tk.BooleanVar(value=bool(self.config.get("use_aci", True)))
         self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
+        self.var_use_dat = tk.BooleanVar(value=bool(self.config.get("use_dat", False)))
+        self.var_use_aishub = tk.BooleanVar(value=bool(self.config.get("use_aishub", False)))
         # Ключи API сервисов, которым они нужны
         self.var_vf_key = tk.StringVar(value=self.config.get("vf_key", ""))
         self.var_mt_key = tk.StringVar(value=self.config.get("mt_key", ""))
         self.var_mst_key = tk.StringVar(value=self.config.get("mst_key", ""))
         self.var_gfw_token = tk.StringVar(value=self.config.get("gfw_key", ""))
+        self.var_dat_key = tk.StringVar(value=self.config.get("dat_key", ""))
+        self.var_aishub_key = tk.StringVar(value=self.config.get("aishub_key", ""))
         self.feed_status.update({
             "vf": tk.StringVar(), "vfa": tk.StringVar(), "mt": tk.StringVar(),
             "mst": tk.StringVar(), "dt": tk.StringVar(),
             "aci": tk.StringVar(), "gfw": tk.StringVar(),
+            "dat": tk.StringVar(), "aishub": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -1075,6 +1097,41 @@ class App:
                        ).pack(side="left", padx=(6, 0))
             row += 3
 
+        # 5. Источники без ключа — кнопка проверки: жив ли и читается ли автоматически
+        ttk.Separator(links, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 0))
+        ttk.Label(links, text="Источники без ключа — проверка",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=row + 1, column=0, columnspan=2, sticky="w", padx=(8, 6), pady=(8, 2))
+        ttk.Button(links, text="Проверить все", command=self.check_all_sources
+                   ).grid(row=row + 1, column=2, sticky="e", padx=8, pady=(8, 2))
+        ttk.Label(links, text="Ключ не нужен. «Проверить» показывает, жив ли источник "
+                              "и читается ли он автоматически.",
+                  foreground="#777").grid(row=row + 2, column=0, columnspan=3,
+                                           sticky="w", padx=8)
+        row += 3
+        self.source_status = {}
+        for source in portcalls.SOURCES:
+            key = source["key"]
+            var = tk.StringVar(value=self.source_status_text(key))
+            self.source_status[key] = var
+            ttk.Label(links, text=source["title"], font=("Segoe UI", 9, "bold")
+                      ).grid(row=row, column=0, columnspan=3, sticky="w",
+                             padx=(8, 6), pady=(8, 0))
+            ttk.Label(links, textvariable=var, foreground="#555"
+                      ).grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=30)
+            source_row = ttk.Frame(links)
+            source_row.grid(row=row + 2, column=0, columnspan=3, sticky="w",
+                            padx=30, pady=(2, 0))
+            ttk.Label(source_row, text=source["how"], foreground="#777").pack(side="left")
+            ttk.Button(source_row, text="Проверить",
+                       command=lambda k=key: self.check_source(k)
+                       ).pack(side="left", padx=(6, 0))
+            ttk.Button(source_row, text="Открыть",
+                       command=lambda u=source["url"]: webbrowser.open(u)
+                       ).pack(side="left", padx=(6, 0))
+            row += 3
+
         buttons = ttk.Frame(box)
         buttons.grid(row=5, column=1, sticky="w", pady=(16, 0))
         ttk.Button(buttons, text="Сохранить и перезапустить",
@@ -1086,7 +1143,14 @@ class App:
             "Три канала и выбранные сервисы работают одновременно и пишут в одну базу.\n"
             "Дополнительные подключения: у каждого свой блок — галочка, статус, ключ API "
             "и кнопки «Проверить» / «Открыть сайт». "
-            "Digitraffic работает без ключа, но отдаёт только Балтику.\n\n"
+            "Digitraffic и AIS-catcher работают без ключа: Digitraffic отдаёт только Балтику, "
+            "AIS-catcher — ожидаемые прибытия в наши порты. "
+            "Datalastic и AISHub включаются ключом (у AISHub — логин участника).\n\n"
+            "Источники без ключа (реестры и портовые администрации) в конце вкладки: "
+            "кнопка «Проверить» говорит, жив ли сайт и можно ли читать его автоматически, "
+            "«Проверить все» — обходит все сразу.\n"
+            "Корпоративные каналы (Spire, ORBCOMM, Kpler/MarineTraffic Enterprise, Windward) "
+            "дают доступ только по договору — ключ выдаёт менеджер, поэтому галочки у них нет.\n\n"
             "• AISStream — основной живой поток (нужен бесплатный ключ, см. шаги ниже).\n"
             "• Open Waters AIS — второй живой поток, тот же протокол; токен бесплатный на openwaters.io.\n"
             "• Снимок района — раз в N минут забирает последние известные позиции всех судов "
@@ -2058,6 +2122,8 @@ class App:
         self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_aci"] = bool(getattr(self, "var_use_aci", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_dat"] = bool(getattr(self, "var_use_dat", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_aishub"] = bool(getattr(self, "var_use_aishub", __import__("tkinter").BooleanVar(value=False)).get())
         # Ключи API внешних сервисов
         for key, field in SERVICE_KEY_FIELDS.items():
             var = getattr(self, field, None)
@@ -2100,8 +2166,7 @@ class App:
         enabled = bool(var.get()) if var is not None else False
         if not enabled:
             return "не подключен"
-        key_var = service_key_var(self, key)
-        if key_var is not None and not key_var.get().strip():
+        if service_key_var(self, key) is not None and not service_key_value(self, key):
             return "нужен ключ API"
         return "ожидает запуска"
 
@@ -2416,7 +2481,7 @@ class App:
 
     def _check_service_worker(self, key):
         title = services_feed.SERVICE_TITLES.get(key, key)
-        api_key = (self.config.get(f"{key}_key") or "").strip()
+        api_key = service_key_value(self, key) or (self.config.get(f"{key}_key") or "").strip()
         self._on_service_status(key, f"проверка {title.lower()}…")
 
         def finish(text):
@@ -2448,6 +2513,99 @@ class App:
         status = feed.status or f"подключен, судов {feed.events}"
         self.log(f"{title}: {status}.")
         finish(status)
+
+    # -------------------------------------- источники без ключа: проверка
+
+    @staticmethod
+    def format_source_result(result) -> str:
+        """«работает — судов 13 (07.11 23:50)» для окна и бота."""
+        result = result or {}
+        if result.get("ok"):
+            state = "работает"
+        elif result.get("warn"):
+            state = "только в браузере"
+        else:
+            state = "не отвечает"
+        detail = str(result.get("detail") or "")
+        text = f"{state} — {detail}" if detail else state
+        when = str(result.get("checked") or "").replace("T", " ")
+        when = when[5:16] if when else ""
+        return f"{text} ({when})" if when else text
+
+    def source_status_text(self, key) -> str:
+        result = portcalls.source_result(key)
+        return self.format_source_result(result) if result else "не проверялось"
+
+    def _store_source_result(self, result):
+        """Складывает результат в кэш и обновляет подпись в окне."""
+        key = (result or {}).get("key")
+        items = [item for item in (portcalls.load_sources().get("sources") or [])
+                 if isinstance(item, dict) and item.get("key") != key]
+        items.append(result)
+        try:
+            portcalls.save_sources(items)
+        except OSError as error:
+            self.log(f"Не удалось сохранить результат проверки: {error}")
+        if key not in getattr(self, "source_status", {}):
+            return
+        text = self.format_source_result(result)
+        try:
+            self.root.after(0, lambda: self.source_status[key].set(text))
+        except Exception:
+            pass
+
+    def check_source(self, key):
+        """Одна проверка источника без ключа — в своём потоке."""
+        source = portcalls.SOURCES_BY_KEY.get(key)
+        if not source:
+            return
+        checking = getattr(self, "_source_checking", None)
+        if checking is None:
+            checking = self._source_checking = set()
+        if key in checking:
+            self.log("Проверка этого источника уже идёт — подождите.")
+            return
+        checking.add(key)
+        if key in getattr(self, "source_status", {}):
+            self.source_status[key].set("проверяю…")
+        threading.Thread(target=self._check_source_worker, args=(source,),
+                         daemon=True).start()
+
+    def _check_source_worker(self, source):
+        try:
+            result = portcalls.check_source(source, log=self.log)
+        except Exception as error:                     # не должно случаться
+            result = {"key": source["key"], "title": source["title"],
+                      "ok": False, "warn": False,
+                      "detail": str(error)[:120],
+                      "checked": datetime.now().isoformat(timespec="seconds")}
+        finally:
+            self._source_checking.discard(source["key"])
+        self._store_source_result(result)
+
+    def check_all_sources(self):
+        if getattr(self, "_sources_busy", False):
+            self.log("Проверка источников уже идёт — подождите.")
+            return
+        self._sources_busy = True
+        threading.Thread(target=self._check_all_sources_worker, daemon=True).start()
+
+    def _check_all_sources_worker(self):
+        self.log(f"Проверяю источники без ключа ({len(portcalls.SOURCES)} сайтов)…")
+        try:
+            for source in portcalls.SOURCES:
+                try:
+                    result = portcalls.check_source(source, log=self.log)
+                except Exception as error:
+                    result = {"key": source["key"], "title": source["title"],
+                              "ok": False, "warn": False,
+                              "detail": str(error)[:120],
+                              "checked": datetime.now().isoformat(timespec="seconds")}
+                self._store_source_result(result)
+                time.sleep(0.5)
+        finally:
+            self._sources_busy = False
+        self.log("Проверка источников завершена.")
 
     def close(self):
         try:

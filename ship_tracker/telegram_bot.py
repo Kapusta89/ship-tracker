@@ -566,6 +566,7 @@ async def cmd_help(message: Message):
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
         "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
+        "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
         "/start — вернуть клавиатуру портов.",
         reply_markup=make_port_keyboard(),
     )
@@ -630,6 +631,67 @@ async def cmd_expected(message: Message):
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
+async def cmd_sources(message: Message):
+    """Состояние подключений и живая проверка источников без ключа."""
+    try:
+        portcalls = _import("portcalls")
+        services_feed = _import("services_feed")
+    except Exception as error:
+        await message.answer(f"Проверка источников недоступна: {error}")
+        return
+
+    config = reload_config()
+    statuses = dict(getattr(get_core(), "service_status", {}) or {})
+    lines = ["🔌 <b>Подключения</b>", ""]
+
+    # 1. Каналы данных: включены ли и что говорит поток
+    lines.append("<b>Каналы данных</b>")
+    ais_key = bool((config.get("api_key") or "").strip())
+    lines.append(f"• AISStream — {'ключ задан' if ais_key else 'нет ключа'}")
+    services = ["vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub"]
+    for key in services:
+        title = services_feed.SERVICE_TITLES.get(key, key)
+        enabled = bool(config.get(f"use_{key}"))
+        api_key = (config.get(f"{key}_key") or "").strip()
+        if key == "vfa" and not api_key:
+            api_key = (config.get("vf_key") or "").strip()
+        if not enabled:
+            state = "выключен"
+        elif services_feed.needs_key(key) and not api_key:
+            state = "включён, нужен ключ"
+        else:
+            state = "включён"
+        runtime = (statuses.get(key) or "").strip()
+        if runtime and runtime not in ("запуск…", "не подключен"):
+            state += f" — {runtime}"
+        lines.append(f"• {title} — {state}")
+
+    # 2. Источники без ключа: проверяем прямо сейчас
+    lines.append("")
+    lines.append("<b>Источники без ключа (проверка сейчас)</b>")
+    try:
+        results = await asyncio.to_thread(portcalls.check_sources)
+    except Exception as error:
+        await message.answer("\n".join(lines + [f"Проверка не удалась: {error}"]),
+                             disable_web_page_preview=True)
+        return
+    for result in results:
+        if result.get("ok"):
+            icon = "✅"
+        elif result.get("warn"):
+            icon = "⚠️"
+        else:
+            icon = "❌"
+        detail = str(result.get("detail") or "")
+        tail = f" — {detail}" if detail else ""
+        lines.append(f"{icon} {result.get('title')}{tail}")
+
+    lines.append("")
+    lines.append("✅ читается автоматически, ⚠️ сайт жив, но только глазами, "
+                 "❌ не отвечает. Ключи задаются во вкладке «Подключение».")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
 async def fallback(message: Message):
     await message.answer("Выберите порт:", reply_markup=make_port_keyboard())
 
@@ -642,6 +704,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_expected, Command("expected"))
+    dp.message.register(cmd_sources, Command("sources"))
     dp.message.register(handle_port, F.text.in_(DEFAULT_PORT_NAMES))
     dp.message.register(fallback)
     return bot, dp

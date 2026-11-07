@@ -12,17 +12,23 @@ Global Fishing Watch — официальный API по бесплатному 
 Реестры (Equasis, ITU MARS, IMO GISIS) и портовые администрации (USPA, APDM
 Galați, APM Constanța) программного API не дают — для них строятся прямые
 ссылки, чтобы проверить судно вручную.
+
+Для источников без ключа есть проверка доступности (check_sources): она
+отвечает, жив ли сайт и годится ли он для автоматического чтения. Так видно,
+когда источник «лёг», а не только когда пропали данные.
 """
 from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 EXPECTED_PATH = DATA_DIR / "expected.json"
 GFW_PATH = DATA_DIR / "gfw.json"
+SOURCES_PATH = DATA_DIR / "sources.json"
 
 EXPECTED_URL = "https://www.aiscatcher.org/port/{locode}?tab=expected"
 GFW_SEARCH_URL = "https://gateway.api.globalfishingwatch.org/v3/vessels/search"
@@ -187,11 +193,11 @@ def gfw_gap_text(entry) -> str:
 def registry_links(imo=None, mmsi=None) -> list[tuple[str, str]]:
     """Ссылки на реестры и портовые сводки: [(подпись, url), …]."""
     imo_text = _clean(imo)
-    mmsi_text = _clean(mmsi)
     gisis = ("https://gisis.imo.org/Public/SHIPS/ShipDetails.aspx?IMONumber=" + imo_text
              if imo_text else "https://gisis.imo.org/Public/SHIPS/Default.aspx")
-    mars = ("https://www.itu.int/mars/ShipDetail?shipid=" + mmsi_text
-            if mmsi_text else "https://www.itu.int/mars/")
+    # ITU MARS: форма поиска по MMSI/позывному (прямые ссылки на карточку
+    # ITU не публикует — параметры меняются, и ссылка ведёт на 404).
+    mars = "https://www.itu.int/mars/"
     return [
         ("Equasis (владелец, флаг, история)", "https://www.equasis.org/EquasisWeb/public/HomePage"),
         ("IMO GISIS (судно по IMO)", gisis),
@@ -204,3 +210,139 @@ def registry_links(imo=None, mmsi=None) -> list[tuple[str, str]]:
         ("APM Terminals: расписание судов",
          "https://www.apmterminals.com/track-and-trace/vessel-schedule"),
     ]
+
+
+# ------------------------------------------------- источники без ключа API
+#
+# Эти сервисы не требуют ключа, но и не все годятся для автоматического
+# чтения: у части таблицы рисует браузерный скрипт, у APDM — скан PDF.
+# kind: ais — разбираем HTML-таблицу; pdf — проверяем файл; page — только
+# доступность сайта (данные открываются глазами).
+
+SOURCES = [
+    {"key": "aci", "title": "AIS-catcher: ожидаемые прибытия", "kind": "ais",
+     "url": EXPECTED_URL.format(locode="UAIZM"),
+     "how": "читается автоматически: HTML-таблица Expected, ключ не нужен"},
+    {"key": "uspa", "title": "USPA: суда на рейде и судозаходы", "kind": "page",
+     "url": "https://www.uspa.gov.ua/en/project/list-of-ships-on-a-roadstead",
+     "how": "только глазами: таблицы грузятся браузерным скриптом, API нет"},
+    {"key": "apdm", "title": "APDM Galați: сводка по судам", "kind": "pdf",
+     "url": "https://apdmgalati.ro/actualizare/ccmnmfgalati.pdf",
+     "how": "только глазами: PDF-скан без текстового слоя"},
+    {"key": "apm", "title": "APM Terminals: расписание судов", "kind": "page",
+     "url": "https://www.apmterminals.com/track-and-trace/vessel-schedule",
+     "how": "только глазами: интерактивное расписание, API нет"},
+    {"key": "equasis", "title": "Equasis: владелец, флаг, история", "kind": "page",
+     "url": "https://www.equasis.org/EquasisWeb/public/HomePage",
+     "how": "только глазами: вход по логину и капче"},
+    {"key": "gisis", "title": "IMO GISIS: карточка судна", "kind": "page",
+     "url": "https://gisis.imo.org/Public/Default.aspx",
+     "how": "только глазами: форма поиска, API нет"},
+    {"key": "itu", "title": "ITU MARS: MMSI и позывной", "kind": "page",
+     "url": "https://www.itu.int/mars/",
+     "how": "только глазами: форма поиска, API нет"},
+]
+
+SOURCES_BY_KEY = {source["key"]: source for source in SOURCES}
+
+
+def _human_size(size) -> str:
+    try:
+        size = float(size)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{size:.1f} {unit}" if unit != "Б" else f"{int(size)} {unit}"
+        size /= 1024
+    return ""
+
+
+def check_source(source, timeout=25, log=None) -> dict:
+    """Проверка одного источника без ключа: жив ли и читается ли автоматически.
+
+    ok=True — сайт отдаёт данные (или хотя бы открывается); warn=True — сайт
+    жив, но закрыт от автоматических запросов (нужен браузер); ok=False — сбой.
+    """
+    import requests
+
+    source = dict(source or {})
+    key = source.get("key") or ""
+    started = time.monotonic()
+    result = {"key": key, "title": source.get("title") or key,
+              "how": source.get("how") or "", "url": source.get("url") or "",
+              "ok": False, "warn": False, "detail": "", "status": 0,
+              "checked": datetime.now().isoformat(timespec="seconds")}
+    try:
+        response = requests.get(source.get("url"), headers=HEADERS, timeout=timeout,
+                                stream=True)
+        status = int(response.status_code)
+        result["status"] = status
+        if source.get("kind") == "ais" and status == 200:
+            text = response.text
+            rows = parse_expected_page(text)
+            result["ok"] = bool(rows)
+            result["detail"] = f"судов в списке {len(rows)}" if rows else "таблица пуста"
+        elif source.get("kind") == "pdf":
+            size = response.headers.get("Content-Length")
+            head = next(response.iter_content(2048), b"") or b""
+            is_pdf = head.lstrip()[:5] == b"%PDF-"
+            result["ok"] = status < 400 and is_pdf
+            parts = [f"HTTP {status}"]
+            if is_pdf:
+                parts.append("PDF")
+                if size:
+                    parts.append(_human_size(size))
+            result["detail"] = ", ".join(parts)
+        else:
+            result["detail"] = f"HTTP {status}"
+            if status < 400:
+                result["ok"] = True
+            elif status < 500:
+                result["warn"] = True
+                result["detail"] = (f"HTTP {status}: сайт отвечает, но закрыт "
+                                    "для автоматических запросов")
+        response.close()
+    except Exception as error:                      # сеть, DNS, таймаут
+        result["detail"] = str(error).strip()[:120] or error.__class__.__name__
+    result["seconds"] = round(time.monotonic() - started, 1)
+    if log:
+        state = "работает" if result["ok"] else "не отвечает" if not result["warn"] \
+            else "только в браузере"
+        log(f"Проверка источника {result['title']}: {state} — {result['detail']}")
+    return result
+
+
+def check_sources(keys=None, timeout=25, pause=0.5, log=None) -> list[dict]:
+    """Проверяет все источники без ключа (или только указанные).
+
+    Результат кладётся в data/sources.json, чтобы окно показало его сразу
+    после запуска, без повторного обхода сайтов.
+    """
+    wanted = set(keys or [])
+    results = []
+    for source in SOURCES:
+        if wanted and source["key"] not in wanted:
+            continue
+        results.append(check_source(source, timeout=timeout, log=log))
+        time.sleep(max(0.0, pause))
+    save_sources(results)
+    return results
+
+
+def save_sources(results, path=None) -> None:
+    save_cache({"updated": datetime.now().isoformat(timespec="seconds"),
+                "sources": list(results or [])}, path or SOURCES_PATH)
+
+
+def load_sources(path=None) -> dict:
+    return load_cache(path or SOURCES_PATH)
+
+
+def source_result(key, cache=None) -> dict | None:
+    """Последний сохранённый результат проверки источника."""
+    cache = cache if isinstance(cache, dict) else load_sources()
+    for item in cache.get("sources") or []:
+        if isinstance(item, dict) and item.get("key") == key:
+            return item
+    return None

@@ -65,6 +65,14 @@ DEFAULT_CONFIG = {
     "gfw_minutes": 720,
     "gfw_days": 7,
     "gfw_max_vessels": 10,
+    # платные/ключевые источники: Datalastic (x-api-key) и AISHub (логин)
+    "use_dat": False,
+    "dat_key": "",
+    "dat_minutes": 600,
+    "dat_max_vessels": 10,
+    "use_aishub": False,
+    "aishub_key": "",
+    "aishub_minutes": 600,
     "vf_key": "",
     "mt_key": "",
     "mst_key": "",
@@ -505,7 +513,7 @@ class RadarCore:
         """Поднимает опрос выбранных внешних сервисов (см. services_feed)."""
         config = self.config
         self.service_status = {}
-        for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw"):
+        for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
