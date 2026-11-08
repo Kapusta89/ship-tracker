@@ -580,6 +580,8 @@ async def cmd_help(message: Message):
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
         "/sea — кто сейчас в море: скорость, расстояние до порта и прибытие.\n"
+        "/port — кто стоит в портах и на рейде (у причала и ждёт лоцмана) "
+        "с грузом и осадкой.\n"
         "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
         "/map — карта-картинка с портами и судами, у которых есть позиция.\n"
         "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
@@ -692,6 +694,67 @@ def _sea_lines(vessels: List[dict], core) -> List[str]:
             tail += f" · через {hours:.0f} ч ({eta:%d.%m %H:%M})"
         lines.append(f"• <b>{name}</b> — {tail}")
     return lines
+
+
+def _port_lines(vessels: List[dict], core, per_port: int = 12) -> List[str]:
+    """Строки по портам: кто у причала, кто ждёт лоцмана на рейде."""
+    cargo = _import("cargo")
+    groups: dict = {}
+    for vessel in vessels:
+        groups.setdefault(str(vessel.get("port_name") or "—"), []).append(vessel)
+    lines = []
+    for port, items in sorted(groups.items()):
+        at_berth = sum(1 for item in items if item.get("port_km") == 0)
+        waiting = len(items) - at_berth
+        lines.append("")
+        lines.append(f"⚓ <b>{html.escape(port)}</b> — у причала {at_berth}, "
+                     f"на рейде {waiting}")
+        for vessel in items[:per_port]:
+            name = html.escape(str(vessel.get("name") or vessel.get("mmsi") or "—"))
+            kind, _ = cargo.cargo_kind(vessel.get("type_code"))
+            kind = kind or vessel.get("type_label") or "тип неизвестен"
+            place = vessel.get("place") or "в порту"
+            tail = [html.escape(f"{place}")]
+            cargo_info = None
+            try:
+                cargo_info = core.cargo_estimate(vessel)
+            except Exception:
+                cargo_info = None
+            if cargo_info and cargo_info.get("cargo_t"):
+                tail.append(f"груз ≈ {core_module.fmt_tons(cargo_info['cargo_t'])} т")
+            draft = vessel.get("draft")
+            if draft:
+                tail.append(f"осадка {draft:g} м" if isinstance(draft, float)
+                            else f"осадка {draft} м")
+            lines.append(f"• <b>{name}</b> ({html.escape(str(kind))}) — " + ", ".join(tail))
+        if len(items) > per_port:
+            lines.append(f"…и ещё {len(items) - per_port}")
+    return lines
+
+
+async def cmd_port(message: Message):
+    """Суда в портах и на рейде: стоянка и ожидание лоцмана."""
+    core = get_core()
+    try:
+        vessels = await asyncio.to_thread(core.port_vessels, 600)
+    except Exception as error:
+        await message.answer(f"Список судов в портах недоступен: {error}")
+        return
+    at_berth = sum(1 for vessel in vessels if vessel.get("port_km") == 0)
+    lines = ["⚓ <b>Суда в портах и на рейде</b>",
+             f"Всего: <b>{len(vessels)}</b> — у причала {at_berth}, "
+             f"на рейде (ждут лоцмана или очереди) {len(vessels) - at_berth}.",
+             "Порты: RENI, IZMAIL, VYLKOVE, CHORNOMORSK, ODESSA, YUZHNY."]
+    if not vessels:
+        lines.append("Сейчас в портах и на рейдах наших портов судов нет.")
+    else:
+        lines += _port_lines(vessels, core)
+    lines.append("")
+    lines.append("Данные: AIS района и карточки судов (тип, осадка, груз).")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    await message.answer(text, disable_web_page_preview=True)
 
 
 async def cmd_sea(message: Message):
@@ -900,6 +963,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_expected, Command("expected"))
     dp.message.register(cmd_sea, Command("sea"))
+    dp.message.register(cmd_port, Command("port"))
     dp.message.register(cmd_map, Command("map"))
     dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_sources, Command("sources"))

@@ -392,6 +392,28 @@ class Store:
                 (length * (1 - band), length * (1 + band))).fetchone()
         return row["value"] if row else None
 
+    def beam_reference(self, length_m, band=0.25):
+        """Обычная ширина корпуса у судов похожей длины.
+
+        Нужна как запасной вариант: у многих судов AIS ширину не передаёт,
+        а без неё оценку груза не посчитать. Значение берётся по медиане
+        известных ширин судов такой же длины — только дл подписи «≈».
+        """
+        try:
+            length = float(length_m)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT beam_m FROM vessels "
+                "WHERE beam_m IS NOT NULL AND beam_m > 0 AND length_m BETWEEN ? AND ?",
+                (length * (1 - band), length * (1 + band))).fetchall()
+        values = sorted(float(row["beam_m"]) for row in rows)
+        if not values:
+            return None
+        middle = values[len(values) // 2]
+        return middle
+
     # ---------------------------------------------------------------- алерты
     def alert_recent(self, key: str, hours: float) -> bool:
         query = "SELECT 1 FROM alerts WHERE key = ? AND ok = 1"

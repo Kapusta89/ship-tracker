@@ -19,6 +19,7 @@ __pycache__/
 **/data/*.err
 **/data/bot_messages.json
 **/data/credits*.json
+**/data/shipradar_cards.json
 **/data/errors.log
 **/data/headless_check.log
 **/data/diagnose.txt

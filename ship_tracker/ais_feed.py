@@ -112,6 +112,41 @@ def type_label(code) -> str:
     return "прочее"
 
 
+# Обратное сопоставление: тип с чужих карт («Inland, Motor Freighter»,
+# «Motor Tanker», «Tug») → код AIS. Нужно, чтобы у судов из Goradar и
+# MarineTraffic.live в базе был наш стандартный тип, а не только текст источника.
+TYPE_BY_KEYWORD = (
+    ("tanker", 80), ("танкер", 80), ("tank", 80), ("tankschiff", 80),
+    ("passenger", 60), ("пассажир", 60), ("fahrgast", 60), ("ferry", 60), ("fähre", 60),
+    ("tug", 52), ("буксир", 52), ("schlepper", 52), ("pusher", 31), ("schub", 31),
+    ("fishing", 30), ("рыболов", 30), ("fischer", 30),
+    ("dredger", 33), ("bagger", 33), ("земснаряд", 33),
+    ("pilot", 50), ("лоцман", 50), ("lotse", 50),
+    ("anti-pollution", 54), ("oil recovery", 54), ("schadstoff", 54),
+    ("противозагряз", 54), ("pollution", 54), ("oil spill", 54),
+    ("police", 55), ("polizei", 55), ("полиц", 55), ("customs", 55),
+    ("rescue", 51), ("rettung", 51), ("спасат", 51),
+    ("sailing", 36), ("segel", 36), ("парусн", 36),
+    ("pleasure", 37), ("yacht", 37), ("прогулоч", 37),
+    ("military", 35), ("navy", 35), ("военн", 35),
+    ("diver", 34), ("водолаз", 34),
+    ("cargo", 70), ("грузов", 70), ("freighter", 70), ("frachter", 70),
+    ("frachtschiff", 70), ("bulk", 70), ("container", 70), ("general", 70),
+    ("barge", 70), ("ponton", 70), ("шут", 70),
+)
+
+
+def type_code_for_label(text):
+    """Код AIS по текстовому типу судна; None, если тип не распознан."""
+    value = str(text or "").strip().lower()
+    if not value or value in ("—", "-", "unknown", "неизвестно", "other", "прочее"):
+        return None
+    for keyword, code in TYPE_BY_KEYWORD:
+        if keyword in value:
+            return code
+    return None
+
+
 def is_tanker_code(code) -> bool:
     try:
         return int(code) in TANKER_CODES

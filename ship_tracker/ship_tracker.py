@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.17"
+APP_VERSION = "2026.11.18"
 
 import ais_feed
 import cargo
@@ -75,6 +75,8 @@ SERVICE_BLOCKS = [
     ("Digitraffic", "dt", "открытые данные Финляндии, только Балтика"),
     ("Goradar", "gor", "бесплатно, без ключа: карта судов района"),
     ("MarineTraffic.live", "mlive", "бесплатно, без ключа: карта судов района"),
+    ("Ship Radar 24: карточки", "srd",
+     "бесплатно, без ключа: тип, осадка, размеры и назначение судов"),
     ("AIS-catcher: ожидаемые прибытия", "aci",
      "бесплатно, без ключа: суда, идущие в наши порты"),
     ("Global Fishing Watch", "gfw",
@@ -93,6 +95,7 @@ SERVICE_SITES = {
     "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
     "gor": ("goradar.ru", "https://goradar.ru/"),
     "mlive": ("marinetraffic.live", "https://marinetraffic.live/"),
+    "srd": ("карточки судов marinetraffic.live", "https://marinetraffic.live/"),
     "aci": ("AIS-catcher", "https://www.aiscatcher.org/port/UAIZM?tab=expected"),
     "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
     "dat": ("Datalastic API", "https://datalastic.com/ais-data-api/"),
@@ -750,6 +753,10 @@ class App:
         self.var_traffic = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="трафик района", variable=self.var_traffic,
                         command=self.redraw_map).pack(side="left", padx=(8, 0))
+        # Фильтр «в порту»: только суда у причала и на рейде (ждут лоцмана)
+        self.var_port_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="в порту / ждёт лоцмана", variable=self.var_port_only,
+                        command=self.redraw_map).pack(side="left", padx=(8, 0))
         self.var_tracks = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="трек", variable=self.var_tracks,
                         command=self.toggle_tracks).pack(side="left", padx=(8, 0))
@@ -1060,6 +1067,7 @@ class App:
         self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
         self.var_use_gor = tk.BooleanVar(value=bool(self.config.get("use_gor", True)))
         self.var_use_mlive = tk.BooleanVar(value=bool(self.config.get("use_mlive", True)))
+        self.var_use_srd = tk.BooleanVar(value=bool(self.config.get("use_srd", True)))
         self.var_use_aci = tk.BooleanVar(value=bool(self.config.get("use_aci", True)))
         self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
         self.var_use_dat = tk.BooleanVar(value=bool(self.config.get("use_dat", False)))
@@ -1077,6 +1085,7 @@ class App:
             "aci": tk.StringVar(), "gfw": tk.StringVar(),
             "dat": tk.StringVar(), "aishub": tk.StringVar(),
             "gor": tk.StringVar(), "mlive": tk.StringVar(),
+            "srd": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -1604,13 +1613,20 @@ class App:
 
     def redraw_map(self):
         try:
-            vessels = self.core.related_vessels(1000)
-            traffic = []
-            if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
-                try:
-                    traffic = self.core.traffic_vessels(800)
-                except Exception:
-                    traffic = []
+            port_only = bool(getattr(self, "var_port_only", None) is not None
+                             and self.var_port_only.get())
+            if port_only:
+                # только причал и рейд: чужие точки района и суда в море не нужны
+                vessels = self.core.port_vessels(600)
+                traffic = []
+            else:
+                vessels = self.core.related_vessels(1000)
+                traffic = []
+                if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
+                    try:
+                        traffic = self.core.traffic_vessels(800)
+                    except Exception:
+                        traffic = []
             self.radar.draw(vessels, set(self._targets.keys()), traffic)
         except Exception as error:
             self.log(f"Отрисовка радара: {error}")
@@ -2093,7 +2109,7 @@ class App:
                 self.cargo_text(vessel),
                 self.cargo_kind_text(vessel),
                 fmt_number(vessel.get("sog")),
-                "ожидается" if no_position else (vessel.get("port") or "—"),
+                "ожидается" if no_position else self.port_text(vessel),
                 (f"сигнал {info.get('last_heard') or '—'} · AIS-catcher {updated}"
                  if no_position else self.fmt_time(vessel.get("updated_at"))),
                 vessel.get("mmsi"),
@@ -2280,6 +2296,19 @@ class App:
             text += " балласт"
         return text
 
+    def port_text(self, vessel):
+        """Порт и место стоянки: у причала, на рейде или просто в порту."""
+        place = None
+        try:
+            place = self.core.port_place(vessel)
+        except Exception:
+            place = None
+        if place:
+            short = place.get("place") or ""
+            short = short.replace("рейд: ждёт лоцмана", "рейд").replace("у причала", "причал")
+            return f"{place.get('port_name')} · {short}"
+        return vessel.get("port") or "—"
+
     def cargo_kind_text(self, vessel):
         """Что за груз везёт судно — по типу AIS и по имени судна (поиск по ключевым словам)."""
         # 1) По коду типа AIS (надежный источник: танкер 80 = нефть/нефтепродукты)
@@ -2372,6 +2401,7 @@ class App:
         self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_gor"] = bool(getattr(self, "var_use_gor", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_mlive"] = bool(getattr(self, "var_use_mlive", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_srd"] = bool(getattr(self, "var_use_srd", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_aci"] = bool(getattr(self, "var_use_aci", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dat"] = bool(getattr(self, "var_use_dat", __import__("tkinter").BooleanVar(value=False)).get())
@@ -2753,6 +2783,7 @@ class App:
             key, lambda event: None, self.log, threading.Event(),
             api_key=api_key, bboxes=self.config.get("bounding_boxes"),
             ports=self.config.get("ports"),
+            vessels=(self.core.enrich_candidates if key == "srd" else None),
             # проверка не должна тратить много кредитов: только 5 записей
             max_records=5)
         if feed is None:

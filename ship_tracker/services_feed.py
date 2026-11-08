@@ -18,6 +18,7 @@
 """
 
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta
@@ -39,6 +40,7 @@ SERVICE_TITLES = {
     "dt": "Digitraffic",
     "gor": "Goradar (карта судов)",
     "mlive": "MarineTraffic.live (карта судов)",
+    "srd": "Ship Radar 24 (карточки судов)",
 }
 
 DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
@@ -58,6 +60,10 @@ MARINETRAFFIC_LIVE_HOME = "https://marinetraffic.live/"
 # Карта сайта берёт суда из своего JSON-моста (раньше был /realtime_ais,
 # теперь он отдаёт пустой список). Район задаётся точкой и радиусом.
 MARINETRAFFIC_LIVE_URL = "https://marinetraffic.live/bridge/vessels/nearby"
+# Карточка судна на том же сайте (HTML): тип, позывной, размеры, осадка,
+# порт назначения. Позиции берём JSON-мостом, а паспорт — отсюда.
+SHIPRADAR_CARD_URL = "https://marinetraffic.live/vessels/{slug}/{mmsi}/"
+SHIPRADAR_STATE = Path(__file__).resolve().parent / "data" / "shipradar_cards.json"
 MAP_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
@@ -1238,6 +1244,227 @@ class MarineTrafficLiveFeed(ServiceFeed):
         self.ok(len(seen), detail)
 
 
+# ------------------------------------------------- карточки судов Ship Radar 24
+
+CARD_KEYS = {
+    "name": ("name",),
+    "imo": ("imo", "imo-nummer"),
+    "callsign": ("call sign", "rufzeichen", "позывной"),
+    "type": ("schiffstyp", "vessel type", "тип судна"),
+    "length": ("länge", "length", "длина"),
+    "beam": ("breite", "beam", "ширина"),
+    "draft": ("tiefgang", "draught", "осадка"),
+    "destination": ("zielhafen", "ziel", "destination", "назначение"),
+}
+
+
+def _card_text(value) -> str:
+    """Текст из HTML-ячейки карточки: без тегов, пробелов и «—»."""
+    import html as html_module
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = html_module.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return "" if text in ("", "—", "-", "n/a", "N/A") else text
+
+
+def parse_vessel_card(html_text) -> dict:
+    """Паспорт судна из страницы MarineTraffic.live: тип, осадка, размеры."""
+    import html as html_module
+    pairs = re.findall(r'<span class="k">(.*?)</span>\s*<span class="v">(.*?)</span>',
+                       str(html_text or ""), re.S)
+    values = {}
+    for key, value in pairs:
+        name = html_module.unescape(re.sub(r"<[^>]+>", " ", key)).strip().lower()
+        text = _card_text(value)
+        if not name or not text:
+            continue
+        for field, keys in CARD_KEYS.items():
+            if field in values:
+                continue
+            if name in keys:
+                values[field] = text
+                break
+    result = {}
+    if values.get("name"):
+        # в названиях на карте встречаются кавычки и служебные пометки
+        result["name"] = values["name"].strip("'\"«» ")[:60]
+    if values.get("imo"):
+        imo = "".join(ch for ch in values["imo"] if ch.isdigit())
+        if len(imo) == 7:
+            result["imo"] = imo
+    if values.get("callsign"):
+        result["callsign"] = values["callsign"][:16]
+    if values.get("type"):
+        result["type_text"] = values["type"][:60]
+    if values.get("length"):
+        result["length_m"] = _number(values["length"].replace("m", ""))
+    if values.get("beam"):
+        result["beam_m"] = _number(values["beam"].replace("m", ""))
+    if values.get("draft"):
+        result["draft"] = _number(values["draft"].replace("m", ""))
+    if values.get("destination"):
+        # «IZMAIL (UAIZM)» → IZMAIL
+        result["destination"] = re.split(r"[(,]", values["destination"])[0].strip()[:24]
+    # Проверка на явную ошибку в источнике: осадка больше четверти длины корпуса
+    # или ширина больше его длины быть не может (у целого типа судов так бывает
+    # только при опечатке вроде «18 м длина, 13 м осадка»).
+    length = result.get("length_m")
+    draft = result.get("draft")
+    # Осадка больше 8 % длины корпуса — это уже ошибка AIS (встречается
+    # «27 м» у 110-метрового толкача) или опечатка сайта, а не данные.
+    if length and draft and (draft > max(1.5, length * 0.08) or draft < 0.3):
+        result.pop("draft", None)
+    beam = result.get("beam_m")
+    if length and beam and beam > max(1.0, length * 0.6):
+        result.pop("beam_m", None)
+    if beam and (beam < 2.0):
+        result.pop("beam_m", None)
+    return result
+
+
+class ShipRadarDetailsFeed(ServiceFeed):
+    """Наполняет базу паспортными данными судов с карточек Ship Radar 24.
+
+    Позиции приходят JSON-потоком, а тип, позывной, размеры, осадка и порт
+    назначения есть только в HTML-карточке судна. Читаем только те суда,
+    у которых в базе не хватает этих полей, по одному запросу на судно,
+    и запоминаем попытки, чтобы не ходить на сайт каждые полчаса.
+    """
+
+    key = "srd"
+    interval = 900.0
+    max_per_cycle = 120
+    retry_hours = 72.0
+    pause = 0.6
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session = None
+        self.vessel_source = kwargs.get("vessels") or (lambda: [])
+        self.state_path = SHIPRADAR_STATE
+        self.attempts = self._load_attempts()
+        if kwargs.get("minutes"):
+            self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
+
+    # ------------------------------------------------------------ состояние
+    def _load_attempts(self) -> dict:
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _tried_recently(self, mmsi, now) -> bool:
+        """Недавняя попытка: удачная — на весь срок, ошибка — на 6 часов."""
+        seen = self.attempts.get(mmsi)
+        if not seen:
+            return False
+        if isinstance(seen, dict):
+            at = float(seen.get("at") or 0)
+            limit = self.retry_hours * 3600 if seen.get("ok") else 6 * 3600
+        else:
+            at, limit = float(seen), 6 * 3600
+        return 0 < now - at < limit
+
+    def _save_attempts(self):
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.state_path.write_text(json.dumps(self.attempts, ensure_ascii=False),
+                                       encoding="utf-8")
+        except OSError as error:
+            self.log(f"{self.title}: состояние не сохранено ({error})")
+
+    def http(self):
+        import requests
+        if self.session is None:
+            session = requests.Session()
+            session.headers.update({"User-Agent": MAP_HEADERS["User-Agent"],
+                                    "Accept-Language": "ru,en;q=0.8",
+                                    "Referer": MARINETRAFFIC_LIVE_HOME})
+            self.session = session
+        return self.session
+
+    def candidates(self) -> list:
+        try:
+            items = self.vessel_source() or []
+        except Exception:
+            return []
+        now = time.time()
+        result = []
+        for item in items:
+            if isinstance(item, dict):
+                mmsi = _mmsi(item.get("mmsi"))
+                name = str(item.get("name") or "")
+            else:
+                mmsi = _mmsi(item)
+                name = ""
+            if not mmsi:
+                continue
+            # без имени не собрать адрес карточки: сайт отвечает 403 на «x»
+            if not str(name).strip() or self._tried_recently(mmsi, now):
+                continue
+            result.append((mmsi, name))
+            if len(result) >= self.max_per_cycle:
+                break
+        return result
+
+    def url_for(self, mmsi, name="") -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-")
+        return SHIPRADAR_CARD_URL.format(slug=slug or "x", mmsi=mmsi)
+
+    def poll_once(self):
+        session = self.http()
+        targets = self.candidates()
+        if not targets:
+            self.ok(0, "все карточки уже прочитаны")
+            return
+        filled = 0
+        errors = 0
+        for mmsi, name in targets:
+            if self.stop_event.is_set():
+                break
+            try:
+                response = session.get(self.url_for(mmsi, name), timeout=30)
+                response.raise_for_status()
+                card = parse_vessel_card(response.text)
+            except Exception as error:
+                errors += 1
+                if errors == 1:
+                    self.log(f"{self.title}: карточка не открылась "
+                             f"({error.__class__.__name__}: {self.url_for(mmsi, name)})")
+                self.attempts[mmsi] = {"at": time.time(), "ok": False}
+                self.stop_event.wait(self.pause)
+                continue
+            self.attempts[mmsi] = {"at": time.time(), "ok": True}
+            if card and any(card.get(key) for key in
+                            ("name", "type_text", "draft", "length_m", "beam_m",
+                             "destination")):
+                code = None
+                try:
+                    import ais_feed
+                    code = ais_feed.type_code_for_label(card.get("type_text"))
+                except Exception:
+                    code = None
+                self.emit({"kind": "static", "mmsi": mmsi,
+                           "name": card.get("name") or "",
+                           "imo": card.get("imo") or "",
+                           "callsign": card.get("callsign") or "",
+                           "type_code": code,
+                           "type_label": card.get("type_text") or "",
+                           "destination": card.get("destination") or "",
+                           "draft": card.get("draft"),
+                           "length_m": card.get("length_m"),
+                           "beam_m": card.get("beam_m"),
+                           "eta_declared": None,
+                           "at": datetime.now(),
+                           "source": "srd"})
+                filled += 1
+            self.stop_event.wait(self.pause)
+        self._save_attempts()
+        detail = f"запросов {len(targets)}" + (f", ошибок {errors}" if errors else "")
+        self.ok(filled, detail)
+
+
 # Ключ настройки с ключом API: vf_key / mt_key / mst_key.
 PROVIDERS = {
     "vf": VesselFinderFeed,
@@ -1251,6 +1478,7 @@ PROVIDERS = {
     "aishub": AishubFeed,
     "gor": GoradarFeed,
     "mlive": MarineTrafficLiveFeed,
+    "srd": ShipRadarDetailsFeed,
 }
 
 

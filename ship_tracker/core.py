@@ -71,6 +71,9 @@ DEFAULT_CONFIG = {
     "gor_minutes": 15,
     "use_mlive": True,
     "mlive_minutes": 15,
+    # карточки судов Ship Radar 24: тип, осадка, размеры, позывной, назначение
+    "use_srd": True,
+    "srd_minutes": 15,
     "use_gfw": False,
     "gfw_key": "",
     "gfw_minutes": 720,
@@ -538,7 +541,7 @@ class RadarCore:
         config = self.config
         self.service_status = {}
         for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub",
-                    "gor", "mlive"):
+                    "gor", "mlive", "srd"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
@@ -555,7 +558,7 @@ class RadarCore:
                 api_key=api_key,
                 bboxes=config.get("bounding_boxes"),
                 on_status=self._set_service_status,
-                vessels=self.tracked_mmsis,
+                vessels=(self.enrich_candidates if key == "srd" else self.tracked_mmsis),
                 minutes=config.get(f"{key}_minutes"),
                 daily_coins=(config.get("vfa_daily_coins") if key == "vfa"
                              else config.get("mst_daily_coins")),
@@ -818,6 +821,84 @@ class RadarCore:
         return [vessel for vessel in self.related_vessels(limit)
                 if vessel.get("lat") is None or vessel.get("lon") is None]
 
+    def enrich_candidates(self, limit=200) -> list:
+        """Суда, у которых не хватает паспортных данных для нашего стандарта.
+
+        Отдаёт записи из базы, у которых нет типа, осадки или размеров —
+        их карточки дочитывает поток Ship Radar 24.
+        """
+        try:
+            rows = self.store.vessels(2000)
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            if self.is_station_mmsi(row.get("mmsi")):
+                continue
+            if row.get("lat") is None and not row.get("destination"):
+                continue
+            missing = (row.get("type_code") is None or row.get("draft") is None
+                       or row.get("length_m") is None or row.get("beam_m") is None
+                       or not row.get("imo"))
+            if not missing:
+                continue
+            result.append(dict(row))
+            if len(result) >= limit:
+                break
+        return result
+
+    def port_place(self, vessel) -> dict | None:
+        """Где судно относительно портов: у причала, на рейде или нигде.
+
+        Рейд — это стоянка почти без хода в пределах 12 км от границы геозоны
+        порта: так стоят суда в ожидании лоцмана и очереди на обработку.
+        """
+        ports = self.config.get("ports") or []
+        lat, lon = vessel.get("lat"), vessel.get("lon")
+        if lat is None or lon is None or not ports:
+            return None
+        try:
+            speed = float(vessel.get("sog") or 0)
+        except (TypeError, ValueError):
+            speed = 0.0
+        port = geo.port_at(lat, lon, ports)
+        if port:
+            place = "у причала" if speed < 0.5 else "в порту"
+            return {"port_name": port.get("name"), "place": place, "port_km": 0.0}
+        best = None
+        for candidate in ports:
+            try:
+                km = geo.haversine_km(lat, lon, float(candidate["lat"]), float(candidate["lon"]))
+                radius = float(candidate.get("radius_km") or 5.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            gap = km - radius
+            if best is None or gap < best[0]:
+                best = (gap, candidate, km)
+        if not best or best[0] > 12 or speed > 1.5:
+            return None
+        place = "рейд: ждёт лоцмана" if speed < 0.5 else "подход к порту"
+        return {"port_name": best[1].get("name"), "place": place, "port_km": best[2]}
+
+    def port_vessels(self, limit=600) -> list:
+        """Суда у причалов и на рейде — для галочки «в порту» и бота.
+
+        Сортировка: сначала те, кто у причала, потом ожидающие лоцмана;
+        внутри — по названию порта и имени судна.
+        """
+        result = []
+        for vessel in self.related_vessels(limit):
+            place = self.port_place(vessel)
+            if not place:
+                continue
+            row = dict(vessel)
+            row.update(place)
+            result.append(row)
+        result.sort(key=lambda item: (0 if item.get("port_km") == 0 else 1,
+                                      str(item.get("port_name") or ""),
+                                      str(item.get("name") or "")))
+        return result
+
     def traffic_vessels(self, limit=400) -> list:
         """Чужой трафик района: суда в море, не идущие в наши порты.
 
@@ -909,6 +990,12 @@ class RadarCore:
             if removed:
                 self.log(f"История позиций: удалено старых записей {removed}.")
             self.store.prune_sea_traffic(48)
+            # служебные объекты AIS (AtoN, базовые станции) — не суда
+            stations = [str(row.get("mmsi")) for row in self.store.vessels(3000)
+                        if self.is_station_mmsi(row.get("mmsi"))]
+            if stations:
+                self.store.purge_vessels(stations)
+                self.log(f"Убраны служебные объекты AIS: {len(stations)}.")
             forgotten = self.store.forget_vessels(self.config.get("forget_vessels_hours") or 24)
             if forgotten:
                 self.log(f"Убрано из списка судов без связи: {forgotten}.")
@@ -966,9 +1053,24 @@ class RadarCore:
         elif kind == "position":
             self._process_position(event)
 
+    @staticmethod
+    def is_station_mmsi(mmsi) -> bool:
+        """MMSI служебных объектов AIS, а не судов.
+
+        99xxxxxxx — плавучие предупреждения (AtoN), 111xxxxxx — поисковые
+        самолёты, 00xxxxxxx — береговые станции и базовые объекты.
+        На карте они выгляели бы как стоящие в порту «суда» с именами
+        вроде «OBSTN WITH DEPTH 17».
+        """
+        text = "".join(ch for ch in str(mmsi or "") if ch.isdigit())
+        return (text.startswith("99") or text.startswith("111")
+                or text.startswith("00") or text.startswith("000"))
+
     def _process_static(self, event):
         self.stats["static"] += 1
         mmsi = str(event.get("mmsi") or "")
+        if self.is_station_mmsi(mmsi):
+            return
         # Фильтр: пропускаем явно тестовые/демонстрационные суда
         name_cand = (event.get("name") or "").upper()
         if any(x in name_cand for x in ["TEST", "DEMO", "EXAMPLE", "SAMPLE"]) or mmsi in LEGACY_DEMO_MMSI:
@@ -1005,6 +1107,9 @@ class RadarCore:
         self.stats["events"] += 1
         self.stats["last_event"] = event.get("at") or datetime.now()
         mmsi = event["mmsi"]
+        if self.is_station_mmsi(mmsi):
+            self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+            return
         lat, lon = event["lat"], event["lon"]
 
         port = geo.port_at(lat, lon, self.config.get("ports") or [])
@@ -1378,8 +1483,20 @@ class RadarCore:
         draft = vessel.get("draft")
         length = vessel.get("length_m")
         beam = vessel.get("beam_m")
-        if not draft or not length or not beam:
+        if not draft or not length:
             return None
+        if not beam:
+            # ширину корпуса AIS часто не передаёт: берём типичную для этой длины
+            beam = self.store.beam_reference(length)
+            if not beam:
+                return None
+            estimate = cargo.estimate(length, beam, draft,
+                                     draft_max=vessel.get("draft_max"),
+                                     reference_max=self.store.draft_reference(length),
+                                     type_code=vessel.get("type_code"))
+            if estimate:
+                estimate["beam_source"] = "типичная ширина для такой длины"
+            return estimate
         return cargo.estimate(length, beam, draft,
                               draft_max=vessel.get("draft_max"),
                               reference_max=self.store.draft_reference(length),
