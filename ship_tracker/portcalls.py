@@ -72,21 +72,24 @@ def parse_expected_page(html: str) -> list[dict]:
     return rows
 
 
-def fetch_expected(ports, timeout=45, pause=1.5, log=None) -> dict:
+def fetch_expected(ports, timeout=45, pause=1.5, log=None, retries=1) -> dict:
     """Ожидаемые прибытия по всем нашим портам: {locode: {name, vessels}}.
 
     Ошибка одного порта не мешает остальным: она попадает в поле error.
+    Порт, который не ответил с первого раза, переспрашивается — так список
+    при открытии программы заполняется целиком, а не наполовину.
     """
     import requests
     import time
 
     result = {"updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
               "ports": {}}
-    for port in ports or []:
+
+    def ask(port):
         locode = _clean((port or {}).get("locode")).upper()
         label = _clean((port or {}).get("label") or (port or {}).get("name"))
         if not locode:
-            continue
+            return None
         entry = {"name": label, "vessels": []}
         try:
             response = requests.get(EXPECTED_URL.format(locode=locode),
@@ -105,8 +108,31 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None) -> dict:
                 entry["error"] = str(error).strip()[:120] or error.__class__.__name__
                 if log:
                     log(f"AIS-catcher {locode}: {entry['error']}")
-        result["ports"][locode] = entry
+        return locode, entry
+
+    for port in ports or []:
+        asked = ask(port)
+        if not asked:
+            continue
+        result["ports"][asked[0]] = asked[1]
         time.sleep(max(0.0, pause))
+    # второй подход к портам, которые не отдали таблицу с первого раза
+    for attempt in range(max(0, int(retries or 0))):
+        failed = [port for port in (ports or [])
+                  if (result["ports"].get(_clean((port or {}).get("locode")).upper()) or {})
+                  .get("error") and not (result["ports"].get(
+                      _clean((port or {}).get("locode")).upper()) or {}).get("unsupported")]
+        if not failed:
+            break
+        if attempt or failed:
+            time.sleep(3)
+        for port in failed:
+            asked = ask(port)
+            if not asked:
+                continue
+            if asked[1].get("vessels") or not asked[1].get("error"):
+                result["ports"][asked[0]] = asked[1]
+            time.sleep(max(0.0, pause))
     # Пустой ответ по всем портам — почти всегда сбой сайта, а не уход судов:
     # оставляем прошлый список, чтобы вкладка и бот не опустели.
     if not any(entry.get("vessels") for entry in result["ports"].values()):

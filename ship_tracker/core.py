@@ -442,6 +442,7 @@ class RadarCore:
             self.events = queue.Queue(maxsize=20000)
             self._start_consumer()
             self._start_services()
+            self._start_startup_refresh()
             return
         self._feed_lock = lock
         self.feed_elsewhere = False
@@ -452,6 +453,7 @@ class RadarCore:
         self._start_alert_worker()
         self._start_consumer()
         self._start_feed()
+        self._start_startup_refresh()
 
     def _start_feed(self):
         config = self.config
@@ -536,10 +538,72 @@ class RadarCore:
                              name="history-stays").start()
         self._start_services()
 
+    def _start_startup_refresh(self):
+        """Обновление данных при открытии: ждёт первый ответ от всех источников.
+
+        Все включённые источники опрашиваются одновременно (каждый в своём
+        потоке), поэтому при открытии программы данные обновляются за один
+        заход, а не по очереди. Когда все ответили — в журнал пишется итог,
+        и окно перерисовывает таблицы и карту.
+        """
+        threading.Thread(target=self._startup_refresh_worker, daemon=True,
+                         name="startup-refresh").start()
+
+    def _startup_refresh_worker(self):
+        feeds = [feed for feed in list(self.feeds) if hasattr(feed, "first_done")]
+        if not feeds:
+            return
+        started = time.time()
+        answered = 0
+        for feed in feeds:
+            left = max(1.0, 180.0 - (time.time() - started))
+            if feed.first_done.wait(left):
+                answered += 1
+        try:
+            vessels = len(self.store.vessels(3000))
+        except Exception:
+            vessels = 0
+        self.log(f"Данные при открытии обновлены за {time.time() - started:.0f} с: "
+                 f"источников ответило {answered} из {len(feeds)}, "
+                 f"судов в базе {vessels}.")
+        callback = getattr(self, "on_refresh", None)
+        if callback:
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def refresh_all_sources(self):
+        """Внеочередной опрос всех включённых источников — одним заходом.
+
+        Не ждёт расписания и не трогает уже запущенные потоки: просто просит
+        каждый из них выполнить следующий цикл сейчас. Возвращает число
+        источников, которым отправлен запрос.
+        """
+        asked = 0
+        for feed in list(self.feeds):
+            wake = getattr(feed, "wake", None)
+            if not callable(wake):
+                continue
+            try:
+                wake()
+                asked += 1
+            except Exception:
+                continue
+        if asked:
+            self.log(f"Внеочередное обновление: опрос отправлен источникам — {asked}.")
+            self._start_startup_refresh()
+        return asked
+
     def _start_services(self):
-        """Поднимает опрос выбранных внешних сервисов (см. services_feed)."""
+        """Поднимает опрос выбранных внешних сервисов (см. services_feed).
+
+        Все включённые источники стартуют сразу, каждый в своём потоке:
+        запросы уходят одновременно, а не по очереди.
+        """
         config = self.config
         self.service_status = {}
+        started = []
         for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub",
                     "gor", "mlive", "srd"):
             if not config.get(f"use_{key}"):
@@ -576,7 +640,10 @@ class RadarCore:
             self._set_service_status(key, "запуск…")
             feed.start()
             self.feeds.append(feed)
-            self.log(f"{title}: запущен опрос API.")
+            started.append(title)
+        if started:
+            self.log(f"Источники запущены одновременно ({len(started)}): "
+                     + ", ".join(started) + ".")
 
     def tracked_mmsis(self):
         """MMSI всех судов в базе — для обогащения внешними API."""

@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.18"
+APP_VERSION = "2026.11.19"
 
 import ais_feed
 import cargo
@@ -587,6 +587,8 @@ class App:
         self.selected = None
         self.core = RadarCore(config, store, log=self.log, on_alert=self.on_alert)
         self.core.on_service_status = self._on_service_status
+        # когда источники ответили на стартовое обновление — обновить экран
+        self.core.on_refresh = lambda: self.events.put(("refresh", None))
         self.bot = None
         self._targets = {}
         self._banner_job = None
@@ -632,6 +634,8 @@ class App:
                     self.show_banner(payload)
                 elif kind == "photo":
                     self.show_photo(*payload)
+                elif kind == "refresh":
+                    self._slow_tick()
         except queue.Empty:
             pass
 
@@ -1192,6 +1196,8 @@ class App:
             row=row + 1, column=0, columnspan=2, sticky="w", padx=(8, 6), pady=(8, 2))
         ttk.Button(links, text="Проверить все", command=self.check_all_sources
                    ).grid(row=row + 1, column=2, sticky="e", padx=8, pady=(8, 2))
+        ttk.Button(links, text="Обновить данные сейчас", command=self.refresh_sources_now
+                   ).grid(row=row + 1, column=1, sticky="e", padx=8, pady=(8, 2))
         ttk.Label(links, text="Ключ не нужен. «Проверить» показывает, жив ли источник "
                               "и читается ли он автоматически.",
                   foreground="#777").grid(row=row + 2, column=0, columnspan=3,
@@ -2870,6 +2876,19 @@ class App:
         finally:
             self._source_checking.discard(source["key"])
         self._store_source_result(result)
+
+    def refresh_sources_now(self):
+        """Внеочередной опрос всех включённых источников — одним заходом."""
+        asked = 0
+        try:
+            asked = self.core.refresh_all_sources()
+        except Exception as error:
+            self.log(f"Обновление источников: {error}")
+        if asked:
+            self.log(f"Обновление данных запрошено у всех включённых источников ({asked}) — "
+                     f"ответы придут одновременно.")
+        else:
+            self.log("Нет запущенных источников: включите их галочками выше или нажмите «Старт».")
 
     def check_all_sources(self):
         if getattr(self, "_sources_busy", False):

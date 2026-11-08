@@ -211,6 +211,11 @@ class ServiceFeed(threading.Thread):
         self.events = 0
         self.last_error = ""
         self.last_count = -1
+        # первый ответ источника: по нему программа понимает, что обновление
+        # при открытии закончено (все источники опрашиваются одновременно)
+        self.first_done = threading.Event()
+        self.first_count = None
+        self._wake = threading.Event()
 
     # ------------------------------------------------------------- служебное
 
@@ -230,7 +235,14 @@ class ServiceFeed(threading.Thread):
         self.on_event(event)
 
     def sleep_until_next(self):
-        return self.stop_event.wait(self.interval)
+        """Пауза до следующего цикла; wake() сокращает её до нуля."""
+        self._wake.wait(self.interval)
+        self._wake.clear()
+        return self.stop_event.is_set()
+
+    def wake(self):
+        """Выполнить следующий цикл сейчас — для обновления при открытии."""
+        self._wake.set()
 
     def fail(self, error):
         text = str(error).strip() or error.__class__.__name__
@@ -253,6 +265,10 @@ class ServiceFeed(threading.Thread):
                 self.poll_once()
             except Exception as error:  # сеть, лимит, формат — ждём следующий цикл
                 self.fail(error)
+            finally:
+                if not self.first_done.is_set():
+                    self.first_count = self.events
+                    self.first_done.set()
             if self.sleep_until_next():
                 break
 

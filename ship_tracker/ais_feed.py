@@ -666,11 +666,23 @@ class SnapshotFeed(threading.Thread):
         self.connected_since = None
         self.last_ships = 0
         self.last_stale = 0
+        # первый ответ и внеочередное обновление — для обновления при открытии
+        self.first_done = threading.Event()
+        self._wake = threading.Event()
+
+    def wake(self):
+        """Взять свежий снимок района сейчас, не дожидаясь интервала."""
+        self._wake.set()
 
     def run(self):
         while not self.stop_event.is_set():
-            self.fetch_once()
-            if self.stop_event.wait(self.interval_minutes * 60):
+            try:
+                self.fetch_once()
+            finally:
+                self.first_done.set()
+            self._wake.wait(self.interval_minutes * 60)
+            self._wake.clear()
+            if self.stop_event.is_set():
                 break
         self.connected = False
 
