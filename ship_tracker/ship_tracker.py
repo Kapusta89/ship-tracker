@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.14"
+APP_VERSION = "2026.11.16"
 
 import ais_feed
 import cargo
@@ -73,6 +73,8 @@ SERVICE_BLOCKS = [
     ("MarineTraffic", "mt", "живой API по ключу, район задаётся в кабинете"),
     ("MyShipTracking", "mst", "триал 2000 кредитов: расширенные данные по нашим судам"),
     ("Digitraffic", "dt", "открытые данные Финляндии, только Балтика"),
+    ("Goradar", "gor", "бесплатно, без ключа: карта судов района"),
+    ("MarineTraffic.live", "mlive", "бесплатно, без ключа: карта судов района"),
     ("AIS-catcher: ожидаемые прибытия", "aci",
      "бесплатно, без ключа: суда, идущие в наши порты"),
     ("Global Fishing Watch", "gfw",
@@ -89,6 +91,8 @@ SERVICE_SITES = {
     "mt": ("marinetraffic.com", "https://www.marinetraffic.com/"),
     "mst": ("myshiptracking.com", "https://www.myshiptracking.com/"),
     "dt": ("digitraffic.fi", "https://www.digitraffic.fi/en/marine-traffic/"),
+    "gor": ("goradar.ru", "https://goradar.ru/"),
+    "mlive": ("marinetraffic.live", "https://marinetraffic.live/"),
     "aci": ("AIS-catcher", "https://www.aiscatcher.org/port/UAIZM?tab=expected"),
     "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
     "dat": ("Datalastic API", "https://datalastic.com/ais-data-api/"),
@@ -322,7 +326,7 @@ class RadarCanvas:
         return best[1] if best else None
 
     # -- отрисовка
-    def draw(self, vessels, target_mmsi):
+    def draw(self, vessels, target_mmsi, traffic=None):
         canvas = self.canvas
         canvas.delete("all")
         # Get canvas size; if 1x1 (before window mapping), use default
@@ -396,8 +400,27 @@ class RadarCanvas:
                     canvas.create_text(x + 7, y - 7, text=vessel["name"], anchor="w",
                                        fill="#d7e6ee" if not stale else "#5d7280",
                                        font=("Consolas", 7))
+        # Весь остальной трафик района: мелкие точки, чтобы на карте были все суда.
+        shown_traffic = 0
+        if traffic:
+            known = {str(vessel.get("mmsi")) for vessel in vessels if vessel.get("mmsi")}
+            for vessel in traffic:
+                mmsi = str(vessel.get("mmsi") or "")
+                if not mmsi or mmsi in known:
+                    continue
+                lat, lon = vessel.get("lat"), vessel.get("lon")
+                if lat is None or lon is None:
+                    continue
+                x, y = projector.to_screen(lat, lon)
+                if not (0 <= x <= width and 0 <= y <= height):
+                    continue
+                color = "#3f6f88" if (vessel.get("sog") or 0) > 0.5 else "#4a4f52"
+                canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5,
+                                   fill=color, outline="", tags=("traffic",))
+                shown_traffic += 1
         self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_count,
-                          len([v for v in vessels if v.get("lat") is None]))
+                          len([v for v in vessels if v.get("lat") is None]),
+                          traffic=shown_traffic)
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -525,13 +548,16 @@ class RadarCanvas:
             return float("inf")
         return minutes * 60
 
-    def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0):
+    def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
+                     traffic=0):
         fresh = drawn - stale
         text = (f"источник: живой AIS (AISStream, Open Waters)\n"
                 f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
                 f"свежих: {fresh}   без данных > {self._stale_label()}: {stale}\n")
         if without_position:
             text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
+        if traffic:
+            text += f"трафик района (точки): {traffic}\n"
         text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
         self.canvas.create_text(10, 10, anchor="nw", text=text,
                                 fill="#5f8ea3", font=("Consolas", 8))
@@ -721,6 +747,9 @@ class App:
         self.var_targets_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="только цели", variable=self.var_targets_only,
                         command=self.toggle_targets_only).pack(side="left", padx=(12, 0))
+        self.var_traffic = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="трафик района", variable=self.var_traffic,
+                        command=self.redraw_map).pack(side="left", padx=(8, 0))
         self.var_tracks = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="трек", variable=self.var_tracks,
                         command=self.toggle_tracks).pack(side="left", padx=(8, 0))
@@ -1029,6 +1058,8 @@ class App:
         self.var_use_mt = tk.BooleanVar(value=bool(self.config.get("use_mt", False)))
         self.var_use_mst = tk.BooleanVar(value=bool(self.config.get("use_mst", False)))
         self.var_use_dt = tk.BooleanVar(value=bool(self.config.get("use_dt", False)))
+        self.var_use_gor = tk.BooleanVar(value=bool(self.config.get("use_gor", True)))
+        self.var_use_mlive = tk.BooleanVar(value=bool(self.config.get("use_mlive", True)))
         self.var_use_aci = tk.BooleanVar(value=bool(self.config.get("use_aci", True)))
         self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
         self.var_use_dat = tk.BooleanVar(value=bool(self.config.get("use_dat", False)))
@@ -1045,6 +1076,7 @@ class App:
             "mst": tk.StringVar(), "dt": tk.StringVar(),
             "aci": tk.StringVar(), "gfw": tk.StringVar(),
             "dat": tk.StringVar(), "aishub": tk.StringVar(),
+            "gor": tk.StringVar(), "mlive": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -1573,7 +1605,13 @@ class App:
     def redraw_map(self):
         try:
             vessels = self.core.related_vessels(1000)
-            self.radar.draw(vessels, set(self._targets.keys()))
+            traffic = []
+            if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
+                try:
+                    traffic = self.core.traffic_vessels(800)
+                except Exception:
+                    traffic = []
+            self.radar.draw(vessels, set(self._targets.keys()), traffic)
         except Exception as error:
             self.log(f"Отрисовка радара: {error}")
 
@@ -1692,6 +1730,10 @@ class App:
                     "Проверка в других сервисах:",
                 ]
                 for title, url in portcalls.registry_links(None, mmsi):
+                    lines.append(f"  • {title}: {url}")
+                lines.append("")
+                lines.append("Карты судов (открываются в браузере):")
+                for title, url in portcalls.tracking_links(mmsi, expected.get("name")):
                     lines.append(f"  • {title}: {url}")
                 return "\n".join(lines)
             return "Судно не найдено — возможно, оно ушло из района."
@@ -1814,6 +1856,10 @@ class App:
         lines.append("Проверка в других сервисах:")
         for l in links:
             lines.append(f"  {l}")
+        lines.append("")
+        lines.append("Карты судов (открываются в браузере):")
+        for title, url in portcalls.tracking_links(mmsi, vessel.get("name")):
+            lines.append(f"  • {title}: {url}")
         lines.append("")
         if target:
             lines += [
@@ -2324,6 +2370,8 @@ class App:
         self.config["use_mt"] = bool(getattr(self, "var_use_mt", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_mst"] = bool(getattr(self, "var_use_mst", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dt"] = bool(getattr(self, "var_use_dt", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_gor"] = bool(getattr(self, "var_use_gor", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_mlive"] = bool(getattr(self, "var_use_mlive", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_aci"] = bool(getattr(self, "var_use_aci", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dat"] = bool(getattr(self, "var_use_dat", __import__("tkinter").BooleanVar(value=False)).get())

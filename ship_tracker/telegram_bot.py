@@ -376,6 +376,9 @@ def vessel_card(vessel: dict, core) -> str:
         lines.append("<b>Проверить в реестрах:</b>")
         for title, url in portcalls.registry_links(vessel.get("imo"), mmsi)[:3]:
             lines.append(f'• <a href="{url}">{title}</a>')
+        lines.append("<b>Карты судов:</b>")
+        for title, url in portcalls.tracking_links(mmsi, vessel.get("name"))[:4]:
+            lines.append(f'• <a href="{url}">{title}</a>')
     return "\n".join(lines)
 
 

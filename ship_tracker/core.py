@@ -66,6 +66,11 @@ DEFAULT_CONFIG = {
     # профили и разрывы AIS в Global Fishing Watch (нужен токен)
     "use_aci": True,
     "aci_minutes": 60,
+    # публичные карты судов без ключа: дают позиции всех судов района
+    "use_gor": True,
+    "gor_minutes": 15,
+    "use_mlive": True,
+    "mlive_minutes": 15,
     "use_gfw": False,
     "gfw_key": "",
     "gfw_minutes": 720,
@@ -493,7 +498,7 @@ class RadarCore:
         if config.get("use_mmsi_watch", True) and api_key:
             try:
                 watch = ais_feed.MmsiWatchFeed(
-                    api_key, self.tracked_mmsis, config.get("message_types"),
+                    api_key, self.watch_mmsis, config.get("message_types"),
                     self._receive, self.log, self.stop_event,
                     stream_url=ais_feed.STREAM_URL, name="ais-feed-mmsi")
                 watch.start()
@@ -532,7 +537,8 @@ class RadarCore:
         """Поднимает опрос выбранных внешних сервисов (см. services_feed)."""
         config = self.config
         self.service_status = {}
-        for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub"):
+        for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub",
+                    "gor", "mlive"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
@@ -576,6 +582,45 @@ class RadarCore:
         except Exception:
             return []
         return [str(row.get("mmsi") or "") for row in rows if row.get("mmsi")]
+
+    def watch_mmsis(self, limit=40):
+        """Суда для глобального слежения по MMSI.
+
+        AISStream держит подписку с десятками MMSI, а на сотни рвёт соединение
+        сразу после отправки (проверено: 260 MMSI — тишина и переподключение
+        каждые 5 секунд, 20 MMSI — стабильный поток). После подключения карт
+        района в базе оказались сотни судов у портов, поэтому в подписку идут
+        только суда с нашим портом в назначении и самые свежие из базы.
+        """
+        try:
+            rows = self.store.vessels(2000)
+        except Exception:
+            return []
+        tokens = set()
+        for name in self.config.get("filter_destinations") or []:
+            if name:
+                tokens.add(str(name).strip().upper())
+        for port in self.config.get("ports") or []:
+            for field in ("name", "locode"):
+                value = str(port.get(field) or "").strip().upper()
+                if value:
+                    tokens.add(value)
+
+        def ours(row):
+            destination = str(row.get("destination") or "").upper()
+            return any(token in destination for token in tokens if token)
+
+        ordered = sorted(rows, key=lambda row: str(row.get("updated_at") or ""),
+                         reverse=True)
+        ordered.sort(key=lambda row: 0 if ours(row) else 1)
+        result = []
+        for row in ordered:
+            mmsi = str(row.get("mmsi") or "")
+            if mmsi and mmsi not in result:
+                result.append(mmsi)
+            if len(result) >= limit:
+                break
+        return result
 
     def _history_worker(self):
         """Подтягивает стоянки из трека Open Waters после старта потока."""
@@ -1022,7 +1067,7 @@ class RadarCore:
             self.store.save_sea_traffic([{
                 "mmsi": mmsi,
                 "name": event.get("name") or vessel.get("name"),
-                "type_label": vessel.get("type_label"),
+                "type_label": event.get("type_label") or vessel.get("type_label"),
                 "destination": vessel.get("destination"),
                 "sog": event.get("sog"),
                 "cog": event.get("cog"),

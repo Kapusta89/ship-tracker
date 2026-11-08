@@ -288,6 +288,33 @@ def gfw_gap_text(entry) -> str:
 
 # --------------------------------------------------------------- реестры
 
+# Публичные карты судов: у Goradar и MarineTraffic.live есть машинный JSON,
+# он уже читается потоками (см. services_feed). Остальные сайты данные только
+# показывают в браузере, поэтому для них строим ссылки на карточку судна —
+# открыть и посмотреть глазами. Oceanook и СпутникСервис не принимают поиск
+# в адресе (у oceanook — защита от роботов), поэтому ведём на список судов.
+TRACKING_SITES = [
+    ("Goradar: позиция и карта", "https://goradar.ru/vessels_map_marinetraffic_mmsi_{mmsi}", True),
+    ("MarineTraffic.live (Ship Radar 24)", "https://marinetraffic.live/vessels/{slug}/{mmsi}/", True),
+    ("Ship-Tracking.net (карта MarineTraffic)", "https://ship-tracking.net/?s={mmsi}", True),
+    ("Oceanook: список судов", "https://oceanook.com/vessels", False),
+    ("СпутникСервис: система контроля флота", "https://sputnik-flot.ru/", False),
+    ("FleetMon: поиск судна", "https://www.fleetmon.com/vessels/?search={mmsi}", True),
+]
+
+
+def tracking_links(mmsi=None, name=None) -> list[tuple[str, str]]:
+    """Ссылки на публичные карты судов: [(подпись, url), …]."""
+    mmsi_text = _clean(mmsi)
+    slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-") or "x"
+    links = []
+    for title, pattern, needs_mmsi in TRACKING_SITES:
+        if needs_mmsi and not mmsi_text:
+            continue
+        links.append((title, pattern.format(mmsi=mmsi_text, slug=slug)))
+    return links
+
+
 def registry_links(imo=None, mmsi=None) -> list[tuple[str, str]]:
     """Ссылки на реестры и портовые сводки: [(подпись, url), …]."""
     imo_text = _clean(imo)
@@ -339,6 +366,21 @@ SOURCES = [
     {"key": "itu", "title": "ITU MARS: MMSI и позывной", "kind": "page",
      "url": "https://www.itu.int/mars/",
      "how": "только глазами: форма поиска, API нет"},
+    # Публичные карты судов из списка пользователя. У Goradar и MarineTraffic.live
+    # есть машинный JSON — они уже читаются потоками (см. services_feed) и суда
+    # ставятся на карту; здесь только те сайты, у которых данных для чтения нет.
+    {"key": "oceanook", "title": "Oceanook: отслеживание судов", "kind": "page",
+     "url": "https://oceanook.com/",
+     "how": "только глазами: защита от роботов, данные в браузере по токену страницы"},
+    {"key": "sputnik", "title": "СпутникСервис (sputnik-flot.ru)", "kind": "page",
+     "url": "https://sputnik-flot.ru/",
+     "how": "только глазами: сайт услуги, открытой выдачи позиций нет"},
+    {"key": "shiptracking", "title": "Ship-Tracking.net", "kind": "page",
+     "url": "https://ship-tracking.net/",
+     "how": "только глазами: показывает карту MarineTraffic во встроенном окне"},
+    {"key": "fleetmon", "title": "FleetMon", "kind": "page",
+     "url": "https://www.fleetmon.com/",
+     "how": "нужен платный ключ API; сайт с этого компьютера не открывается (DNS)"},
 ]
 
 SOURCES_BY_KEY = {source["key"]: source for source in SOURCES}

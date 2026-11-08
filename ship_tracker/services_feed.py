@@ -20,7 +20,7 @@
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import geo
@@ -37,6 +37,8 @@ SERVICE_TITLES = {
     "mt": "MarineTraffic",
     "mst": "MyShipTracking",
     "dt": "Digitraffic",
+    "gor": "Goradar (карта судов)",
+    "mlive": "MarineTraffic.live (карта судов)",
 }
 
 DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
@@ -47,6 +49,45 @@ MYSHIPTRACKING_URL = "https://api.myshiptracking.com/api/v2/vessel/zone"
 MYSHIPTRACKING_VESSEL_URL = "https://api.myshiptracking.com/api/v2/vessel"
 DATALASTIC_URL = "https://api.datalastic.com/api/v0/vessel"
 AISHUB_URL = "https://data.aishub.net/ws.php"
+
+# Публичные карты судов: те же данные, что видны на сайте в браузере.
+# Ключ не нужен, но отдаются порциями, поэтому район опрашивается клетками.
+GORADAR_HOME = "https://goradar.ru/"
+GORADAR_URL = "https://goradar.ru/api/chunk_tile.php"
+MARINETRAFFIC_LIVE_HOME = "https://marinetraffic.live/"
+# Карта сайта берёт суда из своего JSON-моста (раньше был /realtime_ais,
+# теперь он отдаёт пустой список). Район задаётся точкой и радиусом.
+MARINETRAFFIC_LIVE_URL = "https://marinetraffic.live/bridge/vessels/nearby"
+MAP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+
+def _grid_boxes(bboxes, step=2.0, max_cells=64):
+    """Район подписки → сетка клеток: публичные карты отдают порцию судов на запрос."""
+    cells = []
+    for box in bboxes or []:
+        try:
+            (lat1, lon1), (lat2, lon2) = box
+            south, north = sorted((float(lat1), float(lat2)))
+            west, east = sorted((float(lon1), float(lon2)))
+        except (TypeError, ValueError):
+            continue
+        if north <= south or east <= west:
+            continue
+        lat = south
+        while lat < north and len(cells) < max_cells:
+            lon = west
+            while lon < east and len(cells) < max_cells:
+                cells.append((round(lat, 3), round(lon, 3),
+                              round(min(lat + step, north), 3),
+                              round(min(lon + step, east), 3)))
+                lon += step
+            lat += step
+    return cells
 
 
 def _number(value):
@@ -93,7 +134,7 @@ def _time(value):
 
 
 def _position(mmsi, lat, lon, sog=None, cog=None, heading=None, name=None, source="",
-              at=None):
+              at=None, type_label=None):
     lat, lon = _number(lat), _number(lon)
     if lat is None or lon is None:
         return None
@@ -110,6 +151,7 @@ def _position(mmsi, lat, lon, sog=None, cog=None, heading=None, name=None, sourc
         "cog": _number(cog),
         "heading": heading,
         "name": name or "",
+        "type_label": type_label or "",
         "at": at or datetime.now(),
         "source": source,
     }
@@ -1017,6 +1059,185 @@ class AishubFeed(ServiceFeed):
         self.ok(found, f"районов {min(len(boxes), 4)}")
 
 
+class GoradarFeed(ServiceFeed):
+    """Goradar: те же суда, что на карте goradar.ru (без ключа).
+
+    Сайт отдаёт позиции кусками по прямоугольникам (не больше 90 судов
+    на запрос), поэтому район режется на клетки 2°×2°. В ответе есть MMSI,
+    широта/долгота, курс и тип, но нет имени и скорости — они подтянутся
+    из других каналов, когда судно появится в живом потоке.
+    """
+
+    key = "gor"
+    interval = 900.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session = None
+        if kwargs.get("minutes"):
+            self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
+
+    def http(self):
+        import requests
+        if self.session is None:
+            session = requests.Session()
+            session.headers.update(dict(MAP_HEADERS, Referer=GORADAR_HOME))
+            try:
+                session.get(GORADAR_HOME, timeout=30)
+            except Exception as error:
+                self.log(f"{self.title}: главная страница не открылась ({error})")
+            self.session = session
+        return self.session
+
+    def poll_once(self):
+        session = self.http()
+        cells = _grid_boxes(self.bboxes)
+        if not cells:
+            raise RuntimeError("не задан район наблюдения")
+        seen = {}
+        errors = 0
+        for cell in cells:
+            if self.stop_event.is_set():
+                break
+            lat1, lon1, lat2, lon2 = cell
+            try:
+                response = session.post(GORADAR_URL,
+                                        data={"lat1": lat1, "lat2": lat2,
+                                              "lng1": lon1, "lng2": lon2},
+                                        timeout=45)
+                response.raise_for_status()
+                rows = response.json()
+            except Exception:
+                errors += 1
+                continue
+            for row in rows if isinstance(rows, list) else []:
+                try:
+                    mmsi = _mmsi(row[0])
+                    lat, lon = _number(row[2]), _number(row[3])
+                except (IndexError, TypeError):
+                    continue
+                if not mmsi or lat is None or lon is None:
+                    continue
+                course = _number(row[4]) if len(row) > 4 else None
+                if course is not None and (course <= 0 or course >= 360):
+                    course = None
+                heading = _heading(row[6]) if len(row) > 6 else None
+                speed = _number(row[7]) if len(row) > 7 else None
+                label = str(row[8] or "").strip() if len(row) > 8 else ""
+                when = None
+                if len(row) > 5 and row[5]:
+                    try:
+                        when = datetime.strptime(str(row[5]).strip(), "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        when = None
+                seen[mmsi] = _position(mmsi, lat, lon, sog=speed, cog=course,
+                                       heading=heading, source="goradar",
+                                       at=when, type_label=label)
+            self.stop_event.wait(0.4)
+        for event in seen.values():
+            self.emit(event)
+        detail = f"клеток {len(cells)}" + (f", ошибок {errors}" if errors else "")
+        self.ok(len(seen), detail)
+
+
+class MarineTrafficLiveFeed(ServiceFeed):
+    """MarineTraffic.live (Ship Radar 24): публичная карта судов, ключ не нужен.
+
+    JSON-мост сайта отдаёт имя, MMSI, координаты, скорость, курс, тип и время
+    последнего сигнала. Район задаётся точкой и радиусом (до 500 судов
+    на ответ), поэтому опрашиваются центры у наших портов, а не вся карта:
+    так один цикл — это несколько запросов, а не сотни.
+    """
+
+    key = "mlive"
+    interval = 900.0
+    radius_km = 120
+    limit = 500
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session = None
+        self.ports = [port for port in (kwargs.get("ports") or []) if isinstance(port, dict)]
+        if kwargs.get("minutes"):
+            self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
+
+    def http(self):
+        import requests
+        if self.session is None:
+            session = requests.Session()
+            session.headers.update(dict(MAP_HEADERS, Referer=MARINETRAFFIC_LIVE_HOME))
+            try:
+                session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
+            except Exception as error:
+                self.log(f"{self.title}: главная страница не открылась ({error})")
+            self.session = session
+        return self.session
+
+    def centers(self):
+        """Точки опроса: наши порты, а если их нет — центры клеток района."""
+        centers = []
+        for port in self.ports:
+            try:
+                centers.append((float(port["lat"]), float(port["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not centers:
+            for lat1, lon1, lat2, lon2 in self.boxes_lat_lon():
+                lat = lat1
+                while lat < lat2 - 0.01:
+                    lon = lon1
+                    while lon < lon2 - 0.01:
+                        centers.append((round(lat + 1.5, 3), round(lon + 1.5, 3)))
+                        lon += 3.0
+                    lat += 3.0
+        unique = []
+        for center in centers:
+            if all(abs(center[0] - other[0]) > 0.05 or abs(center[1] - other[1]) > 0.05
+                   for other in unique):
+                unique.append(center)
+        return unique
+
+    def poll_once(self):
+        session = self.http()
+        centers = self.centers()
+        if not centers:
+            raise RuntimeError("не задан район наблюдения")
+        radius = self.radius_km if self.ports else max(self.radius_km, 220)
+        seen = {}
+        errors = 0
+        for lat, lon in centers:
+            if self.stop_event.is_set():
+                break
+            params = {"lat": lat, "lon": lon, "radius": radius, "limit": self.limit}
+            try:
+                response = session.get(MARINETRAFFIC_LIVE_URL, params=params, timeout=45)
+                response.raise_for_status()
+                data = ((response.json() or {}).get("data") or {})
+            except Exception:
+                errors += 1
+                continue
+            for row in data.get("vessels") or []:
+                mmsi = _mmsi(row.get("mmsi"))
+                if not mmsi:
+                    continue
+                name = str(row.get("name") or "").strip()
+                # у части судов вместо имени сам MMSI («MMSI 264900454»)
+                if not name or mmsi in name.replace(" ", "") or name.upper().startswith("MMSI"):
+                    name = ""
+                event = _position(mmsi, row.get("lat"), row.get("lng"),
+                                  sog=row.get("speed_kn"), cog=row.get("course_deg"),
+                                  name=name,
+                                  type_label=str(row.get("type") or "").strip() or None,
+                                  source="mlive", at=_time(row.get("updated")))
+                if event:
+                    seen[mmsi] = event
+            self.stop_event.wait(0.4)
+        for event in seen.values():
+            self.emit(event)
+        detail = f"точек {len(centers)}" + (f", ошибок {errors}" if errors else "")
+        self.ok(len(seen), detail)
+
+
 # Ключ настройки с ключом API: vf_key / mt_key / mst_key.
 PROVIDERS = {
     "vf": VesselFinderFeed,
@@ -1028,6 +1249,8 @@ PROVIDERS = {
     "gfw": GfwFeed,
     "dat": DatalasticFeed,
     "aishub": AishubFeed,
+    "gor": GoradarFeed,
+    "mlive": MarineTrafficLiveFeed,
 }
 
 
