@@ -50,6 +50,11 @@ DEFAULT_CONFIG = {
     "use_snapshot": True,
     "snapshot_minutes": 10,
     "snapshot_max_age_hours": 6,
+    # слежение за нашими судами по MMSI по всему миру (AISStream FiltersShipMMSI):
+    # единственный бесплатный способ увидеть судно, ушедшее за пределы района
+    "use_mmsi_watch": True,
+    # сколько часов позиция считается «сейчас в море», а не историей
+    "sea_fresh_hours": 12,
     "port_watch_km": 30,
     "use_history": True,
     "use_vf": False,
@@ -484,6 +489,19 @@ class RadarCore:
                     self.feeds.append(feed2)
                 except Exception as error:
                     self.log(f"Open Waters AIS: не удалось запустить ({error})")
+        # Слежение по MMSI: наши суда в любой точке мира, где есть приём AIS
+        if config.get("use_mmsi_watch", True) and api_key:
+            try:
+                watch = ais_feed.MmsiWatchFeed(
+                    api_key, self.tracked_mmsis, config.get("message_types"),
+                    self._receive, self.log, self.stop_event,
+                    stream_url=ais_feed.STREAM_URL, name="ais-feed-mmsi")
+                watch.start()
+                self.feeds.append(watch)
+                if not self.feed:
+                    self.feed = watch
+            except Exception as error:
+                self.log(f"Слежение по MMSI: не удалось запустить ({error})")
         # Снимок района: последние известные позиции всех судов вокруг портов
         if config.get("use_snapshot", True):
             boxes = ais_feed.tile_boxes(config.get("bounding_boxes"))
@@ -711,6 +729,87 @@ class RadarCore:
                 if self._vessel_related(vessel.get("mmsi"), vessel.get("lat"),
                                         vessel.get("lon"), vessel)]
 
+    def sea_vessels(self, limit=1000) -> list:
+        """Суда, которые прямо сейчас находятся в море.
+
+        Берём только связанные с нашими портами суда, у которых есть свежая
+        позиция вне портовых геозон. «В море» — это и идущие под ходом, и те,
+        кто стоит на рейде или на якоре перед входом: любой, кто не в порту.
+        Порядок: сначала под ходом (быстрее — выше), потом остальные.
+        """
+        try:
+            fresh_hours = float(self.config.get("sea_fresh_hours") or 12)
+        except (TypeError, ValueError):
+            fresh_hours = 12.0
+        ports = self.config.get("ports") or []
+        now = datetime.now()
+        rows = []
+        for vessel in self.related_vessels(limit):
+            lat, lon = vessel.get("lat"), vessel.get("lon")
+            if lat is None or lon is None:
+                continue
+            if ports and geo.port_at(lat, lon, ports):
+                continue
+            age = None
+            updated = vessel.get("updated_at")
+            if updated:
+                try:
+                    age = (now - datetime.fromisoformat(str(updated)[:19])).total_seconds() / 3600
+                except ValueError:
+                    age = None
+            if age is not None and age > fresh_hours:
+                continue
+            row = dict(vessel)
+            row["age_hours"] = age
+            row["underway"] = (vessel.get("sog") or 0) > 0.5
+            rows.append(row)
+        rows.sort(key=lambda item: (0 if item["underway"] else 1,
+                                    -(item.get("sog") or 0),
+                                    str(item.get("name") or "")))
+        return rows
+
+    def sea_without_position(self, limit=1000) -> list:
+        """Связанные суда без позиции: сигнала AIS нет, но они в списке."""
+        return [vessel for vessel in self.related_vessels(limit)
+                if vessel.get("lat") is None or vessel.get("lon") is None]
+
+    def traffic_vessels(self, limit=400) -> list:
+        """Чужой трафик района: суда в море, не идущие в наши порты.
+
+        Нужен, чтобы вкладка «В море» показывала всю обстановку, а не только
+        наши суда: у каждого — расстояние до ближайшего порта наблюдения.
+        """
+        ports = self.config.get("ports") or []
+        try:
+            fresh = float(self.config.get("sea_fresh_hours") or 12)
+        except (TypeError, ValueError):
+            fresh = 12.0
+        rows = self.store.sea_traffic(fresh, limit=2000)
+        result = []
+        for row in rows:
+            lat, lon = row.get("lat"), row.get("lon")
+            if lat is None or lon is None:
+                continue
+            if ports and geo.port_at(lat, lon, ports):
+                continue
+            nearest = None
+            distance = None
+            for port in ports:
+                try:
+                    km = geo.haversine_km(float(lat), float(lon),
+                                          float(port["lat"]), float(port["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if distance is None or km < distance:
+                    nearest, distance = port, km
+            row["nearest_port"] = (nearest or {}).get("name")
+            row["nearest_km"] = distance
+            row["underway"] = (row.get("sog") or 0) > 0.5
+            result.append(row)
+        result.sort(key=lambda item: (0 if item["underway"] else 1,
+                                      item.get("nearest_km") if item.get("nearest_km") is not None else 9e9))
+        return result[:limit]
+
     def purge_unrelated(self) -> int:
         """Удаляет из базы суда, никак не связанные с нашими портами."""
         removed = 0
@@ -764,6 +863,7 @@ class RadarCore:
             removed = self.store.prune_positions(self.config.get("history_days") or 7)
             if removed:
                 self.log(f"История позиций: удалено старых записей {removed}.")
+            self.store.prune_sea_traffic(48)
             forgotten = self.store.forget_vessels(self.config.get("forget_vessels_hours") or 24)
             if forgotten:
                 self.log(f"Убрано из списка судов без связи: {forgotten}.")
@@ -866,9 +966,11 @@ class RadarCore:
         port_name = port["name"] if port else None
         vessel = self.store.vessel(mmsi)
         if not self._vessel_related(mmsi, lat, lon, vessel):
-            # чужое судно: в базу не пишем, а ранее записанное — убираем
+            # чужое судно: в базу не пишем, а ранее записанное — убираем,
+            # но позицию сохраняем в трафик района для вкладки «В море»
             if vessel is not None:
                 self.store.drop_vessel(mmsi)
+            self._record_sea_traffic(mmsi, event, lat, lon, vessel)
             self.stats["skipped"] = self.stats.get("skipped", 0) + 1
             return
         if not vessel or vessel.get("tracked") != 1:
@@ -893,6 +995,42 @@ class RadarCore:
 
         self._track_geofence(mmsi, port_name, lat, lon, event.get("at"))
         self._maybe_alert(mmsi)
+
+    def _record_sea_traffic(self, mmsi, event, lat, lon, vessel=None):
+        """Копит чужой трафик района для вкладки «В море».
+
+        Пишем не чаще раза в 10 минут на судно: снимок приходит сотнями судов,
+        иначе база переписывалась бы на каждое сообщение.
+        """
+        cache = getattr(self, "_sea_written", None)
+        if cache is None:
+            cache = self._sea_written = {}
+        now = time.monotonic()
+        last = cache.get(mmsi)
+        if last is not None and now - last < 600:
+            return
+        if len(cache) > 20000:
+            cache.clear()
+        cache[mmsi] = now
+        when = event.get("at") or datetime.now()
+        try:
+            stamp = when.isoformat(timespec="seconds")
+        except AttributeError:
+            stamp = datetime.now().isoformat(timespec="seconds")
+        vessel = vessel or {}
+        try:
+            self.store.save_sea_traffic([{
+                "mmsi": mmsi,
+                "name": event.get("name") or vessel.get("name"),
+                "type_label": vessel.get("type_label"),
+                "destination": vessel.get("destination"),
+                "sog": event.get("sog"),
+                "cog": event.get("cog"),
+                "lat": lat, "lon": lon,
+                "updated_at": stamp,
+            }])
+        except Exception as error:
+            self.log(f"Трафик района: запись не удалась ({error})")
 
     def _track_geofence(self, mmsi, port_name, lat, lon, when):
         visit = self.store.open_visit(mmsi)

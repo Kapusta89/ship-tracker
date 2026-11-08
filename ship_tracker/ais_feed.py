@@ -392,7 +392,13 @@ class AISStreamFeed(threading.Thread):
             try:
                 with open_stream(self.stream_url) as socket:
                     try:
-                        socket.send(json.dumps(self.subscription()))
+                        payload = self.subscription()
+                        if not payload:
+                            self.last_error = "нет судов для слежения по MMSI"
+                            self.log(f"{self.feed_title}: пока нет судов в базе — "
+                                     f"подписка не отправлена.")
+                            return
+                        socket.send(json.dumps(payload))
                         self.log(f"Подключено к {self.stream_url}, подписка отправлена.")
                     except Exception as sub_error:
                         if "openwaters" in (self.stream_url or "").lower():
@@ -442,6 +448,44 @@ class AISStreamFeed(threading.Thread):
             return
         self.events += 1
         self.on_event(event)
+
+
+class MmsiWatchFeed(AISStreamFeed):
+    """Слежение за нашими судами по MMSI в любой точке мира.
+
+    Обычные подписки ограничены районом портов, поэтому судно, которое уже
+    ушло в Средиземное море, из кадра пропадает. AISStream умеет фильтр
+    FiltersShipMMSI: подписка без прямоугольников присылает сообщения только
+    по перечисленным судам, где бы они ни находились. Список берётся из базы
+    и обновляется при каждом переподключении.
+    """
+
+    feed_title = "AISStream — слежение по MMSI (весь мир)"
+
+    def __init__(self, api_key, mmsis, message_types, on_event, log, stop_event,
+                 stream_url=None, name="ais-feed-mmsi"):
+        super().__init__(api_key, [], message_types, on_event, log, stop_event,
+                         stream_url=stream_url, name=name)
+        self.mmsi_source = mmsis if callable(mmsis) else (lambda: list(mmsis or []))
+
+    def mmsis(self) -> list:
+        try:
+            values = self.mmsi_source() or []
+        except Exception:
+            return []
+        result = []
+        for value in values:
+            text = str(value or "").strip()
+            if text.isdigit():
+                result.append(text)
+        return result
+
+    def subscription(self) -> dict:
+        mmsis = self.mmsis()
+        if not mmsis:
+            return {}
+        return {"APIKey": self.api_key, "FiltersShipMMSI": mmsis,
+                "FilterMessageTypes": self.message_types}
 
 
 # --------------------------------------------------------------- снимок района

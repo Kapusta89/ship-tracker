@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Трафик в море: все суда района с позицией, даже чужие для наших портов.
+-- Живёт отдельно от vessels: на карту и в списки «наших» судов не влияет.
+CREATE TABLE IF NOT EXISTS sea_traffic (
+    mmsi        TEXT PRIMARY KEY,
+    name        TEXT,
+    type_label  TEXT,
+    destination TEXT,
+    sog         REAL,
+    cog         REAL,
+    lat         REAL,
+    lon         REAL,
+    updated_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sea_traffic_seen ON sea_traffic (updated_at);
 """
 
 FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "draft",
@@ -187,6 +202,40 @@ class Store:
             rows = self.conn.execute(
                 "SELECT * FROM vessels ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
+
+    # --------------------------------------------------------- трафик в море
+    def save_sea_traffic(self, rows) -> int:
+        """Последние позиции чужих для портов судов (для вкладки «В море»)."""
+        rows = [row for row in (rows or []) if row.get("mmsi")]
+        if not rows:
+            return 0
+        with self._lock, self.conn:
+            self.conn.executemany(
+                "INSERT INTO sea_traffic (mmsi, name, type_label, destination, sog, cog,"
+                " lat, lon, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(mmsi) DO UPDATE SET name=excluded.name,"
+                " type_label=excluded.type_label, destination=excluded.destination,"
+                " sog=excluded.sog, cog=excluded.cog, lat=excluded.lat, lon=excluded.lon,"
+                " updated_at=excluded.updated_at",
+                [(str(row.get("mmsi")), row.get("name"), row.get("type_label"),
+                  row.get("destination"), row.get("sog"), row.get("cog"),
+                  row.get("lat"), row.get("lon"), row.get("updated_at") or iso())
+                 for row in rows])
+        return len(rows)
+
+    def sea_traffic(self, hours=12.0, limit=2000):
+        since = iso(datetime.now() - timedelta(hours=float(hours)))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM sea_traffic WHERE updated_at >= ?"
+                " ORDER BY updated_at DESC LIMIT ?", (since, limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def prune_sea_traffic(self, keep_hours=48.0) -> int:
+        since = iso(datetime.now() - timedelta(hours=float(keep_hours)))
+        with self._lock, self.conn:
+            cur = self.conn.execute("DELETE FROM sea_traffic WHERE updated_at < ?", (since,))
+            return cur.rowcount
 
     def track(self, mmsi: str, hours=24):
         since = iso(datetime.now() - timedelta(hours=float(hours)))

@@ -576,6 +576,7 @@ async def cmd_help(message: Message):
         "В карточке есть маршрут: текущие координаты и прогноз на 5 дней.\n"
         "Карточки обновляются сами каждые 2 минуты.\n"
         "При выборе другого порта прошлый список удаляется.\n"
+        "/sea — кто сейчас в море: скорость, расстояние до порта и прибытие.\n"
         "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
         "/map — карта-картинка с портами и судами, у которых есть позиция.\n"
         "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
@@ -658,6 +659,75 @@ async def cmd_expected(message: Message):
         lines.append("Сейчас страницы AIS-catcher отдают 0 судов — "
                      "показан прошлый список.")
     lines.append("ETA — заявленный капитаном, время UTC.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+def _sea_lines(vessels: List[dict], core) -> List[str]:
+    """Строки списка судов в море: курс, скорость, расстояние и прибытие."""
+    lines = []
+    for vessel in vessels:
+        try:
+            voyage = core.voyage(vessel) or {}
+        except Exception:
+            voyage = {}
+        name = html.escape(str(vessel.get("name") or vessel.get("mmsi") or "—"))
+        tail = html.escape(str(vessel.get("destination") or "—"))
+        sog = vessel.get("sog")
+        try:
+            speed = float(sog)
+        except (TypeError, ValueError):
+            speed = 0.0
+        tail += f" · {speed:.1f} уз" if speed > 0.5 else " · без хода"
+        distance = voyage.get("distance_km")
+        if distance is not None:
+            tail += f" · {round(distance)} км"
+        elif vessel.get("nearest_km") is not None:
+            tail += f" · {round(vessel['nearest_km'])} км от {vessel.get('nearest_port') or '—'}"
+        hours = voyage.get("hours")
+        eta = voyage.get("eta")
+        if hours is not None and eta is not None:
+            tail += f" · через {hours:.0f} ч ({eta:%d.%m %H:%M})"
+        lines.append(f"• <b>{name}</b> — {tail}")
+    return lines
+
+
+async def cmd_sea(message: Message):
+    """Суда в море прямо сейчас: позиции из всех каналов AIS."""
+    core = get_core()
+    try:
+        vessels = await asyncio.to_thread(core.sea_vessels, 500)
+        silent = await asyncio.to_thread(core.sea_without_position, 500)
+        others = await asyncio.to_thread(core.traffic_vessels, 400)
+    except Exception as error:
+        await message.answer(f"Список судов в море недоступен: {error}")
+        return
+    moved = sum(1 for vessel in vessels if vessel.get("underway"))
+    lines = ["🌊 <b>Суда в море сейчас</b>",
+             f"Всего: <b>{len(vessels)}</b> (под ходом {moved}, "
+             f"на рейде/якоре {len(vessels) - moved}).",
+             "Позиции собраны всеми каналами: поток района, снимок района, "
+             "Open Waters и глобальное слежение по MMSI."]
+    lines += _sea_lines(vessels[:25], core)
+    if len(vessels) > 25:
+        lines.append(f"…и ещё {len(vessels) - 25}")
+    if not vessels:
+        lines.append("Сейчас ни у одного связанного судна нет свежей позиции вне порта: "
+                     "они могут стоять в порту или не передавать AIS.")
+    if others:
+        lines.append("")
+        lines.append(f"🌐 <b>Трафик района</b> (не идут в наши порты): {len(others)}")
+        for vessel in others[:10]:
+            name = html.escape(str(vessel.get("name") or vessel.get("mmsi")))
+            km = vessel.get("nearest_km")
+            where = f"{round(km)} км от {vessel.get('nearest_port') or '—'}" if km is not None else "—"
+            lines.append(f"• {name} — {where}")
+        if len(others) > 10:
+            lines.append(f"…и ещё {len(others) - 10}")
+    if silent:
+        names = [html.escape(str(vessel.get("name") or vessel.get("mmsi"))) for vessel in silent[:10]]
+        lines.append("")
+        lines.append(f"📵 Без сигнала AIS: <b>{len(silent)}</b> — " + ", ".join(names)
+                     + ("…" if len(silent) > 10 else ""))
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
@@ -826,6 +896,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
     dp.message.register(cmd_expected, Command("expected"))
+    dp.message.register(cmd_sea, Command("sea"))
     dp.message.register(cmd_map, Command("map"))
     dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_sources, Command("sources"))

@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.13"
+APP_VERSION = "2026.11.14"
 
 import ais_feed
 import cargo
@@ -651,6 +651,7 @@ class App:
 
         self.tab_radar = ttk.Frame(notebook)
         self.tab_vessels = ttk.Frame(notebook)
+        self.tab_sea = ttk.Frame(notebook)
         self.tab_alerts = ttk.Frame(notebook)
         self.tab_visits = ttk.Frame(notebook)
         self.tab_expected = ttk.Frame(notebook)
@@ -660,7 +661,8 @@ class App:
         self.tab_services = ttk.Frame(notebook)
         self.tab_log = ttk.Frame(notebook)
         for tab, title in ((self.tab_radar, "Радар"),
-                           (self.tab_vessels, "Все суда"), (self.tab_visits, "Стоянки"),
+                           (self.tab_vessels, "Все суда"), (self.tab_sea, "В море"),
+                           (self.tab_visits, "Стоянки"),
                            (self.tab_expected, "Ожидаемые"),
                            (self.tab_alerts, "Алерты"),
                            (self.tab_connection, "Подключение"), (self.tab_filters, "Фильтры"),
@@ -670,6 +672,7 @@ class App:
 
         self.build_radar()
         self.build_vessels()
+        self.build_sea()
         self.build_visits()
         self.build_expected()
         self.build_alerts()
@@ -760,6 +763,29 @@ class App:
                     ("sog", "Узлы", 55),
                     ("port", "В порту", 100),
                     ("updated", "Обновлено", 115), ("mmsi", "MMSI", 90)))
+
+    def build_sea(self):
+        """Вкладка «В море»: суда с позицией вне портов и без статики AIS."""
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_sea
+        ttk.Label(frame, text="Кто прямо сейчас в море. Сверху — суда, связанные с нашими "
+                              "портами (идут в порт, вышли из него или проходят рядом), "
+                              "ниже — весь остальной трафик района. Позиции собираются "
+                              "всеми каналами сразу: поток района, снимок района, "
+                              "Open Waters и глобальное слежение по MMSI (судно видно "
+                              "в любой точке мира, где есть приём AIS). Расстояние и "
+                              "прибытие — по прямой и текущей скорости.",
+                  foreground="#555", wraplength=1100, justify="left").pack(
+            anchor="w", padx=8, pady=(8, 4))
+        self.sea_info = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.sea_info, foreground="#333").pack(
+            anchor="w", padx=8, pady=(0, 4))
+        self.sea_tree = self.make_tree(
+            frame, (("name", "Судно", 180), ("flag", "Флаг", 150),
+                    ("type", "Тип", 110), ("dest", "Назначение", 150),
+                    ("sog", "Узлы", 60), ("course", "Курс", 70),
+                    ("distance", "До порта", 150), ("eta", "Прибытие", 155),
+                    ("updated", "Обновлено", 130), ("mmsi", "MMSI", 95)))
 
     def build_visits(self):
         tk, ttk = self.tk, self.ttk
@@ -1965,6 +1991,7 @@ class App:
         if hasattr(self, "targets_tree"):
             self.refresh_targets_table()
         self.refresh_vessels_table()
+        self.refresh_sea_table()
         self.refresh_visits()
         self.refresh_alerts()
         self.update_detail()
@@ -2046,6 +2073,106 @@ class App:
                 f"сигнал {row.get('last_heard') or '—'} · AIS-catcher {updated}",
                 mmsi,
             ))
+
+    def refresh_sea_table(self):
+        """Обновляет вкладку «В море»: только свежие позиции вне портов."""
+        if not hasattr(self, "sea_tree"):
+            return
+        tree = self.sea_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        try:
+            rows = self.core.sea_vessels(500)
+        except Exception as error:
+            self.log(f"Список «В море»: {error}")
+            rows = []
+        moved = 0
+        for vessel in rows:
+            try:
+                voyage = self.core.voyage(vessel) or {}
+            except Exception:
+                voyage = {}
+            if vessel.get("underway"):
+                moved += 1
+            distance = "—"
+            if voyage.get("distance_km") is not None:
+                distance = (f"{fmt_number(round(voyage['distance_km']))} км → "
+                            f"{voyage.get('port') or '—'}")
+            elif voyage.get("port"):
+                distance = f"→ {voyage.get('port')}"
+            tree.insert("", "end", tags=(vessel["mmsi"],), values=(
+                vessel.get("name") or "—",
+                flags.flag_text(vessel.get("mmsi")),
+                vessel.get("type_label") or "—",
+                vessel.get("destination") or "—",
+                fmt_number(vessel.get("sog")),
+                self.course_text(vessel),
+                distance,
+                self.arrival_text(voyage),
+                self.fmt_time(vessel.get("updated_at")),
+                vessel.get("mmsi"),
+            ))
+        try:
+            others = self.core.traffic_vessels(400)
+        except Exception as error:
+            self.log(f"Трафик района: {error}")
+            others = []
+        if others:
+            tree.insert("", "end", tags=("group",), values=(
+                f"— трафик района, не идущие в наши порты: {len(others)} —",
+                "", "", "", "", "", "", "", "", ""))
+            for vessel in others:
+                distance = "—"
+                if vessel.get("nearest_km") is not None:
+                    distance = (f"{fmt_number(round(vessel['nearest_km']))} км · "
+                                f"{vessel.get('nearest_port') or '—'}")
+                tree.insert("", "end", tags=(str(vessel.get("mmsi")),), values=(
+                    vessel.get("name") or "—",
+                    flags.flag_text(vessel.get("mmsi")),
+                    vessel.get("type_label") or "—",
+                    vessel.get("destination") or "—",
+                    fmt_number(vessel.get("sog")),
+                    self.course_text(vessel),
+                    distance,
+                    "—",
+                    self.fmt_time(vessel.get("updated_at")),
+                    vessel.get("mmsi"),
+                ))
+        try:
+            silent = self.core.sea_without_position(500)
+        except Exception:
+            silent = []
+        self.sea_info.set(
+            f"Суда у наших портов и идущие в них: {len(rows)} (под ходом {moved}, "
+            f"на рейде/якоре {len(rows) - moved}). "
+            f"Трафик района: {len(others)}. Без сигнала AIS: {len(silent)} — они остаются "
+            f"во вкладке «Все суда». Обновляется само; двойной щелчок открывает карточку.")
+
+    def course_text(self, vessel):
+        """Курс судна в градусах и по стороне света."""
+        value = vessel.get("heading")
+        if value in (None, 0, 511):
+            value = vessel.get("cog")
+        try:
+            degrees = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        if degrees <= 0 or degrees >= 360:
+            return "—"
+        sides = ("С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ")
+        return f"{round(degrees)}° {sides[int((degrees % 360) / 45) % 8]}"
+
+    def arrival_text(self, voyage):
+        """Когда судно будет в порту: сколько осталось и время прибытия."""
+        if not voyage:
+            return "—"
+        if voyage.get("in_port"):
+            return "в порту"
+        eta = voyage.get("eta")
+        hours = voyage.get("hours")
+        if eta is None or hours is None:
+            return "нет расчёта (не под ходом)"
+        return f"{duration_text(hours)} · {eta:%d.%m %H:%M}"
 
     def size_text(self, vessel):
         """Габариты корпуса из AIS: длина × ширина в метрах."""
