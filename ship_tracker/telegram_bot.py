@@ -299,6 +299,16 @@ def vessel_card(vessel: dict, core) -> str:
         f"Обновлено: {core_module.fmt_moment(store_module.parse_iso(vessel.get('updated_at')))}",
         route_text(vessel),
     ]
+    try:
+        metrics = _import("metrics")
+    except Exception:
+        metrics = None
+    if metrics is not None:
+        stale_hours = (core.stale_hours() if hasattr(core, "stale_hours") else 0.25)
+        age = metrics.freshness_hours(vessel.get("updated_at"))
+        if age is not None and stale_hours and age > stale_hours:
+            lines.append(f"⚠ Данные устарели: AIS не поступал {core_module.span_text(age)} — "
+                         f"скорость, курс и позиция могут быть неактуальны.")
 
     voyage = core.voyage(vessel)
     if voyage:

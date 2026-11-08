@@ -1544,6 +1544,14 @@ class RadarCore:
         return analysis.signals(vessel, track, visits,
                                 self.config.get("ports") or [], days)
 
+    def stale_hours(self) -> float:
+        """Через сколько часов без AIS данные судна считаются устаревшими."""
+        try:
+            minutes = float(self.config.get("stale_minutes") or 0)
+        except (TypeError, ValueError):
+            minutes = 15.0
+        return max(0.0, minutes) / 60.0
+
     def vessel_math(self, vessel) -> list:
         """Расчёты по судну: расстояния, скорости, корпус, стоянка, AIS, ETA.
 

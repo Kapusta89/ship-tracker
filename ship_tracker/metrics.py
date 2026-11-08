@@ -474,6 +474,9 @@ def report(vessel, track_rows, visits=None, stay=None, voyage=None,
         lines.append("ETA в AIS передаёт капитан: "
                      f"{vessel.get('eta_declared')} — это не расчёт.")
 
+    for problem in suspects(vessel):
+        lines.append(f"⚠ Проверка данных: {problem}.")
+
     age = freshness_hours(vessel.get("updated_at"), now)
     if age is not None:
         lines.append(f"Свежесть данных: последнее сообщение AIS "
@@ -481,7 +484,51 @@ def report(vessel, track_rows, visits=None, stay=None, voyage=None,
     return lines
 
 
-def row_note(vessel) -> str:
+def suspects(vessel) -> list:
+    """Подозрительные значения: показываем их, но помечаем как ошибку источника.
+
+    AIS-static иногда приходит искажённым (осадка больше длины, ширина как у
+    палубы и т.п.). Такие числа не исправляются втихую: судно остаётся в списке,
+    но рядом с ним видно, что данные сомнительные.
+    """
+    if not vessel:
+        return []
+    found = []
+    length = num(vessel.get("length_m"))
+    beam = num(vessel.get("beam_m"))
+    draft = num(vessel.get("draft"))
+    sog = num(vessel.get("sog"))
+    cog = num(vessel.get("cog"))
+    if length is not None and not 4 <= length <= 500:
+        found.append(f"длина {fmt(length)} м — вне пределов судна")
+    if beam is not None and length and beam > 0.6 * length:
+        found.append(f"ширина {fmt(beam)} м несоразмерна длине {fmt(length)} м")
+    if draft is not None:
+        if not 0.2 <= draft <= 25:
+            found.append(f"осадка {fmt(draft, 2)} м — вне пределов судна")
+        elif length and draft > 0.08 * length:
+            found.append(f"осадка {fmt(draft, 2)} м при длине {fmt(length)} м — "
+                         f"так не бывает, вероятно ошибка источника")
+    # −1 в AIS значит «не передано», это не ошибка и не повод для пометки
+    if sog is not None and sog != -1 and not 0 <= sog <= 40:
+        found.append(f"скорость {fmt(sog)} уз — вне пределов судна")
+    if cog is not None and cog != -1 and not 0 <= cog <= 360:
+        found.append(f"курс {fmt(cog, 0)}° — вне шкалы 0…360")
+    return found
+
+
+def stale_note(vessel, stale_hours=0.25, now=None) -> str:
+    """«⚠ устарело · связь 3 ч назад» или пусто, если данные свежие."""
+    age = freshness_hours((vessel or {}).get("updated_at"), now)
+    if age is None:
+        return "нет сообщений AIS"
+    text = f"связь {analysis.span_text(age)} назад"
+    if stale_hours and age > float(stale_hours):
+        return f"⚠ устарело · {text}"
+    return text
+
+
+def row_note(vessel, stale_hours=0.25) -> str:
     """Короткая строка расчётов для таблицы: только то, что не требует трека."""
     if not vessel:
         return ""
@@ -493,7 +540,9 @@ def row_note(vessel) -> str:
         parts.append(f"L/T {fmt(ratios['length_draft'])}")
     if ratios["beam_draft"]:
         parts.append(f"B/T {fmt(ratios['beam_draft'])}")
-    age = freshness_hours(vessel.get("updated_at"))
-    if age is not None:
-        parts.append(f"связь {analysis.span_text(age)} назад")
+    note = stale_note(vessel, stale_hours)
+    if note:
+        parts.append(note)
+    if suspects(vessel):
+        parts.append("⚠ данные источника")
     return " · ".join(parts)

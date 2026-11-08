@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.20"
+APP_VERSION = "2026.11.21"
 
 import ais_feed
 import cargo
@@ -781,9 +781,20 @@ class App:
         self.photo_note = ttk.Label(panel, text="", foreground="#777", wraplength=300)
         self.photo_note.pack(fill="x", padx=(8, 0))
 
-        self.detail_text = tk.Text(panel, width=36, height=20, wrap="word", state="disabled",
-                                   font=("Consolas", 9), background="#f7f9fa")
-        self.detail_text.pack(fill="both", expand=True, padx=(8, 0), pady=0)
+        detail_box = ttk.Frame(panel)
+        detail_box.pack(fill="both", expand=True, padx=(8, 0), pady=0)
+        self.detail_text = tk.Text(detail_box, width=36, height=20, wrap="word",
+                                   state="disabled", font=("Consolas", 9),
+                                   background="#f7f9fa")
+        self.detail_scroll = ttk.Scrollbar(detail_box, orient="vertical",
+                                           command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=self.detail_scroll.set)
+        self.detail_text.pack(side="left", fill="both", expand=True)
+        self.detail_scroll.pack(side="right", fill="y")
+        # Содержимое карточки обновляется каждые 3 с; прокрутка при этом
+        # сохраняется, иначе окно прыгало бы наверх каждый раз.
+        self._detail_cache = None
+        self.detail_text.bind("<MouseWheel>", self.scroll_detail)
 
     def build_vessels(self):
         ttk = self.ttk
@@ -805,6 +816,8 @@ class App:
                     ("math", "Расчёт", 210),
                     ("port", "В порту", 100),
                     ("updated", "Обновлено", 115), ("mmsi", "MMSI", 90)))
+        # Строки без свежих данных AIS — серым: видно, что цифры не сегодняшние.
+        self.vessels_tree.tag_configure("stale", foreground="#8c8c8c")
 
     def build_sea(self):
         """Вкладка «В море»: суда с позицией вне портов и без статики AIS."""
@@ -1672,11 +1685,45 @@ class App:
         except Exception:
             self.radar.track = []
 
-    def update_detail(self):
+    def scroll_detail(self, event):
+        """Колесо мыши над карточкой: прокрутка без перехода наверх."""
+        step = -1 if getattr(event, "delta", 0) > 0 else 1
+        self.detail_text.yview_scroll(step * 3, "units")
+        return "break"
+
+    def update_detail(self, force=False):
+        """Перерисовывает карточку, сохраняя позицию прокрутки.
+
+        Карточка обновляется на каждом такте, потому что в ней есть время
+        («связь 5 мин назад»); чтобы текст не прыгал наверх, запоминаем
+        положение прокрутки и возвращаем его после перерисовки, а если текст
+        не изменился — вообще ничего не трогаем.
+        """
+        try:
+            view = self.detail_text.yview()
+            top_line = self.detail_text.index("@0,0")
+        except Exception:
+            view, top_line = (0.0, 1.0), None
+        report = self.detail_report(self.selected)
+        if not force and report == self._detail_cache:
+            return
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
-        self.detail_text.insert("1.0", self.detail_report(self.selected))
+        self.detail_text.insert("1.0", report)
         self.detail_text.configure(state="disabled")
+        self._detail_cache = report
+        # Раскладка пересчитывается только после update_idletasks: без этого
+        # «прокрутить к строке» упирается в старую высоту текста.
+        self.detail_text.update_idletasks()
+        if view[1] >= 0.999:
+            self.detail_text.see("end")
+        elif top_line:
+            try:
+                self.detail_text.yview(top_line)
+            except Exception:
+                self.detail_text.yview_moveto(view[0])
+        else:
+            self.detail_text.yview_moveto(view[0])
 
     # -- фото судна
     def load_photo(self, mmsi):
@@ -1779,8 +1826,15 @@ class App:
             f"Осадка: {fmt_number(vessel.get('draft'))} м",
             f"В порту: {vessel.get('port') or '—'}",
             f"Координаты: {fmt_number(vessel.get('lat'))}, {fmt_number(vessel.get('lon'))}",
-            f"Обновлено: {self.fmt_time(vessel.get('updated_at'))}",
+            f"Обновлено: {self.fmt_time(vessel.get('updated_at'))}"
+            f" ({metrics.stale_note(vessel, self.core.stale_hours())})",
         ]
+        age = metrics.freshness_hours(vessel.get("updated_at"))
+        if age is not None and age > self.core.stale_hours():
+            lines.append(f"⚠ Данные устарели: AIS не поступал {span_text(age)}. "
+                         f"Скорость, курс и позиция могут быть неактуальны — "
+                         f"расчёты ниже сделаны по последним известным данным и для "
+                         f"решения о движении сейчас не годятся.")
         if vessel.get("lat") is None or vessel.get("lon") is None:
             lines.append("Позиция: неизвестна — на карту не нанесено; судно есть в списках "
                          f"и в боте (порт назначения: {vessel.get('destination') or '—'})")
@@ -2109,7 +2163,11 @@ class App:
             info = expected_map.get(mmsi)
             # судно из AIS-catcher: координат у него нет, вместо расчёта — заявленный ETA
             no_position = info and (vessel.get("lat") is None or vessel.get("lon") is None)
-            tree.insert("", "end", tags=(vessel["mmsi"],), values=(
+            tags = (vessel["mmsi"],)
+            age = metrics.freshness_hours(vessel.get("updated_at"))
+            if age is not None and age > self.core.stale_hours():
+                tags = (vessel["mmsi"], "stale")
+            tree.insert("", "end", tags=tags, values=(
                 vessel.get("name") or "—",
                 flags.flag_text(vessel["mmsi"]),
                 vessel.get("type_label") or "—",
@@ -2121,7 +2179,8 @@ class App:
                 self.cargo_text(vessel),
                 self.cargo_kind_text(vessel),
                 fmt_number(vessel.get("sog")),
-                "—" if no_position else (metrics.row_note(vessel) or "—"),
+                "—" if no_position else (metrics.row_note(
+                    vessel, self.core.stale_hours()) or "—"),
                 "ожидается" if no_position else self.port_text(vessel),
                 (f"сигнал {info.get('last_heard') or '—'} · AIS-catcher {updated}"
                  if no_position else self.fmt_time(vessel.get("updated_at"))),
