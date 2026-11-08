@@ -297,9 +297,15 @@ TRACKING_SITES = [
     ("Goradar: позиция и карта", "https://goradar.ru/vessels_map_marinetraffic_mmsi_{mmsi}", True),
     ("MarineTraffic.live (Ship Radar 24)", "https://marinetraffic.live/vessels/{slug}/{mmsi}/", True),
     ("Ship-Tracking.net (карта MarineTraffic)", "https://ship-tracking.net/?s={mmsi}", True),
+    ("ShippingExplorer: поиск судна", "https://www.shippingexplorer.net/ru/ships?search={mmsi}", True),
     ("Oceanook: список судов", "https://oceanook.com/vessels", False),
     ("СпутникСервис: система контроля флота", "https://sputnik-flot.ru/", False),
     ("FleetMon: поиск судна", "https://www.fleetmon.com/vessels/?search={mmsi}", True),
+    ("Radar24: суда и самолёты (витрина)", "https://radar-24.ru/", False),
+    ("Ships.com.ua (карта VesselFinder)", "https://www.ships.com.ua/", False),
+    ("Rynda: биржа фрахта", "https://rynda.io/vessels?q={mmsi}", True),
+    # ShipAIS ведёт только воды Великобритании: наших судов там нет.
+    ("ShipAIS (воды Великобритании)", "https://shipais.uk/", False),
 ]
 
 
@@ -381,6 +387,27 @@ SOURCES = [
     {"key": "fleetmon", "title": "FleetMon", "kind": "page",
      "url": "https://www.fleetmon.com/",
      "how": "нужен платный ключ API; сайт с этого компьютера не открывается (DNS)"},
+    {"key": "shipais", "title": "ShipAIS.uk", "kind": "page",
+     "url": "https://shipais.uk/",
+     "how": "только глазами: карты и история только по водам Великобритании"},
+    {"key": "shipexplorer", "title": "ShippingExplorer", "kind": "page",
+     "url": "https://www.shippingexplorer.net/ru/map",
+     "how": "только глазами: карта отдаёт позиции только с antiforgery-токеном браузера"},
+    {"key": "liveshipsmap", "title": "LiveShipsMap", "kind": "page",
+     "url": "https://liveshipsmap.com/",
+     "how": "недоступен: домен не резолвится с этого компьютера"},
+    {"key": "portmaps", "title": "Portmaps", "kind": "page",
+     "url": "https://portmaps.com/",
+     "how": "недоступен: сайт не отвечает на запросы"},
+    {"key": "shipsua", "title": "Ships.com.ua", "kind": "page",
+     "url": "https://www.ships.com.ua/",
+     "how": "только глазами: показывает карту VesselFinder во встроенном окне"},
+    {"key": "radar24", "title": "Radar24.ru", "kind": "page",
+     "url": "https://radar-24.ru/",
+     "how": "только глазами: витрина сервиса, карты судов на странице нет"},
+    {"key": "rynda", "title": "Rynda.io", "kind": "page",
+     "url": "https://rynda.io/",
+     "how": "только глазами: биржа фрахта, публичного API нет"},
 ]
 
 SOURCES_BY_KEY = {source["key"]: source for source in SOURCES}
