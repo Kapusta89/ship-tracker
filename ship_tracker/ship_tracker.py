@@ -669,8 +669,6 @@ class App:
         header = ttk.Frame(self.root)
         header.pack(fill="x", padx=10, pady=(8, 2))
         ttk.Label(header, text="Ship Tracker", font=("Segoe UI", 16, "bold")).pack(side="left")
-        ttk.Label(header, text="  живой AIS · Дунай · танкеры в Измаил и Рени",
-                  foreground="#555").pack(side="left")
         self.conn_var = tk.StringVar(value="поток: —")
         ttk.Label(header, textvariable=self.conn_var, foreground="#555").pack(side="right")
 
