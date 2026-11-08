@@ -241,7 +241,8 @@ class Store:
         since = iso(datetime.now() - timedelta(hours=float(hours)))
         with self._lock:
             rows = self.conn.execute(
-                "SELECT ts, lat, lon FROM positions WHERE mmsi = ? AND ts >= ? ORDER BY ts",
+                "SELECT ts, lat, lon, sog, cog FROM positions WHERE mmsi = ? AND ts >= ? "
+                "ORDER BY ts",
                 (mmsi, since)).fetchall()
         return [dict(row) for row in rows]
 

@@ -39,13 +39,14 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.19"
+APP_VERSION = "2026.11.20"
 
 import ais_feed
 import cargo
 import flags
 import forecast
 import geo
+import metrics
 import photos
 import portcalls
 import services_feed
@@ -801,6 +802,7 @@ class App:
                     ("stay", "Стоянка в порту", 170), ("cargo", "Груз (оценка)", 130),
                     ("cargo_kind", "Что везёт", 235),
                     ("sog", "Узлы", 55),
+                    ("math", "Расчёт", 210),
                     ("port", "В порту", 100),
                     ("updated", "Обновлено", 115), ("mmsi", "MMSI", 90)))
 
@@ -1857,6 +1859,10 @@ class App:
         if signals:
             lines.append("Признаки (по наблюдениям программы):")
             lines += [f"  • {signal}" for signal in signals]
+        math_lines = self.core.vessel_math(vessel)
+        if math_lines:
+            lines.append("Расчёты по данным наблюдений:")
+            lines += [f"  • {line}" for line in math_lines]
         target = self._targets.get(mmsi)
         if target and target.get("eta_calc"):
             lines.append(f"Прибытие (расчёт): {fmt_moment(target['eta_calc'])} "
@@ -2115,6 +2121,7 @@ class App:
                 self.cargo_text(vessel),
                 self.cargo_kind_text(vessel),
                 fmt_number(vessel.get("sog")),
+                "—" if no_position else (metrics.row_note(vessel) or "—"),
                 "ожидается" if no_position else self.port_text(vessel),
                 (f"сигнал {info.get('last_heard') or '—'} · AIS-catcher {updated}"
                  if no_position else self.fmt_time(vessel.get("updated_at"))),
@@ -2133,7 +2140,6 @@ class App:
                 "нет позиции",
                 row.get("port") or "—",
                 f"ETA {row.get('eta') or '—'}",
-                "—",
                 "—",
                 "—",
                 "—",

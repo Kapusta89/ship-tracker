@@ -27,6 +27,7 @@ import analysis
 import cargo
 import flags
 import geo
+import metrics
 import portcalls
 import services_feed
 from store import Store, parse_iso
@@ -1542,6 +1543,31 @@ class RadarCore:
             return [analysis.flag_note(mmsi)] if analysis.flag_note(mmsi) else []
         return analysis.signals(vessel, track, visits,
                                 self.config.get("ports") or [], days)
+
+    def vessel_math(self, vessel) -> list:
+        """Расчёты по судну: расстояния, скорости, корпус, стоянка, AIS, ETA.
+
+        Всё считается в metrics.py по нашим позициям, визитам и статике судна;
+        недостающие данные не додумываются — об этом пишется отдельной строкой.
+        """
+        if not vessel or not vessel.get("mmsi"):
+            return []
+        mmsi = vessel["mmsi"]
+        days = float(self.config.get("history_days") or 7)
+        try:
+            track = self.store.track(mmsi, days * 24)
+            visits = self.store.visits(200, mmsi=mmsi)
+        except Exception:
+            track, visits = [], []
+        try:
+            stay = self.port_stay(vessel)
+        except Exception:
+            stay = None
+        try:
+            voyage = self.voyage(vessel)
+        except Exception:
+            voyage = None
+        return metrics.report(vessel, track, visits, stay, voyage, days * 24)
 
     def cargo_estimate(self, vessel):
         """Оценка груза по осадке и габаритам корпуса — см. cargo.py."""

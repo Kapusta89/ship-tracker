@@ -369,6 +369,11 @@ def vessel_card(vessel: dict, core) -> str:
         lines.append("<b>Признаки</b> (по наблюдениям программы):")
         lines += [f"• {signal}" for signal in signals]
 
+    math_lines = core.vessel_math(vessel) if hasattr(core, "vessel_math") else []
+    if math_lines:
+        lines.append("<b>Расчёты по данным наблюдений:</b>")
+        lines += [f"• {line}" for line in math_lines]
+
     if vessel.get("imo") or mmsi:
         lines.append(f"VesselFinder: https://www.vesselfinder.com/vessels/details/"
                      f"{vessel.get('imo') or mmsi}")
