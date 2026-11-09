@@ -282,30 +282,100 @@ def vessel_card(vessel: dict, core) -> str:
     flags = _import("flags")
     ais_feed = _import("ais_feed")
     cargo = _import("cargo")
+    try:
+        portcalls = _import("portcalls")
+    except Exception:
+        portcalls = None
 
     mmsi = str(vessel.get("mmsi"))
     _country, iso2, _emoji = flags.flag_for_mmsi(mmsi)
-    lines = [
-        f"🚢 <b>{vessel.get('name') or mmsi}</b>",
+
+    def section(title, rows):
+        """Блок карточки: заголовок и только заполненные строки."""
+        rows = [row for row in rows if row]
+        return ([f"<b>{title}</b>"] + rows + [""]) if rows else []
+
+    def field(label, value, suffix=""):
+        """Строка «поле: значение» или None, чтобы не было прочерков."""
+        text = "" if value is None else str(value).strip()
+        if not text or text in {"—", "None"}:
+            return None
+        return f"{label}: {text}{suffix}"
+
+    type_code = vessel.get("type_code")
+    type_text = ais_feed.type_detail(type_code) if type_code is not None else ""
+    if not type_text or type_text == "—":
+        type_text = vessel.get("type_label") or ""
+    if type_code is not None and type_text:
+        type_text = f"{type_text} (AIS {type_code})"
+
+    lines = [f"🚢 <b>{vessel.get('name') or 'судно без имени'}</b>", ""]
+    lines += section("Судно", [
         f"MMSI: {mmsi}",
         f"Флаг: {flags.flag_text(mmsi)}" + (f" ({iso2})" if iso2 else ""),
-    ]
-    if vessel.get("imo"):
-        lines.append(f"IMO: {vessel['imo']}")
-    lines += [
-        f"Тип: {ais_feed.type_detail(vessel.get('type_code'))} "
-        f"(код AIS {vessel.get('type_code')}, {vessel.get('type_label') or '—'})",
-        f"Назначение: {vessel.get('destination') or '—'}",
-        f"Скорость: {core_module.fmt_number(vessel.get('sog'))} уз",
-        f"Размеры: {size_text(vessel)} (длина × ширина)",
-        f"Курс: {core_module.fmt_number(vessel.get('cog'))}°",
-        f"Осадка: {core_module.fmt_number(vessel.get('draft'))} м",
-        f"В порту: {vessel.get('port') or '—'}",
-        f"Координаты: {core_module.fmt_number(vessel.get('lat'))}, "
-        f"{core_module.fmt_number(vessel.get('lon'))}",
+        field("IMO", vessel.get("imo")),
+        field("Позывной", vessel.get("callsign")),
+    ])
+
+    gfw_entry = portcalls.gfw_vessel(None, mmsi) if portcalls is not None else None
+    length = vessel.get("length_m")
+    beam = vessel.get("beam_m")
+    sizes = size_text(vessel)
+    if sizes == "—" and gfw_entry and gfw_entry.get("length_m"):
+        sizes = f"{gfw_entry['length_m']:g} м (GFW)"
+    lines += section("Что за судно", [
+        field("Тип", type_text),
+        field("Размеры", None if sizes == "—" else sizes),
+        field("Осадка", core_module.fmt_number(vessel.get("draft")) if vessel.get("draft") else None, " м"),
+        field("Тоннаж", gfw_entry.get("tonnage_gt") if gfw_entry else None, " GT"),
+        field("Макс. скорость", gfw_entry.get("max_speed_kn") if gfw_entry else None, " уз"),
+    ])
+
+    position = None
+    if vessel.get("lat") is not None and vessel.get("lon") is not None:
+        position = (f"{core_module.fmt_number(vessel.get('lat'))}, "
+                    f"{core_module.fmt_number(vessel.get('lon'))}")
+    sog = vessel.get("sog")
+    lines += section("Сейчас", [
+        field("Скорость", f"{core_module.fmt_number(sog)} уз" if sog is not None else None),
+        field("Курс", f"{core_module.fmt_number(vessel.get('cog'))}°" if vessel.get("cog") not in (None, -1) else None),
+        field("Координаты", position),
+        field("В порту", vessel.get("port")),
         f"Обновлено: {core_module.fmt_moment(store_module.parse_iso(vessel.get('updated_at')))}",
-        route_text(vessel),
-    ]
+    ])
+
+    voyage_rows = [field("Назначение", vessel.get("destination")), route_text(vessel)]
+    voyage = core.voyage(vessel)
+    if voyage:
+        port_label = voyage.get("port_label") or voyage.get("port")
+        if voyage.get("in_port"):
+            voyage_rows.append(f"До прибытия: уже в порту {port_label}")
+        elif voyage.get("hours") is not None:
+            voyage_rows.append(
+                f"До прибытия: {core_module.duration_text(voyage['hours'])} "
+                f"({core_module.fmt_moment(voyage['eta'])}), "
+                f"{core_module.fmt_number(voyage['distance_km'])} км до {port_label}")
+        else:
+            voyage_rows.append(
+                f"До прибытия: скорость слишком мала для расчёта "
+                f"({core_module.fmt_number(voyage['distance_km'])} км до {port_label})")
+    declared = store_module.parse_iso(vessel.get("eta_declared"))
+    if declared:
+        voyage_rows.append(f"Срок прибытия (AIS): {core_module.fmt_moment(declared)} "
+                           f"(передаёт капитан, в UTC)")
+    if portcalls is not None:
+        expected = portcalls.expected_for_mmsi(mmsi)
+        if expected:
+            voyage_rows.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
+                               f"{expected.get('eta') or 'не указан'} (AIS-catcher)")
+    lines += section("Рейс", voyage_rows)
+
+    if portcalls is not None and gfw_entry:
+        checked = str(gfw_entry.get("checked") or "")[:16].replace("T", " ")
+        lines += section("Проверка по реестрам", [
+            f"Паспорт GFW получен" + (f": {checked}" if checked else ""),
+            portcalls.gfw_gap_text(gfw_entry),
+        ])
     try:
         metrics = _import("metrics")
     except Exception:
@@ -317,39 +387,8 @@ def vessel_card(vessel: dict, core) -> str:
             lines.append(f"⚠ Данные устарели: AIS не поступал {core_module.span_text(age)} — "
                          f"скорость, курс и позиция могут быть неактуальны.")
 
-    voyage = core.voyage(vessel)
-    if voyage:
-        port_label = voyage.get("port_label") or voyage.get("port")
-        if voyage.get("in_port"):
-            lines.append(f"До прибытия: уже в порту {port_label}")
-        elif voyage.get("hours") is not None:
-            lines.append(f"До прибытия: {core_module.duration_text(voyage['hours'])} "
-                         f"({core_module.fmt_moment(voyage['eta'])}), "
-                         f"{core_module.fmt_number(voyage['distance_km'])} км до {port_label}")
-        else:
-            lines.append(f"До прибытия: скорость слишком мала для расчёта "
-                         f"({core_module.fmt_number(voyage['distance_km'])} км до {port_label})")
-
-    declared = store_module.parse_iso(vessel.get("eta_declared"))
-    lines.append(f"Срок прибытия (AIS): {core_module.fmt_moment(declared) if declared else '—'} "
-                 f"(передаёт капитан, в UTC)")
-    try:
-        portcalls = _import("portcalls")
-    except Exception:
-        portcalls = None
-    if portcalls is not None:
-        expected = portcalls.expected_for_mmsi(mmsi)
-        if expected:
-            lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
-                         f"{expected.get('eta') or '—'} (AIS-catcher)")
-        gfw_entry = portcalls.gfw_vessel(None, mmsi)
-        if gfw_entry:
-            lines.append(portcalls.gfw_profile_text(gfw_entry))
-        gfw_text = portcalls.gfw_gap_text(gfw_entry)
-        if gfw_text:
-            lines.append(gfw_text)
-
     stay = core.port_stay(vessel)
+    stay_rows = []
     if stay:
         stay_port = stay.get("port_label") or stay.get("port")
         parts = []
@@ -362,24 +401,26 @@ def vessel_card(vessel: dict, core) -> str:
                          f"({source}, визитов: {stay['visits']})")
         if stay.get("remaining_hours") is not None:
             parts.append(f"осталось примерно {core_module.span_text(stay['remaining_hours'])}")
-        lines.append(f"Стоянка в {stay_port}: " + ("; ".join(parts) if parts else "наблюдений пока нет"))
+        stay_rows.append(f"Стоянка в {stay_port}: "
+                         + ("; ".join(parts) if parts else "наблюдений пока нет"))
 
     cargo_info = core.cargo_estimate(vessel)
     if cargo_info:
         share = cargo_info.get("load_share")
         if share is None:
-            lines.append(f"Груз (оценка): ≈ {core_module.fmt_tons(cargo_info['cargo_t'])} т")
+            stay_rows.append(f"Груз (оценка): ≈ {core_module.fmt_tons(cargo_info['cargo_t'])} т")
         else:
-            lines.append(f"Груз (оценка): ≈ {core_module.fmt_tons(cargo_info['cargo_t'])} т "
-                         f"({round(share * 100)} % дедвейта ≈ "
-                         f"{core_module.fmt_tons(cargo_info['deadweight_t'])} т)")
+            stay_rows.append(f"Груз (оценка): ≈ {core_module.fmt_tons(cargo_info['cargo_t'])} т "
+                             f"({round(share * 100)} % дедвейта ≈ "
+                             f"{core_module.fmt_tons(cargo_info['deadweight_t'])} т)")
     elif vessel.get("draft"):
-        lines.append("Груз (оценка): нет длины и ширины корпуса — "
-                     "судно их ещё не передавало")
+        stay_rows.append("Груз (оценка): нет длины и ширины корпуса — "
+                         "судно их ещё не передавало")
 
     kind, kind_detail = cargo.cargo_kind(vessel.get("type_code"))
     if kind:
-        lines.append(f"Что везёт: {kind} — {kind_detail}")
+        stay_rows.append(f"Что везёт: {kind} — {kind_detail}")
+    lines += section("Стоянка и груз", stay_rows)
 
     signals = core.vessel_signals(vessel) if hasattr(core, "vessel_signals") else []
     if signals:

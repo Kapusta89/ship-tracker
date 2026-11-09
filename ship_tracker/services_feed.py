@@ -780,13 +780,15 @@ class GfwFeed(ServiceFeed):
     """
 
     key = "gfw"
-    interval = 43200.0
+    # раз в час: паспорта судов меняются редко, но база из снимков
+    # пополняется быстро, и ждать 12 часов перед обогащением не нужно
+    interval = 3600.0
 
     def __init__(self, *args, vessels=None, max_vessels=None, days=None,
                  cache_path=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.vessels = vessels or (lambda: [])
-        self.max_vessels = max(1, int(max_vessels or 10))
+        self.max_vessels = max(1, int(max_vessels or 40))
         self.days = max(1, int(days or 7))
         self.cache_path = Path(cache_path) if cache_path else portcalls.GFW_PATH
         if kwargs.get("minutes"):
@@ -808,16 +810,11 @@ class GfwFeed(ServiceFeed):
         if not entries:
             return None
         entry = entries[0] if isinstance(entries[0], dict) else {}
-        info = entry.get("selfReportedInfo") or []
-        info = info[0] if info and isinstance(info[0], dict) else {}
-        vessel_id = info.get("id") or entry.get("id")
-        if not vessel_id:
+        # весь паспорт сразу: имя, флаг, IMO, позывной, тип, длина, тоннаж
+        profile = portcalls.gfw_identity(entry)
+        if not profile.get("id"):
             return None
-        # в ответе API поле называется shipname (раньше код читал shipName
-        # и имя всегда оставалось пустым)
-        return {"id": str(vessel_id),
-                "name": info.get("shipname") or info.get("shipName") or "",
-                "flag": info.get("flag") or "", "imo": info.get("imo") or ""}
+        return profile
 
     def last_gap(self, vessel_id):
         from datetime import timedelta
@@ -875,6 +872,15 @@ class GfwFeed(ServiceFeed):
                 known[mmsi] = record
                 found += 1
                 gaps += 1 if record.get("gap") else 0
+                # паспорт сразу в базу: именно из-за пустых полей в карточках
+                # были прочерки вместо типа, размеров и позывного
+                self.emit({"kind": "static", "mmsi": mmsi,
+                           "name": profile.get("name") or "",
+                           "imo": profile.get("imo") or "",
+                           "callsign": profile.get("callsign") or "",
+                           "type_code": profile.get("type_code"),
+                           "type_label": profile.get("type_label") or "",
+                           "length_m": profile.get("length_m")})
             except Exception as error:
                 errors += 1
                 if errors == 1:

@@ -195,6 +195,87 @@ def expected_for_mmsi(mmsi, cache=None) -> dict | None:
 
 # ------------------------------------------------------------------- GFW
 
+# Классы судов GFW → код типа AIS и подпись по-русски. Нужно, чтобы данные
+# из реестра вставали в те же поля, что и статика AIS, и не спорили с ней.
+GFW_CLASSES = {
+    "CARGO": (70, "грузовое"),
+    "TANKER": (80, "танкер"),
+    "PASSENGER": (60, "пассажирское"),
+    "FISHING": (30, "рыболовное"),
+    "TUG": (52, "буксир"),
+    "TUG_TOW": (52, "буксир"),
+    "PLEASURE": (37, "прогулочное"),
+    "SEARCH_AND_RESCUE": (55, "спасательное"),
+    "DREDGING": (33, "земснаряд"),
+    "PILOT": (50, "лоцманское"),
+    "MILITARY": (35, "военное"),
+    "SAR": (55, "спасательное"),
+}
+
+
+def _gfw_value(items):
+    """Первое значение из списка оценок GFW ({'value': ...})."""
+    if isinstance(items, list) and items:
+        first = items[0] if isinstance(items[0], dict) else {}
+        return first.get("value")
+    return None
+
+
+def gfw_identity(entry) -> dict:
+    """Паспорт судна из ответа GFW: имя, флаг, IMO, тип, длина, тоннаж.
+
+    GFW отдаёт справочник (selfReportedInfo: имя, флаг, позывной, IMO) и
+    оценки модели (combinedSourcesInfo: класс судна, длина, тоннаж, скорость).
+    Оценки модель даёт не всегда — тогда поле просто не заполняется.
+    """
+    entry = entry if isinstance(entry, dict) else {}
+    info = entry.get("selfReportedInfo") or []
+    info = info[0] if info and isinstance(info[0], dict) else {}
+    combined = entry.get("combinedSourcesInfo") or []
+    combined = combined[0] if combined and isinstance(combined[0], dict) else {}
+    classes = combined.get("vesselClassSc") or []
+    klass = str(_gfw_value(classes) or "").upper().replace(" ", "_")
+    code, label = GFW_CLASSES.get(klass, (None, ""))
+    if not label:
+        shiptype = str(_gfw_value(combined.get("shiptypes")) or "").upper().replace(" ", "_")
+        code, label = GFW_CLASSES.get(shiptype, (None, ""))
+    length = _gfw_value(combined.get("bestLengthM"))
+    tonnage = _gfw_value(combined.get("bestTonnageGt"))
+    power = _gfw_value(combined.get("bestEnginePowerKw"))
+    speed = _gfw_value(combined.get("maxSpeedKn"))
+    try:
+        length = round(float(length), 1) if length is not None else None
+    except (TypeError, ValueError):
+        length = None
+    try:
+        tonnage = round(float(tonnage))
+    except (TypeError, ValueError):
+        tonnage = None
+    try:
+        power = round(float(power))
+    except (TypeError, ValueError):
+        power = None
+    try:
+        speed = round(float(speed), 1)
+    except (TypeError, ValueError):
+        speed = None
+    return {
+        "id": str(info.get("id") or entry.get("id") or ""),
+        "mmsi": str(info.get("ssvid") or ""),
+        "name": _clean(info.get("shipname") or info.get("shipName")),
+        "flag": _clean(info.get("flag")),
+        "imo": _clean(info.get("imo")),
+        "callsign": _clean(info.get("callsign")),
+        "type_code": code,
+        "type_label": label,
+        "vessel_class": klass,
+        "length_m": length,
+        "tonnage_gt": tonnage,
+        "engine_power_kw": power,
+        "max_speed_kn": speed,
+    }
+
+
 def gfw_vessel(gfw, mmsi):
     """Данные GFW по MMSI из кэша (если профиль уже запрашивался)."""
     gfw = gfw if isinstance(gfw, dict) else load_gfw()
@@ -275,18 +356,30 @@ def clean_gfw_token(value) -> str:
 
 
 def gfw_profile_text(entry) -> str:
-    """Строка с профилем судна из GFW: имя, флаг, IMO и когда проверено."""
+    """Строка с профилем судна из GFW: имя, флаг, IMO, тип, размеры, тоннаж."""
     entry = entry or {}
     parts = []
     name = _clean(entry.get("name"))
     flag = _clean(entry.get("flag"))
     imo = _clean(entry.get("imo"))
+    callsign = _clean(entry.get("callsign"))
+    label = _clean(entry.get("type_label"))
     if name:
         parts.append(name)
     if flag:
         parts.append(f"флаг {flag}")
     if imo:
         parts.append(f"IMO {imo}")
+    if callsign:
+        parts.append(f"позывной {callsign}")
+    if label:
+        parts.append(label)
+    if entry.get("length_m"):
+        parts.append(f"длина {entry['length_m']:.1f} м".replace(".0 м", " м"))
+    if entry.get("tonnage_gt"):
+        parts.append(f"{int(entry['tonnage_gt'])} GT")
+    if entry.get("max_speed_kn"):
+        parts.append(f"макс. {entry['max_speed_kn']} уз")
     text = "GFW: " + (" · ".join(parts) if parts else "профиль судна найден")
     checked = _clean(str(entry.get("checked") or "").replace("T", " ")[:16])
     if checked:

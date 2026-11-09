@@ -80,9 +80,9 @@ DEFAULT_CONFIG = {
     "srd_minutes": 15,
     "use_gfw": False,
     "gfw_key": "",
-    "gfw_minutes": 720,
+    "gfw_minutes": 60,
     "gfw_days": 7,
-    "gfw_max_vessels": 20,
+    "gfw_max_vessels": 60,
     # платные/ключевые источники: Datalastic (x-api-key) и AISHub (логин)
     "use_dat": False,
     "dat_key": "",
@@ -626,7 +626,9 @@ class RadarCore:
                 api_key=api_key,
                 bboxes=config.get("bounding_boxes"),
                 on_status=self._set_service_status,
-                vessels=(self.enrich_candidates if key == "srd" else self.tracked_mmsis),
+                vessels=(self.enrich_candidates if key == "srd"
+                         else self.profile_candidates if key == "gfw"
+                         else self.tracked_mmsis),
                 minutes=config.get(f"{key}_minutes"),
                 daily_coins=(config.get("vfa_daily_coins") if key == "vfa"
                              else config.get("mst_daily_coins")),
@@ -1004,6 +1006,29 @@ class RadarCore:
         return [vessel for vessel in self.related_vessels(limit)
                 if vessel.get("lat") is None or vessel.get("lon") is None]
 
+    def profile_candidates(self, limit=200) -> list:
+        """Суда без паспорта — для обогащения из реестра GFW.
+
+        Отдаёт те записи, у которых нет IMO, типа или длины: именно они в
+        карточках выглядят как прочерки. Сначала идут свежие суда.
+        """
+        try:
+            rows = self.store.vessels(2000)
+        except Exception:
+            return []
+        result = []
+        for row in rows:
+            if self.is_station_mmsi(row.get("mmsi")):
+                continue
+            if not (row.get("name") or row.get("lat") is not None):
+                continue
+            if row.get("imo") and row.get("type_code") is not None and row.get("length_m"):
+                continue
+            result.append(str(row.get("mmsi")))
+            if len(result) >= limit:
+                break
+        return result
+
     def enrich_candidates(self, limit=200) -> list:
         """Суда, у которых не хватает паспортных данных для нашего стандарта.
 
@@ -1280,11 +1305,11 @@ class RadarCore:
         if any(x in name_cand for x in ["TEST", "DEMO", "EXAMPLE", "SAMPLE"]) or mmsi in LEGACY_DEMO_MMSI:
             return
         before = self.store.vessel(mmsi)
-        # в базу попадают только суда, связанные с нашими портами
-        if not self._vessel_related(mmsi, None, None, before,
-                                    destination=event.get("destination"), area=True):
-            if before is not None:
-                self.store.drop_vessel(mmsi)
+        # в базу попадают только суда, связанные с нашими портами; но статика
+        # приходит без координат, и у судна, уже записанного по позиции,
+        # близость к порту здесь не проверить — его не отбрасываем и не удаляем
+        if before is None and not self._vessel_related(
+                mmsi, None, None, None, destination=event.get("destination"), area=True):
             return
         code = event.get("type_code")
         self.store.upsert_static(
