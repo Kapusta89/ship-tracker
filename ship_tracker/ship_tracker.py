@@ -3541,6 +3541,8 @@ class App:
                 [sys.executable, "-X", "utf8", str(APP_DIR / "telegram_bot.py")],
                 cwd=str(APP_DIR), stdout=handle, stderr=subprocess.STDOUT,
                 creationflags=flags)
+            # у дочернего процесса свой дескриптор — родителю файл больше не нужен
+            handle.close()
             self.log("Бот Telegram запущен вместе с приложением.")
         except Exception as error:
             self.bot_process = None
