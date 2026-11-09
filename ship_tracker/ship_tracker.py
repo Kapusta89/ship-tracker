@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.2"
+APP_VERSION = "2026.12.3"
 
 import ais_feed
 import cargo
@@ -355,6 +355,7 @@ class RadarCanvas:
         self._hits = []
         now = datetime.now()
         drawn = 0
+        faded = 0
         stale_count = 0
         stale_drawn = 0
         stale_hidden = 0
@@ -369,18 +370,24 @@ class RadarCanvas:
             if self.targets_only and not is_target:
                 continue
             updated = parse_iso(vessel.get("updated_at"))
-            stale = not updated or (now - updated).total_seconds() > self.stale_seconds()
+            age = (now - updated).total_seconds() if updated else None
+            fresh = age is not None and age <= self.stale_seconds()
+            # Без свежего сигнала, но ещё в пределах `sea_fresh_hours` — судно
+            # остаётся на карте приглушённым: AIS-каналы отдают район не каждую
+            # минуту, и скрывать такие позиции означало бы терять половину судов.
+            stale = age is None or age > self.max_age_seconds()
             if stale:
                 stale_count += 1
                 if not self.show_stale and vessel["mmsi"] != self.selected:
                     stale_hidden += 1
                     continue
+                stale_drawn += 1
+            elif not fresh:
+                faded += 1
             x, y = projector.to_screen(lat, lon)
             if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
                 continue
             drawn += 1
-            if stale:
-                stale_drawn += 1
             self._hits.append((x, y, vessel["mmsi"]))
             # Цвета в зависимости от типа и схемatical режима
             if is_target:
@@ -396,6 +403,8 @@ class RadarCanvas:
                 elif color == "#7fa8bf": color = "#42a5f5"
             if stale:
                 color = "#4b6472"
+            elif not fresh:
+                color = "#5d7786"
             if vessel["mmsi"] == self.selected:
                 canvas.create_oval(x - 11, y - 11, x + 11, y + 11, outline="#ffffff", width=2)
             course = vessel.get("cog")
@@ -444,7 +453,7 @@ class RadarCanvas:
         self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_drawn,
                           len([v for v in vessels if v.get("lat") is None]),
                           traffic=shown_traffic, stale_hidden=stale_hidden,
-                          traffic_hidden=traffic_hidden)
+                          traffic_hidden=traffic_hidden, faded=faded)
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -619,11 +628,12 @@ class RadarCanvas:
         return minutes * 60
 
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
-                     traffic=0, stale_hidden=0, traffic_hidden=0):
-        fresh = drawn - stale
+                     traffic=0, stale_hidden=0, traffic_hidden=0, faded=0):
+        fresh = drawn - stale - faded
         text = (f"источник: живой AIS (AISStream, Open Waters)\n"
                 f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
-                f"свежих: {fresh}   старых > {self._stale_label()}: {stale + stale_hidden}\n")
+                f"свежих: {fresh}   без свежего сигнала (приглушённые): {faded}\n"
+                f"старше {self._age_label()}: {stale + stale_hidden}\n")
         if stale_hidden:
             text += f"из них скрыто на карте: {stale_hidden} (галочка «устаревшие»)\n"
         if without_position:
@@ -636,6 +646,8 @@ class RadarCanvas:
         if self.show_forecast:
             text += (f"пунктир — прогноз выбранного судна на {int(forecast.MAX_DAYS)} сут: "
                      f"голубой — в наш порт, жёлтый — по текущему курсу\n")
+            text += (f"план на {int(forecast.PLAN_DAYS)} дня (путь, стоянка, выход в море) — "
+                     f"во вкладке «Прогноз 4 дня»\n")
         text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
         self.canvas.create_text(10, 10, anchor="nw", text=text,
                                 fill="#5f8ea3", font=("Consolas", 8))
@@ -645,6 +657,26 @@ class RadarCanvas:
         if seconds == float("inf"):
             return "—"
         return f"{int(round(seconds / 60))} мин"
+
+    def max_age_seconds(self):
+        """Сколько позиция ещё считается пригодной для карты.
+
+        Свежие (до `stale_minutes`) рисуются обычными цветами, более старые —
+        приглушённо, пока не выйдут за `sea_fresh_hours`; дальше это уже
+        «устаревшие», и без галочки их не видно.
+        """
+        try:
+            hours = float(self.config.get("sea_fresh_hours") or 12)
+        except (TypeError, ValueError):
+            hours = 12.0
+        return max(self.stale_seconds(), hours * 3600.0)
+
+    def _age_label(self):
+        seconds = self.max_age_seconds()
+        if seconds == float("inf"):
+            return "—"
+        hours = seconds / 3600.0
+        return f"{hours:.0f} ч" if hours >= 1 else f"{int(round(seconds / 60))} мин"
 
 
 # ------------------------------------------------------------------ приложение
@@ -758,6 +790,7 @@ class App:
         self.tab_radar = ttk.Frame(notebook)
         self.tab_vessels = ttk.Frame(notebook)
         self.tab_sea = ttk.Frame(notebook)
+        self.tab_forecast = ttk.Frame(notebook)
         self.tab_alerts = ttk.Frame(notebook)
         self.tab_visits = ttk.Frame(notebook)
         self.tab_visit_history = ttk.Frame(notebook)
@@ -769,6 +802,7 @@ class App:
         self.tab_log = ttk.Frame(notebook)
         for tab, title in ((self.tab_radar, "Радар"),
                            (self.tab_vessels, "Все суда"), (self.tab_sea, "В море"),
+                           (self.tab_forecast, "Прогноз 4 дня"),
                            (self.tab_visits, "Стоянки"),
                            (self.tab_visit_history, "История стоянок"),
                            (self.tab_expected, "Ожидаемые"),
@@ -783,6 +817,7 @@ class App:
         self.build_radar()
         self.build_vessels()
         self.build_sea()
+        self.build_forecast()
         self.build_visits()
         self.build_visit_history()
         self.build_expected()
@@ -952,6 +987,160 @@ class App:
             button.configure(relief="sunken" if active else "groove",
                              background="#d7e6f5" if active else "#f0f0f0")
         self.refresh_sea_table()
+
+    def build_forecast(self):
+        """Вкладка «Прогноз 4 дня»: путь до порта, стоянка и выход в море."""
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_forecast
+        ttk.Label(
+            frame,
+            text="План на 4 дня по каждому судну, которое идёт в наш порт или уже стоит в нём: "
+                 "путь до порта, сколько простоит и маршрут в море на оставшийся срок "
+                 "(стоянка сутки — море три дня, стоянка двое — два дня). Стоянка оценивается "
+                 "по прежним визитам этого судна, иначе по среднему в порту; если наблюдений "
+                 "нет — сутки. Скорость и курс берутся из AIS. Двойной щелчок открывает карточку.",
+            foreground="#555", wraplength=1150, justify="left").pack(
+            anchor="w", padx=8, pady=(8, 4))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.forecast_info = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.forecast_info, foreground="#333",
+                  wraplength=980, justify="left").pack(side="left", fill="x", expand=True)
+        ttk.Button(bar, text="Обновить", command=self.refresh_forecast).pack(side="right")
+        self.forecast_tree = self.make_tree(
+            frame, (("name", "Судно", 170), ("port", "Порт", 110),
+                    ("arrival", "Приход", 145), ("stay", "Стоянка", 110),
+                    ("departure", "Выход", 145), ("sea", "Море", 100),
+                    ("route", "Маршрут", 320), ("mmsi", "MMSI", 95)))
+        self.forecast_tree.bind("<<TreeviewSelect>>", self.show_forecast_detail)
+        self.forecast_tree.tag_configure("in_port", foreground="#1f7a52")
+        self.forecast_tree.tag_configure("late", foreground="#8c8c8c")
+        self.forecast_detail = tk.Text(frame, height=7, wrap="word",
+                                       font=("Consolas", 9), background="#f7fafc",
+                                       foreground="#20323c")
+        self.forecast_detail.pack(fill="x", padx=8, pady=(0, 8))
+        self.forecast_detail.insert("1.0", "Выберите судно — покажу полный план.")
+        self.forecast_detail.configure(state="disabled")
+        self.refresh_forecast()
+
+    def forecast_candidates(self):
+        """Суда для плана: идут в наш порт или уже стоят в нём."""
+        ports = self.config.get("ports") or []
+        names = {(port.get("name") or "").upper() for port in ports}
+        opens = {}
+        try:
+            for visit in self.store.open_visits():
+                if (visit.get("port") or "").upper() in names:
+                    opens[str(visit.get("mmsi"))] = visit
+        except Exception as error:
+            self.log(f"Стоянки для прогноза: {error}")
+        result = []
+        for vessel in self.core.related_vessels(3000):
+            mmsi = str(vessel.get("mmsi"))
+            port = self.core.destination_port(vessel)
+            visit = opens.get(mmsi)
+            if not port:
+                if not visit:
+                    continue
+                port = geo.port_by_name(visit.get("port"), ports)
+            if not port:
+                continue
+            result.append((vessel, port))
+        return result
+
+    def refresh_forecast(self):
+        """Пересобирает план на 4 дня по всем судам у наших портов."""
+        tree = getattr(self, "forecast_tree", None)
+        if not tree:
+            return
+        ports = self.config.get("ports") or []
+        selected = tree.selection()
+        keep = tree.item(selected[0], "tags")[0] if selected else None
+        for item in tree.get_children():
+            tree.delete(item)
+        plans = {}
+        rows = []
+        for vessel, port in self.forecast_candidates():
+            mmsi = str(vessel.get("mmsi"))
+            try:
+                stay = self.core.port_stay(vessel, port=port)
+            except Exception:
+                stay = None
+            try:
+                track = self.store.track(mmsi, 24)
+            except Exception:
+                track = None
+            result = forecast.plan(vessel, ports, stay=stay, track=track)
+            if not result:
+                continue
+            plans[mmsi] = (vessel, result)
+            rows.append((vessel, result))
+
+        rows.sort(key=lambda pair: (pair[1].get("arrival_hours") is None,
+                                    pair[1].get("arrival_hours") or 0.0,
+                                    (pair[0].get("name") or "")))
+        for vessel, result in rows:
+            mmsi = str(vessel.get("mmsi"))
+            tags = (mmsi, "in_port" if result.get("in_port") else "sea_plan")
+            if not result.get("complete"):
+                tags = (mmsi, "late")
+            arrival = result.get("arrival_at")
+            departure = result.get("departure_at")
+            if result.get("in_port"):
+                arrival_text = "в порту"
+            elif arrival:
+                mark = "≈" if result.get("arrival_estimate") else ""
+                arrival_text = f"{mark}{arrival:%d.%m %H:%M}"
+            elif result.get("no_position"):
+                arrival_text = "нет позиции"
+            else:
+                arrival_text = "не доходит"
+            tree.insert("", "end", iid=mmsi, tags=tags, values=(
+                vessel.get("name") or "—",
+                result.get("port_label") or result.get("port") or "—",
+                arrival_text,
+                forecast.duration_text(result.get("stay_hours")),
+                f"{departure:%d.%m %H:%M}" if departure else "—",
+                forecast.duration_text(result.get("sea_hours")) if result.get("sea_hours") else "—",
+                forecast.plan_route_text(result),
+                mmsi))
+        self._forecast_plans = plans
+        in_port = sum(1 for _, result in rows if result.get("in_port"))
+        missing = sum(1 for _, result in rows if result.get("no_position") and not result.get("in_port"))
+        late = sum(1 for _, result in rows
+                   if not result.get("complete") and not result.get("no_position"))
+        if hasattr(self, "forecast_info"):
+            text = (f"В плане судов: {len(rows)} — в порту {in_port}, "
+                    f"в пути {len(rows) - in_port - missing}.")
+            if late:
+                text += f" Не успевают дойти за 4 суток: {late}."
+            if missing:
+                text += f" Без позиции (только AIS-catcher): {missing}."
+            text += (" Стоянка — по истории визитов, выход и маршрут в море — "
+                     "оценка по курсу и скорости.")
+            self.forecast_info.set(text)
+        if keep and keep in plans:
+            tree.selection_set(keep)
+            self.show_forecast_detail()
+
+    def show_forecast_detail(self, event=None):
+        """Показывает под таблицей полный план выбранного судна."""
+        text = getattr(self, "forecast_detail", None)
+        tree = getattr(self, "forecast_tree", None)
+        if not text or not tree:
+            return
+        selection = tree.selection()
+        content = "Выберите судно — покажу полный план."
+        if selection:
+            plan = (getattr(self, "_forecast_plans", {}) or {}).get(selection[0])
+            if plan:
+                vessel, result = plan
+                content = f"{vessel.get('name') or '—'} ({vessel.get('mmsi')})\n"
+                content += forecast.plan_detail(result)
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", content)
+        text.configure(state="disabled")
 
     def build_visits(self):
         tk, ttk = self.tk, self.ttk
@@ -1982,7 +2171,9 @@ class App:
                 vessels = self.core.port_vessels(600)
                 traffic = []
             else:
-                vessels = self.core.related_vessels(3000)
+                # На карте — все суда базы района, а не только «свои»: так видна
+                # вся обстановка у портов, а не несколько десятков точек.
+                vessels = self.core.area_vessels(4000)
                 traffic = []
                 if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
                     try:
@@ -2003,10 +2194,14 @@ class App:
 
     def on_tree_double_click(self, event):
         tree = event.widget
-        # Если удалена вкладка «Цели», проверяем только vessels_tree
-        if not hasattr(self, 'targets_tree') and tree != self.vessels_tree:
-            return
-        if hasattr(self, 'targets_tree') and tree not in (self.targets_tree, self.vessels_tree):
+        # Двойной щелчок в любой таблице открывает карточку — кроме вкладок,
+        # где строки не про суда (стоянки, алерты, сервисы).
+        allowed = [self.vessels_tree]
+        if hasattr(self, "targets_tree"):
+            allowed.append(self.targets_tree)
+        if hasattr(self, "forecast_tree"):
+            allowed.append(self.forecast_tree)
+        if tree not in allowed:
             return
         selection = tree.selection()
         if not selection:
@@ -2524,6 +2719,9 @@ class App:
             self.refresh_vessels_table()
             self._vessels_drawn_at = now
         self.refresh_sea_table()
+        if now - getattr(self, "_forecast_drawn_at", 0.0) >= 8.0:
+            self.refresh_forecast()
+            self._forecast_drawn_at = now
         self.refresh_visits()
         if hasattr(self, "visit_history_tree"):
             self.refresh_visit_history()
@@ -2563,6 +2761,8 @@ class App:
                 self.refresh_vessels_table()
             elif tab is getattr(self, "tab_sea", None):
                 self.refresh_sea_table()
+            elif tab is getattr(self, "tab_forecast", None):
+                self.refresh_forecast()
             elif tab is getattr(self, "tab_alerts", None):
                 self.refresh_alerts()
             elif tab is getattr(self, "tab_connection", None):

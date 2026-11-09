@@ -260,6 +260,13 @@ class Store:
                 "ORDER BY id DESC LIMIT 1", (mmsi,)).fetchone()
         return dict(row) if row else None
 
+    def open_visits(self):
+        """Все незакрытые стоянки сразу: кто сейчас в каком порту."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM port_visits WHERE left_at IS NULL").fetchall()
+        return [dict(row) for row in rows]
+
     def start_visit(self, mmsi: str, port: str, lat, lon, when=None, draft=None,
                     cargo_kind=None, source="live"):
         now = iso(when)

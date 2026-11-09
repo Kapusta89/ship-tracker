@@ -1697,16 +1697,18 @@ class RadarCore:
             "in_port": in_port,
         }
 
-    def port_stay(self, vessel):
+    def port_stay(self, vessel, port=None):
         """Сколько судно стоит (и будет стоять) в своём порту назначения.
 
         Время стоянки AIS не передаёт, поэтому считаем по своим наблюдениям:
         сколько уже стоит (открытый визит) и сколько обычно стоит — сначала
         по истории этого судна, а если её нет — по истории всех судов в порту.
+        Порт можно передать явно: у стоящего в порту судна Destination часто
+        пустой, и без подсказки стоянка не считается.
         """
         if not vessel:
             return None
-        port = self.destination_port(vessel)
+        port = port or self.destination_port(vessel)
         if not port:
             return None
         port_name = port.get("name")

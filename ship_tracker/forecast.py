@@ -18,6 +18,12 @@ import geo
 # сменить рейс, а погода и течения не учитываются вовсе.
 MAX_DAYS = 3.0
 STEP_HOURS = 2.0
+# План на четыре дня: путь до порта + стоянка + выход в море на остаток срока.
+PLAN_DAYS = 4.0
+# Сколько судно обычно стоит, если наблюдений ещё нет.
+DEFAULT_STAY_HOURS = 24.0
+# Скорость на выходе из порта, если AIS её не передал (обычный ход сухогруза).
+DEFAULT_SEA_KNOTS = 8.0
 # Насколько быстро судно может довернуть на новый курс: больше 20° в час
 # на практике не бывает, а мгновенный разворот на карте выглядел бы обманом.
 TURN_DEG_PER_HOUR = 20.0
@@ -199,6 +205,227 @@ def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
                        "source": source, "course": new_course,
                        "port": (port or {}).get("name")})
     return points
+
+
+def duration_text(hours):
+    """Длительность словами: «40 мин», «14 ч», «1 д 6 ч», «3 д»."""
+    if hours is None:
+        return "—"
+    hours = max(0.0, float(hours))
+    if hours < 1:
+        return f"{round(hours * 60)} мин"
+    if hours < 24:
+        return f"{hours:.0f} ч"
+    days, rest = divmod(round(hours), 24)
+    if rest == 0:
+        return f"{days} д"
+    return f"{days} д {rest} ч"
+
+
+def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
+    """План судна на 4 дня: путь до порта, стоянка в нём и выход в море.
+
+    AIS не знает ни времени стоянки, ни дальнейшего рейса, поэтому план
+    собирается из того, что видно: маршрут до порта считается по курсу и
+    скорости (как в `route`), стоянка — по нашим наблюдениям (`core.port_stay`),
+    а после выхода судно идёт в море тем же ходом в сторону, откуда пришло.
+
+    `stay` — ответ `core.port_stay`: current_hours (уже стоит), typical_hours
+    (сколько обычно стоит) и remaining_hours (сколько осталось). Если стоянка
+    займёт сутки, на море в четырёхдневном плане остаётся три дня; если двое —
+    два дня, и так далее.
+    """
+    vessel = vessel or {}
+    stay = stay or {}
+    now = now or datetime.now()
+    port = target_port(vessel, ports) or geo.port_by_name(stay.get("port"), ports or [])
+    if not port:
+        return None
+    try:
+        port_lat, port_lon = float(port["lat"]), float(port["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    speed, course, source = estimates(vessel, track)
+    in_port = stay.get("current_hours") is not None
+    horizon_end = now + timedelta(days=days)
+
+    points = []
+    arrival = None
+    estimate = False
+    if not in_port:
+        route_points = route(vessel, [port], days=days, track=track)
+        points.extend(dict(point, phase="approach") for point in route_points
+                      if not point.get("arrived"))
+        arrival = next((point for point in route_points if point.get("arrived")), None)
+        if arrival:
+            points.append(dict(arrival, phase="port"))
+        elif not route_points:
+            # Маршрут не строится без хода и курса (судно на рейде или в списке
+            # AIS-catcher без координат). Если позиция есть — считаем приход
+            # по прямой, чтобы план не был пустым.
+            arrival = _arrival_from_distance(vessel, port, port_lat, port_lon, now,
+                                            speed, course)
+            if arrival:
+                estimate = True
+                points = [{"hours": 0.0, "at": now, "lat": float(vessel["lat"]),
+                           "lon": float(vessel["lon"]), "label": "сейчас",
+                           "phase": "approach", "course": course},
+                          dict(arrival, phase="port")]
+
+    # Стоянка: сначала остаток по истории судна, потом среднее по порту,
+    # и только если наблюдений нет вовсе — сутки по умолчанию.
+    remaining = stay.get("remaining_hours")
+    typical = stay.get("typical_hours")
+    if remaining is not None and float(remaining) > 0.5:
+        stay_hours, stay_scope = float(remaining), stay.get("scope") or "порт"
+    elif typical:
+        # Норматив уже пересижен — точного времени выхода нет: даём
+        # короткий запас (не больше шести часов), а не «ноль минут».
+        if remaining is not None:
+            stay_hours, stay_scope = min(float(typical), 6.0), "перестой"
+        else:
+            stay_hours, stay_scope = float(typical), stay.get("scope") or "порт"
+    else:
+        stay_hours, stay_scope = DEFAULT_STAY_HOURS, "оценка"
+
+    arrival_hours = arrival_at = departure_at = None
+    if in_port:
+        arrival_hours, arrival_at = 0.0, now
+        departure_at = now + timedelta(hours=stay_hours)
+        points.insert(0, {"hours": 0.0, "at": now, "lat": port_lat, "lon": port_lon,
+                          "label": "в порту", "phase": "port", "port": port.get("name")})
+    elif arrival:
+        arrival_hours, arrival_at = float(arrival["hours"]), arrival["at"]
+        departure_at = arrival_at + timedelta(hours=stay_hours)
+        points[-1] = dict(arrival, phase="port", label=f"стоянка {duration_text(stay_hours)}")
+
+    # Курс выхода: обратно туда, откуда судно пришло. Для стоящего в порту —
+    # противоположный его последнему курсу.
+    out_course = None
+    if in_port and course is not None:
+        out_course = (float(course) + 180.0) % 360.0
+    else:
+        try:
+            out_course = bearing_deg(port_lat, port_lon,
+                                     float(vessel.get("lat")), float(vessel.get("lon")))
+        except (TypeError, ValueError):
+            if course is not None:
+                out_course = (float(course) + 180.0) % 360.0
+
+    sea_hours = 0.0
+    if departure_at is not None:
+        sea_hours = max(0.0, (horizon_end - departure_at).total_seconds() / 3600.0)
+    knots = speed if speed and MIN_SPEED_KNOTS <= speed <= 40 else DEFAULT_SEA_KNOTS
+    if sea_hours > 0.01 and out_course is not None:
+        kmh = knots * KNOT_KMH
+        lat, lon, hours = port_lat, port_lon, 0.0
+        while hours < sea_hours - 1e-9:
+            step = min(STEP_HOURS, sea_hours - hours)
+            lat, lon = destination_point(lat, lon, out_course, kmh * step)
+            hours += step
+            points.append({"hours": arrival_hours + stay_hours + hours if arrival_hours is not None else hours,
+                           "at": departure_at + timedelta(hours=hours),
+                           "lat": lat, "lon": lon, "phase": "sea",
+                           "label": f"море {duration_text(hours)}",
+                           "course": out_course, "port": port.get("name")})
+
+    return {
+        "port": port.get("name"),
+        "port_label": port.get("label") or port.get("name"),
+        "points": points,
+        "speed": speed,
+        "course": course,
+        "source": source,
+        "arrival_hours": arrival_hours,
+        "arrival_at": arrival_at,
+        "arrival_text": arrival and arrival.get("label"),
+        "stay_hours": stay_hours,
+        "stay_scope": stay_scope,
+        "departure_at": departure_at,
+        "sea_hours": sea_hours,
+        "sea_knots": knots if sea_hours > 0.01 else None,
+        "out_course": out_course,
+        "in_port": in_port,
+        "complete": bool(arrival or in_port),
+        "arrival_estimate": estimate,
+        "no_position": vessel.get("lat") is None or vessel.get("lon") is None,
+        "days": days,
+    }
+
+
+def _arrival_from_distance(vessel, port, port_lat, port_lon, now, speed, course):
+    """Приход по прямой, когда маршрут не строится (на рейде, без хода)."""
+    try:
+        lat, lon = float(vessel.get("lat")), float(vessel.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    km = geo.haversine_km(lat, lon, port_lat, port_lon)
+    knots = speed if speed and MIN_SPEED_KNOTS <= speed <= 40 else DEFAULT_SEA_KNOTS
+    hours = max(0.25, km / (knots * KNOT_KMH))
+    return {"hours": hours, "at": now + timedelta(hours=hours),
+            "lat": port_lat, "lon": port_lon, "label": _label(hours),
+            "course": bearing_deg(lat, lon, port_lat, port_lon),
+            "port": (port or {}).get("name"), "estimated": True}
+
+
+def plan_route_text(result):
+    """План одной строкой для таблицы."""
+    if not result:
+        return "—"
+    parts = []
+    if result.get("no_position") and not result.get("in_port"):
+        parts.append("нет позиции AIS")
+        return " → ".join(parts)
+    if result.get("in_port"):
+        parts.append(f"в порту, выход через {duration_text(result.get('stay_hours'))}")
+    elif result.get("arrival_at"):
+        parts.append(f"в пути {duration_text(result.get('arrival_hours'))}")
+        parts.append(f"стоянка {duration_text(result.get('stay_hours'))}")
+    else:
+        parts.append(f"за {int(result.get('days') or PLAN_DAYS)} сут не доходит")
+    if result.get("sea_hours"):
+        parts.append(f"в море {duration_text(result.get('sea_hours'))}")
+    return " → ".join(parts)
+
+
+def plan_detail(result):
+    """Подробный план для карточки во вкладке «Прогноз 4 дня»."""
+    if not result:
+        return "Нет данных для плана."
+    lines = [f"Порт: {result.get('port_label') or result.get('port')}"]
+    if result.get("in_port"):
+        lines.append("Сейчас: в порту")
+    elif result.get("arrival_at"):
+        mark = "≈" if result.get("arrival_estimate") else ""
+        source = " — оценка по расстоянию" if result.get("arrival_estimate") else ""
+        lines.append(f"Приход: {mark}{result['arrival_at']:%d.%m %H:%M} "
+                     f"(через {duration_text(result.get('arrival_hours'))}){source}")
+    elif result.get("no_position"):
+        lines.append("Приход: нет позиции AIS — судно только в списке AIS-catcher")
+    else:
+        lines.append(f"Приход: за {int(result.get('days') or PLAN_DAYS)} сут не доходит")
+    if result.get("departure_at"):
+        lines.append(f"Стоянка: {duration_text(result.get('stay_hours'))} "
+                     f"(оценка: {result.get('stay_scope')})")
+        lines.append(f"Выход: {result['departure_at']:%d.%m %H:%M}")
+        if result.get("sea_hours"):
+            knots = result.get("sea_knots")
+            speed_text = f" при {knots:.1f} уз" if knots else ""
+            lines.append(f"Море после выхода: {duration_text(result.get('sea_hours'))}"
+                         f"{speed_text}")
+            lines.append(f"Курс выхода: {course_text(result.get('out_course'))}")
+    if result.get("speed"):
+        lines.append(f"Ход по AIS: {result['speed']:.1f} уз ({result.get('source')})")
+    sea = [point for point in result.get("points") or [] if point.get("phase") == "sea"]
+    if sea:
+        marks = []
+        for point in sea:
+            if point["at"].hour >= 0:
+                marks.append(f"{point['at']:%d.%m %H:%M} — {point['lat']:.2f}, {point['lon']:.2f}")
+        lines.append("Путь после выхода:")
+        lines.extend(f"  · {mark}" for mark in marks[-8:])
+    return "\n".join(lines)
 
 
 def course_text(course):
