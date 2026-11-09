@@ -468,10 +468,10 @@ class RadarCore:
         if removed:
             self.log(f"Из базы убраны демо-суда прежней версии: {removed}. "
                      f"Остаются только реальные суда AIS.")
-        dropped = self.purge_unrelated()
+        dropped = self.purge_unrelated(48)
         if dropped:
-            self.log(f"Из базы убраны суда вне наших портов: {dropped}. "
-                     f"В списке только суда, связанные с портами наблюдения.")
+            self.log(f"Из базы убраны суда без связи с нашими портами дольше двух суток: "
+                     f"{dropped}. В списках и на карте остаются только связанные с портами.")
         self.feed = None
         self.feeds = []
         # Основной поток AISStream
@@ -1119,19 +1119,39 @@ class RadarCore:
                                       item.get("nearest_km") if item.get("nearest_km") is not None else 9e9))
         return result[:limit]
 
-    def purge_unrelated(self) -> int:
-        """Удаляет из базы суда, никак не связанные с нашими портами."""
+    def purge_unrelated(self, min_age_hours=48.0) -> int:
+        """Удаляет из базы суда, у которых нет связи с нашими портами.
+
+        Связь — наш порт в Destination, визит в наш порт или судно в пределах
+        `port_watch_km` от порта. Судно, которое в базе дольше `min_age_hours`
+        и за это время ничем себя не проявило, считается чужим: его убираем,
+        чтобы оно не занимало место во «Все суда» и не висело на карте.
+        Новым судам даётся время: их не трогаем, пока не истекли сутки-двое.
+        """
+        try:
+            min_age_hours = float(min_age_hours or 0)
+        except (TypeError, ValueError):
+            min_age_hours = 48.0
+        deadline = (datetime.now() - timedelta(hours=min_age_hours)
+                    if min_age_hours > 0 else None)
         removed = 0
         for vessel in self.store.vessels(100000):
             mmsi = vessel.get("mmsi")
             if not mmsi:
                 continue
-            if self._vessel_related(mmsi, vessel.get("lat"), vessel.get("lon"), vessel,
-                                    area=True):
+            if self._vessel_related(mmsi, vessel.get("lat"), vessel.get("lon"), vessel):
                 self.store.set_tracked(mmsi, True)
-            else:
-                self.store.drop_vessel(mmsi)
-                removed += 1
+                continue
+            if deadline is not None:
+                seen = str(vessel.get("first_seen") or vessel.get("updated_at") or "")
+                try:
+                    since = datetime.fromisoformat(seen[:19])
+                except ValueError:
+                    since = None
+                if since is None or since > deadline:
+                    continue
+            self.store.drop_vessel(mmsi)
+            removed += 1
         return removed
 
     # ------------------------------------------------------------ приём
@@ -1186,9 +1206,9 @@ class RadarCore:
             added = self.sync_expected()
             if added:
                 self.log(f"AIS-catcher: в базу добавлено ожидаемых судов {added}.")
-            dropped = self.purge_unrelated()
+            dropped = self.purge_unrelated(48)
             if dropped:
-                self.log(f"Убрано судов вне наших портов: {dropped}.")
+                self.log(f"Убрано судов без связи с портами дольше двух суток: {dropped}.")
         except Exception as error:
             self.log(f"Обслуживание базы: {error}")
 
