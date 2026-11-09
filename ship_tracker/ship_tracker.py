@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.21"
+APP_VERSION = "2026.11.22"
 
 import ais_feed
 import cargo
@@ -686,6 +686,7 @@ class App:
         self.tab_sea = ttk.Frame(notebook)
         self.tab_alerts = ttk.Frame(notebook)
         self.tab_visits = ttk.Frame(notebook)
+        self.tab_visit_history = ttk.Frame(notebook)
         self.tab_expected = ttk.Frame(notebook)
         self.tab_connection = ttk.Frame(notebook)
         self.tab_filters = ttk.Frame(notebook)
@@ -695,6 +696,7 @@ class App:
         for tab, title in ((self.tab_radar, "Радар"),
                            (self.tab_vessels, "Все суда"), (self.tab_sea, "В море"),
                            (self.tab_visits, "Стоянки"),
+                           (self.tab_visit_history, "История стоянок"),
                            (self.tab_expected, "Ожидаемые"),
                            (self.tab_alerts, "Алерты"),
                            (self.tab_connection, "Подключение"), (self.tab_filters, "Фильтры"),
@@ -702,10 +704,13 @@ class App:
                            (self.tab_log, "Журнал")):
             notebook.add(tab, text=title)
 
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+
         self.build_radar()
         self.build_vessels()
         self.build_sea()
         self.build_visits()
+        self.build_visit_history()
         self.build_expected()
         self.build_alerts()
         self.build_connection()
@@ -795,15 +800,22 @@ class App:
         self.detail_text.bind("<MouseWheel>", self.scroll_detail)
 
     def build_vessels(self):
-        ttk = self.ttk
+        tk, ttk = self.tk, self.ttk
         frame = self.tab_vessels
-        ttk.Label(frame, text="Суда, связанные с нашими портами: стоят или проходят рядом, "
-                              "идут в порт или вышли из него, либо уже были в нём. "
-                              "Если в Destination наш порт — расстояние не важно, судно "
-                              "в списке на любом удалении; те, у кого пока нет позиции "
-                              "в живых потоках, добавлены снизу из ожидаемых AIS-catcher.",
-                  foreground="#555", wraplength=1100, justify="left").pack(
+        ttk.Label(frame, text="Все суда в районе наших портов: в радиусе «Район вокруг "
+                              "портов, км» (по умолчанию 800–1000 км от любого порта) и все, "
+                              "у кого в Destination наш порт — на любом удалении. Каждое "
+                              "такое судно записывается в базу. Те, у кого пока нет "
+                              "позиции в живых потоках, добавлены снизу из ожидаемых "
+                              "AIS-catcher.",
+                  foreground="#555", wraplength=1200, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=8, pady=(0, 4))
+        self.vessels_info = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self.vessels_info, foreground="#333",
+                  wraplength=1000, justify="left").pack(side="left")
+        ttk.Button(row, text="Обновить", command=self.refresh_vessels_table).pack(side="right")
         self.vessels_tree = self.make_tree(
             frame, (                    ("name", "Судно", 170), ("flag", "Флаг", 140), ("type", "Тип", 100),
                     ("size", "Размеры", 115),
@@ -821,18 +833,23 @@ class App:
         """Вкладка «В море»: суда с позицией вне портов и без статики AIS."""
         tk, ttk = self.tk, self.ttk
         frame = self.tab_sea
-        ttk.Label(frame, text="Кто прямо сейчас в море. Сверху — суда, связанные с нашими "
-                              "портами (идут в порт, вышли из него или проходят рядом), "
-                              "ниже — весь остальной трафик района. Позиции собираются "
-                              "всеми каналами сразу: поток района, снимок района, "
-                              "Open Waters и глобальное слежение по MMSI (судно видно "
-                              "в любой точке мира, где есть приём AIS). Расстояние и "
-                              "прибытие — по прямой и текущей скорости.",
+        ttk.Label(frame, text="Судна в море, связанные с нашими портами: в Destination стоит "
+                              "наш порт (идут в него) или судно вышло из нашего порта за "
+                              "последние дни. Остальной трафик района скрыт — его можно "
+                              "включить галочкой. Расстояние и прибытие — по прямой и "
+                              "текущей скорости; заявленный капитаном ETA — в карточке.",
                   foreground="#555", wraplength=1100, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", padx=8, pady=(0, 4))
+        self.var_sea_all = tk.IntVar(value=0)
+        ttk.Checkbutton(controls, text="Показывать весь трафик района, а не только связанный "
+                                       "с нашими портами",
+                        variable=self.var_sea_all, command=self.refresh_sea_table).pack(side="left")
+        ttk.Button(controls, text="Обновить", command=self.refresh_sea_table).pack(side="right")
         self.sea_info = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.sea_info, foreground="#333").pack(
-            anchor="w", padx=8, pady=(0, 4))
+        ttk.Label(frame, textvariable=self.sea_info, foreground="#333", wraplength=1200,
+                  justify="left").pack(anchor="w", padx=8, pady=(0, 4))
         self.sea_tree = self.make_tree(
             frame, (("name", "Судно", 180), ("flag", "Флаг", 150),
                     ("type", "Тип", 110), ("dest", "Назначение", 150),
@@ -921,25 +938,168 @@ class App:
         finally:
             self._history_loading = False
 
+    def build_visit_history(self):
+        """Вкладка «История стоянок»: стоянки в наших портах с кнопками портов."""
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_visit_history
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(top, text="Кто и сколько стоял в наших портах: приход, уход, время "
+                            "стоянки, осадка и груз. Кнопка порта оставляет только его "
+                            "стоянки; в скобках — сколько их в базе.",
+                  foreground="#555").pack(side="left")
+        ttk.Button(top, text="Обновить", command=self.refresh_visit_history
+                   ).pack(side="right")
+        port_bar = ttk.Frame(frame)
+        port_bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.visit_port = tk.StringVar(value="")
+        self.visit_port_buttons = {}
+        ports = [((port.get("name") or "").upper(), port.get("label") or port.get("name"))
+                 for port in self.config.get("ports") or []]
+        for name, label in [("", "Все порты")] + ports:
+            button = tk.Button(port_bar, text=label, command=lambda key=name: self.pick_visit_port(key),
+                               relief="groove", padx=8, pady=2, font=("Segoe UI", 9))
+            button.pack(side="left", padx=(0, 4))
+            self.visit_port_buttons[name] = button
+        self.visit_history_info = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.visit_history_info, foreground="#333").pack(
+            anchor="w", padx=8, pady=(0, 4))
+        self.visit_history_tree = self.make_tree(
+            frame, (("name", "Судно", 180), ("port", "Порт", 110),
+                    ("arrived", "Пришёл", 130), ("left", "Ушёл", 130),
+                    ("stay", "Стоянка", 110), ("draft", "Осадка вход→выход", 150),
+                    ("cargo", "Груз", 220), ("source", "Источник", 100)))
+        self.pick_visit_port("")
+
+    def pick_visit_port(self, name):
+        """Выбор порта кнопкой: подсвечиваем её и перестраиваем список."""
+        self.visit_port.set(name or "")
+        for key, button in getattr(self, "visit_port_buttons", {}).items():
+            active = (key == (name or ""))
+            button.configure(relief="sunken" if active else "groove",
+                             background="#d7e6f5" if active else "#f0f0f0")
+        self.refresh_visit_history()
+
+    def refresh_visit_history(self):
+        tree = getattr(self, "visit_history_tree", None)
+        if not tree:
+            return
+        port = (self.visit_port.get() or "")
+        for item in tree.get_children():
+            tree.delete(item)
+        try:
+            rows = self.store.visits(500, port=port or None)
+            counts = self.store.visit_counts()
+        except Exception as error:
+            self.log(f"История стоянок: {error}")
+            return
+        for name, button in getattr(self, "visit_port_buttons", {}).items():
+            label = next((p.get("label") or p.get("name")
+                          for p in self.config.get("ports") or []
+                          if (p.get("name") or "").upper() == name), "Все порты")
+            if name == "":
+                total = sum(entry["visits"] for entry in counts.values())
+                button.configure(text=f"Все порты ({total})")
+            else:
+                button.configure(text=f"{label} ({counts.get(name, {}).get('visits', 0)})")
+        open_visits = 0
+        for visit in rows:
+            vessel = self.store.vessel(visit.get("mmsi")) or {}
+            entered = parse_iso(visit.get("entered_at"))
+            left = parse_iso(visit.get("left_at"))
+            if left and entered:
+                stay = span_text((left - entered).total_seconds() / 3600)
+            elif entered:
+                stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
+                open_visits += 1
+            else:
+                stay = "—"
+            draft_in = visit.get("draft_in")
+            draft_out = visit.get("draft_out")
+            if draft_in is None and draft_out is None:
+                draft = "—"
+            else:
+                draft = f"{fmt_number(draft_in)} → {fmt_number(draft_out)} м"
+            tree.insert("", "end", tags=(str(visit.get("mmsi")),), values=(
+                vessel.get("name") or f"MMSI {visit.get('mmsi')}",
+                visit.get("port"),
+                self.fmt_time(visit.get("entered_at")),
+                self.fmt_time(visit.get("left_at")) if left else "на месте",
+                stay, draft,
+                visit.get("cargo_kind") or self.cargo_kind_text(vessel),
+                "история" if visit.get("source") == "track" else "наблюдение",
+            ))
+        left_count = len(rows) - open_visits
+        where = f"в порту {port}" if port else "во всех наших портах"
+        self.visit_history_info.set(
+            f"Стоянок {where}: {len(rows)} (завершённых {left_count}, идут сейчас "
+            f"{open_visits}). Портов в базе: {len(counts)}. Стоянки считаются по "
+            f"геозоне порта; история из трека добавляется кнопкой «Загрузить из "
+            f"истории» во вкладке «Стоянки».")
+
     def build_expected(self):
         tk, ttk = self.tk, self.ttk
         frame = self.tab_expected
         top = ttk.Frame(frame)
         top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(top, text="Кто указал наш порт пунктом назначения — таблица портовых "
-                            "страниц AIS-catcher (открытая сеть приёмников, без ключа).",
-                  foreground="#555").pack(side="left")
-        ttk.Button(top, text="Обновить сейчас", command=self.refresh_expected_now
-                   ).pack(side="right")
+                            "страниц AIS-catcher (открытая сеть приёмников, без ключа). "
+                            "Страницы есть только у части портов, ETA передаёт сам "
+                            "капитан и обновляет его не всегда.",
+                  foreground="#555", wraplength=760, justify="left").pack(
+            side="left", fill="x", expand=True)
+        self.expected_button = ttk.Button(top, text="Обновить сейчас",
+                                         command=self.refresh_expected_now)
+        self.expected_button.pack(side="right")
         self.expected_info = tk.StringVar(value="")
-        ttk.Label(frame, textvariable=self.expected_info, foreground="#555").pack(
-            anchor="w", padx=8, pady=(0, 4))
+        ttk.Label(frame, textvariable=self.expected_info, foreground="#333",
+                  wraplength=1200, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
         self.expected_tree = self.make_tree(
             frame, (("port", "Порт", 110), ("name", "Судно", 180),
-                    ("type", "Тип", 130), ("eta", "Заявленный ETA", 140),
+                    ("type", "Тип", 130), ("eta", "Заявленный ETA", 200),
                     ("heard", "Последний сигнал", 150), ("mmsi", "MMSI", 100),
-                    ("updated", "Обновлено", 130)))
+                    ("updated", "Обновлено", 150)))
+        # Судно, чьё последнее сообщение AIS давно не приходило, — серым.
+        self.expected_tree.tag_configure("old", foreground="#8c8c8c")
         self.refresh_expected()
+        self.root.after(60000, self._expected_watch)
+
+    @staticmethod
+    def _heard_hours(text):
+        """«2m ago», «1h 3m ago», «16h 9m ago» — сколько часов назад это было."""
+        import re as _re
+        text = str(text or "")
+        found = _re.findall(r"(\d+)\s*([hm])", text)
+        if not found:
+            return None
+        hours = 0.0
+        for value, unit in found:
+            hours += int(value) / 60 if unit == "m" else int(value)
+        return hours
+
+    @staticmethod
+    def _eta_state(text):
+        """Прошёл ли заявленный ETA: строка вида «09 Nov 18:00» (без года)."""
+        from datetime import datetime as _dt
+        raw = str(text or "").strip()
+        try:
+            moment = _dt.strptime(raw, "%d %b %H:%M").replace(year=datetime.now().year)
+        except ValueError:
+            return None
+        if moment > datetime.now() + timedelta(days=300):   # ETA «прошлого года»
+            moment = moment.replace(year=moment.year - 1)
+        return round((moment - datetime.now()).total_seconds() / 3600, 1)
+
+    def _expected_watch(self):
+        """Раз в минуту смотрим, не обновил ли файл фоновый канал AIS-catcher."""
+        try:
+            stamp = portcalls.EXPECTED_PATH.stat().st_mtime
+        except OSError:
+            stamp = None
+        if stamp and stamp != getattr(self, "_expected_stamp", None):
+            self._expected_stamp = stamp
+            self.refresh_expected()
+        self.root.after(60000, self._expected_watch)
 
     def refresh_expected(self):
         tree = getattr(self, "expected_tree", None)
@@ -947,30 +1107,59 @@ class App:
             return
         for item in tree.get_children():
             tree.delete(item)
-        rows = portcalls.expected_rows()
-        for row in rows:
-            at = portcalls.load_cache().get("updated") or ""
-            when = at[:16].replace("T", " ") if at else "—"
-            tree.insert("", "end", values=(
-                row.get("port"), row.get("name"), row.get("type") or "—",
-                row.get("eta") or "—", row.get("last_heard") or "—",
-                row.get("mmsi"), when))
         cache = portcalls.load_cache()
+        self._expected_stamp = portcalls.EXPECTED_PATH.stat().st_mtime \
+            if portcalls.EXPECTED_PATH.exists() else None
+        rows = portcalls.expected_rows(cache)
+        updated_at = parse_iso(cache.get("updated"))
+        local_stamp = "—"
+        if updated_at is not None:
+            try:
+                local_stamp = (updated_at.astimezone() if updated_at.tzinfo
+                               else updated_at).strftime("%d.%m.%Y %H:%M")
+            except (ValueError, OSError):
+                local_stamp = updated_at.strftime("%d.%m.%Y %H:%M")
+        stale_rows = 0
+        for row in rows:
+            hours = self._heard_hours(row.get("last_heard"))
+            eta_hours = self._eta_state(row.get("eta"))
+            eta = row.get("eta") or "—"
+            if eta_hours is not None and eta_hours < -12:
+                eta += f" (прошёл {span_text(abs(eta_hours))} назад)"
+            tags = ("old",) if hours is not None and hours > 12 else ()
+            if tags:
+                stale_rows += 1
+            tree.insert("", "end", tags=tags, values=(
+                row.get("port"), row.get("name"), row.get("type") or "—",
+                eta, row.get("last_heard") or "—", row.get("mmsi"), local_stamp))
         ports = cache.get("ports") or {}
         failed = [entry.get("name") for entry in ports.values() if entry.get("error")]
         missing = [entry.get("name") for entry in ports.values() if entry.get("unsupported")]
         info = (f"Ожидается судов: {len(rows)} в портах: {len(ports)}."
                 if ports else "Данных пока нет: нажмите «Обновить сейчас».")
+        if updated_at:
+            now = datetime.now(updated_at.tzinfo) if updated_at.tzinfo else datetime.now()
+            minutes = int((now - updated_at).total_seconds() / 60)
+            info += (f" Таблица получена {local_stamp} (местное время, "
+                     f"{span_text(minutes / 60)} назад).")
+            interval = float(self.config.get("aci_minutes") or 60)
+            left = interval - minutes
+            if left > 0:
+                info += f" Автообновление примерно через {round(left)} мин."
         if failed:
             info += f" Не ответили: {', '.join(failed)}."
         if missing:
             info += f" Нет страницы у AIS-catcher: {', '.join(missing)}."
+        if stale_rows:
+            info += (f" Серым — {stale_rows} судов без сигнала AIS дольше 12 ч: "
+                     f"их ETA уже не значит ничего.")
         if cache.get("stale"):
             info += (" Сейчас страницы отдают 0 судов — показан прошлый список "
                      f"от {(cache.get('updated') or '—')[:16].replace('T', ' ')}.")
         if rows:
-            info += (" Заявленный ETA — то, что передал капитан (UTC); у некоторых "
-                     "судов он устарел — смотрите колонку «Последний сигнал».")
+            info += (" Заявленный ETA — то, что передал капитан (UTC); если ETA прошёл "
+                     "несколько дней назад — капитан его не обновил, судно идёт по "
+                     "старому плану.")
         self.expected_info.set(info)
 
     def refresh_expected_now(self):
@@ -978,6 +1167,11 @@ class App:
             self.log("Обновление ожидаемых уже идёт — подождите.")
             return
         self._expected_loading = True
+        button = getattr(self, "expected_button", None)
+        if button is not None:
+            button.configure(state="disabled", text="Обновляю… (до 1 мин)")
+        self.expected_info.set("Запрашиваю портовые страницы AIS-catcher: "
+                               "6 портов, на каждый до 45 с. Таблица обновится сама.")
         threading.Thread(target=self._expected_worker, daemon=True).start()
 
     def _expected_worker(self):
@@ -993,9 +1187,15 @@ class App:
         finally:
             self._expected_loading = False
             try:
-                self.root.after(0, self.refresh_expected)
+                self.root.after(0, self._expected_done)
             except Exception:
                 pass
+
+    def _expected_done(self):
+        button = getattr(self, "expected_button", None)
+        if button is not None:
+            button.configure(state="normal", text="Обновить сейчас")
+        self.refresh_expected()
 
     def build_alerts(self):
         ttk = self.ttk
@@ -1286,6 +1486,7 @@ class App:
         self.var_interval = tk.StringVar(value=str(self.config.get("position_interval_seconds", 60)))
         self.var_stale = tk.StringVar(value=str(self.config.get("stale_minutes", 15)))
         self.var_watch_km = tk.StringVar(value=str(self.config.get("port_watch_km", 50)))
+        self.var_area_km = tk.StringVar(value=str(self.config.get("area_radius_km", 900)))
 
         # Чекбоксы для выбора портов отслеживания
         ports_list = self.config.get("ports") or []
@@ -1338,6 +1539,10 @@ class App:
             ("Радиус интереса, км", self.var_watch_km,
              "Судно ближе этого расстояния к нашему порту считается своим и показывается "
              "на карте. 20–30 км — порт и подходы; больше — на карту попадёт транзит."),
+            ("Район вокруг портов, км", self.var_area_km,
+             "Граница вкладки «Все суда»: судно в этом радиусе от любого нашего порта "
+             "записывается в базу и показывается в списке. 800–1000 км — всё Чёрное "
+             "море с подходами; 900 — по умолчанию."),
         ]
         for index, (title, var, hint) in enumerate(fields):
             r = fields_start + index * 2
@@ -2119,10 +2324,29 @@ class App:
         self.refresh_vessels_table()
         self.refresh_sea_table()
         self.refresh_visits()
+        if hasattr(self, "visit_history_tree"):
+            self.refresh_visit_history()
         self.refresh_alerts()
         self.update_detail()
         self.update_track()
         self.redraw_map()
+
+    def on_tab_changed(self, event=None):
+        """При переключении вкладки сразу читаем данные, а не ждём такта."""
+        try:
+            tab = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            return
+        if tab is getattr(self, "tab_visit_history", None):
+            self.refresh_visit_history()
+        elif tab is getattr(self, "tab_visits", None):
+            self.refresh_visits()
+        elif tab is getattr(self, "tab_expected", None):
+            self.refresh_expected()
+        elif tab is getattr(self, "tab_vessels", None):
+            self.refresh_vessels_table()
+        elif tab is getattr(self, "tab_sea", None):
+            self.refresh_sea_table()
 
     def refresh_targets_table(self):
         tree = self.targets_tree
@@ -2155,7 +2379,13 @@ class App:
         updated = (rows[0].get("updated") or "")[:16].replace("T", " ") if rows else ""
         expected_map = {str(row.get("mmsi") or ""): row for row in rows}
         seen = set()
-        for vessel in self.core.related_vessels(500):
+        try:
+            vessels = self.core.area_vessels(2000)
+        except Exception as error:
+            self.log(f"Список «Все суда»: {error}")
+            vessels = []
+        radius = self.core.area_radius_km()
+        for vessel in vessels:
             mmsi = str(vessel.get("mmsi"))
             seen.add(mmsi)
             info = expected_map.get(mmsi)
@@ -2204,6 +2434,16 @@ class App:
                 f"сигнал {row.get('last_heard') or '—'} · AIS-catcher {updated}",
                 mmsi,
             ))
+        try:
+            near = sum(1 for vessel in vessels if vessel.get("lat") is not None)
+        except Exception:
+            near = 0
+        if hasattr(self, "vessels_info"):
+            self.vessels_info.set(
+                f"Судов в базе района: {len(vessels)} (с позицией {near}), "
+                f"ожидаемых из AIS-catcher: {len(rows)}. Радиус района: {radius:.0f} км "
+                f"от каждого порта — меняется во вкладке «Фильтры». "
+                f"Обновляется само; двойной щелчок открывает карточку.")
 
     def refresh_sea_table(self):
         """Обновляет вкладку «В море»: только свежие позиции вне портов."""
@@ -2217,6 +2457,19 @@ class App:
         except Exception as error:
             self.log(f"Список «В море»: {error}")
             rows = []
+        linked = []
+        for vessel in rows:
+            ours = self.core.destination_is_ours(vessel.get("destination"))
+            was = self.core.was_in_our_port(vessel.get("mmsi"))
+            vessel["dest_ours"] = ours
+            vessel["was_in_port"] = was
+            if ours or was:
+                linked.append(vessel)
+        hidden = len(rows) - len(linked)
+        show_all = bool(getattr(self, "var_sea_all", None) is not None
+                        and self.var_sea_all.get())
+        if not show_all:
+            rows = linked
         moved = 0
         for vessel in rows:
             try:
@@ -2231,11 +2484,16 @@ class App:
                             f"{voyage.get('port') or '—'}")
             elif voyage.get("port"):
                 distance = f"→ {voyage.get('port')}"
+            note = ""
+            if vessel.get("dest_ours"):
+                note = " · наш порт"
+            elif vessel.get("was_in_port"):
+                note = " · вышло из нашего порта"
             tree.insert("", "end", tags=(vessel["mmsi"],), values=(
                 vessel.get("name") or "—",
                 flags.flag_text(vessel.get("mmsi")),
                 vessel.get("type_label") or "—",
-                vessel.get("destination") or "—",
+                (vessel.get("destination") or "—") + note,
                 fmt_number(vessel.get("sog")),
                 self.course_text(vessel),
                 distance,
@@ -2244,7 +2502,7 @@ class App:
                 vessel.get("mmsi"),
             ))
         try:
-            others = self.core.traffic_vessels(400)
+            others = self.core.traffic_vessels(400) if show_all else []
         except Exception as error:
             self.log(f"Трафик района: {error}")
             others = []
@@ -2274,10 +2532,12 @@ class App:
         except Exception:
             silent = []
         self.sea_info.set(
-            f"Суда у наших портов и идущие в них: {len(rows)} (под ходом {moved}, "
-            f"на рейде/якоре {len(rows) - moved}). "
-            f"Трафик района: {len(others)}. Без сигнала AIS: {len(silent)} — они остаются "
-            f"во вкладке «Все суда». Обновляется само; двойной щелчок открывает карточку.")
+            f"В море и связаны с нашими портами: {len(rows)} "
+            f"(под ходом {moved}, на рейде/якоре {len(rows) - moved}). "
+            f"Скрыто несвязанного трафика: {hidden}."
+            + (f" Трафик района показан: {len(others)}." if show_all else "")
+            + f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
+              f"Обновляется само; двойной щелчок открывает карточку.")
 
     def course_text(self, vessel):
         """Курс судна в градусах и по стороне света."""
@@ -2433,6 +2693,7 @@ class App:
             interval = float(str(self.var_interval.get()).replace(",", "."))
             stale = float(str(self.var_stale.get()).replace(",", "."))
             watch_km = float(str(getattr(self, "var_watch_km", None).get() or 50).replace(",", "."))
+            area_km = float(str(getattr(self, "var_area_km", None).get() or 900).replace(",", "."))
             snapshot_minutes = float(str(getattr(self, "var_snapshot_minutes", None).get() or 10)
                                      .replace(",", "."))
         except ValueError:
@@ -2503,6 +2764,7 @@ class App:
             "position_interval_seconds": interval,
             "stale_minutes": max(0.0, stale),
             "port_watch_km": max(0.0, watch_km),
+            "area_radius_km": max(50.0, min(1500.0, area_km)),
             "telegram_token": self.var_token.get().strip(),
             "telegram_chat_id": self.var_chat.get().strip(),
             "telegram_commands": bool(self.var_commands.get()),

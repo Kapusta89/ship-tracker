@@ -57,6 +57,9 @@ DEFAULT_CONFIG = {
     # сколько часов позиция считается «сейчас в море», а не историей
     "sea_fresh_hours": 12,
     "port_watch_km": 30,
+    # всё, что попадает в этот радиус от любого нашего порта, — «своё» судно:
+    # пишется в базу и показывается во вкладке «Все суда» (800–1000 км)
+    "area_radius_km": 900,
     "use_history": True,
     "use_vf": False,
     "use_vfa": False,
@@ -790,9 +793,15 @@ class RadarCore:
         return rows
 
     # ------------------------------------------------ только «наши» суда
-    def _vessel_related(self, mmsi, lat=None, lon=None, vessel=None, destination=None) -> bool:
+    def _vessel_related(self, mmsi, lat=None, lon=None, vessel=None, destination=None,
+                        area=False) -> bool:
         """Относится ли судно к нашим портам: стоит/проходит рядом, был в порту
-        или следует в него/из него по данным AIS."""
+        или следует в него/из него по данным AIS.
+
+        area=True добавляет проверку по широкому району (`area_radius_km`):
+        так судно, идущее через Чёрное море в сотнях километров от порта,
+        тоже записывается в базу и попадает во вкладку «Все суда».
+        """
         mmsi = str(mmsi)
         ports = self.config.get("ports") or []
         if ports and lat is not None and lon is not None:
@@ -807,6 +816,8 @@ class RadarCore:
             return True
         if ports and lat is not None and lon is not None:
             watch = float(self.config.get("port_watch_km") or 0)
+            if area:
+                watch = max(watch, self.area_radius_km())
             if watch > 0:
                 for port in ports:
                     try:
@@ -816,6 +827,27 @@ class RadarCore:
                     if distance <= watch:
                         return True
         return False
+
+    def area_radius_km(self) -> float:
+        """Радиус района вокруг портов, по которому суда считаются своими."""
+        try:
+            value = float(self.config.get("area_radius_km") or 0)
+        except (TypeError, ValueError):
+            value = 900.0
+        return max(0.0, min(1500.0, value))
+
+    def port_names(self) -> list:
+        """Все написания наших портов, как они бывают в поле Destination."""
+        variants = geo.port_aliases(self.config.get("ports") or [])
+        return [variant for group in variants.values() for variant in group]
+
+    def destination_is_ours(self, text) -> bool:
+        """Стоит ли в Destination нашего судна один из наших портов."""
+        return bool(text) and bool(matched_port(text, self.port_names()))
+
+    def was_in_our_port(self, mmsi) -> bool:
+        """Было ли судно в нашем порту или вышло оттуда за последние дни."""
+        return self._history_related(mmsi)
 
     def _history_related(self, mmsi) -> bool:
         """Был ли визит в наш порт / выход из него. Ответ кэшируется на минуту:
@@ -844,6 +876,35 @@ class RadarCore:
         return [vessel for vessel in self.store.vessels(limit)
                 if self._vessel_related(vessel.get("mmsi"), vessel.get("lat"),
                                         vessel.get("lon"), vessel)]
+
+    def area_vessels(self, limit=2000) -> list:
+        """Все суда района — в радиусе `area_radius_km` от любого нашего порта.
+
+        В базу такие суда уже пишутся (проверка района есть при сохранении),
+        поэтому здесь достаточно отдать записи: они и есть «все суда» вкладки.
+        """
+        try:
+            rows = self.store.vessels(limit)
+        except Exception:
+            return []
+        radius = self.area_radius_km()
+        ports = self.config.get("ports") or []
+        result = []
+        for row in rows:
+            lat, lon = row.get("lat"), row.get("lon")
+            if lat is None or lon is None:
+                result.append(row)
+                continue
+            if self._vessel_related(row.get("mmsi"), lat, lon, row, area=True):
+                result.append(row)
+                continue
+            nearest = min((geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+                           for port in ports
+                           if port.get("lat") is not None and port.get("lon") is not None),
+                          default=None)
+            if nearest is not None and nearest <= radius:
+                result.append(row)
+        return result
 
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
@@ -1011,7 +1072,8 @@ class RadarCore:
             mmsi = vessel.get("mmsi")
             if not mmsi:
                 continue
-            if self._vessel_related(mmsi, vessel.get("lat"), vessel.get("lon"), vessel):
+            if self._vessel_related(mmsi, vessel.get("lat"), vessel.get("lon"), vessel,
+                                    area=True):
                 self.store.set_tracked(mmsi, True)
             else:
                 self.store.drop_vessel(mmsi)
@@ -1145,7 +1207,8 @@ class RadarCore:
             return
         before = self.store.vessel(mmsi)
         # в базу попадают только суда, связанные с нашими портами
-        if not self._vessel_related(mmsi, None, None, before, destination=event.get("destination")):
+        if not self._vessel_related(mmsi, None, None, before,
+                                    destination=event.get("destination"), area=True):
             if before is not None:
                 self.store.drop_vessel(mmsi)
             return
@@ -1183,7 +1246,7 @@ class RadarCore:
         port = geo.port_at(lat, lon, self.config.get("ports") or [])
         port_name = port["name"] if port else None
         vessel = self.store.vessel(mmsi)
-        if not self._vessel_related(mmsi, lat, lon, vessel):
+        if not self._vessel_related(mmsi, lat, lon, vessel, area=True):
             # чужое судно: в базу не пишем, а ранее записанное — убираем,
             # но позицию сохраняем в трафик района для вкладки «В море»
             if vessel is not None:

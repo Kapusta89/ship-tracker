@@ -293,18 +293,35 @@ class Store:
                 (mmsi, port, entered, left, draft_in, draft_out, cargo_kind, source))
             return True
 
-    def visits(self, limit=300, mmsi=None):
+    def visits(self, limit=300, mmsi=None, port=None):
         """Все визиты в порты: кто, когда пришёл/ушёл и сколько стоял."""
         query = "SELECT * FROM port_visits"
         params = []
+        conditions = []
         if mmsi:
-            query += " WHERE mmsi = ?"
+            conditions.append("mmsi = ?")
             params.append(str(mmsi))
+        if port:
+            conditions.append("UPPER(port) = ?")
+            params.append(str(port).strip().upper())
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY entered_at DESC LIMIT ?"
         params.append(limit)
         with self._lock:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def visit_counts(self) -> dict:
+        """Сколько визитов и сколько судов было в каждом нашем порту."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT UPPER(port) AS port, COUNT(*) AS visits,"
+                " COUNT(DISTINCT mmsi) AS vessels, MAX(entered_at) AS last"
+                " FROM port_visits GROUP BY UPPER(port)").fetchall()
+        return {row["port"]: {"visits": int(row["visits"]),
+                              "vessels": int(row["vessels"]),
+                              "last": row["last"]} for row in rows}
 
     def has_visits(self, mmsi: str) -> bool:
         """Было ли судно хотя бы раз в одном из наших портов."""
