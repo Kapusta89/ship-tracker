@@ -1948,7 +1948,7 @@ class App:
                 vessels = self.core.port_vessels(600)
                 traffic = []
             else:
-                vessels = self.core.related_vessels(1000)
+                vessels = self.core.related_vessels(3000)
                 traffic = []
                 if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
                     try:
@@ -2597,7 +2597,7 @@ class App:
         for item in tree.get_children():
             tree.delete(item)
         try:
-            rows = self.core.sea_vessels(500)
+            rows = self.core.sea_vessels(3000)
         except Exception as error:
             self.log(f"Список «В море»: {error}")
             rows = []
@@ -2669,7 +2669,7 @@ class App:
                 vessel.get("mmsi"),
             ))
         try:
-            silent = self.core.sea_without_position(500)
+            silent = self.core.sea_without_position(3000)
         except Exception:
             silent = []
         far = sum(1 for vessel in rows

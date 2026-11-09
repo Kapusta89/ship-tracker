@@ -1015,7 +1015,9 @@ class RadarCore:
         ports = self.config.get("ports") or []
         now = datetime.now()
         rows = []
-        for vessel in self.related_vessels(limit):
+        # после подключения дальних районов в базе тысячи судов, и «свежие
+        # 500» могут оказаться чужими: связанные с портами вытеснялись
+        for vessel in self.related_vessels(max(limit, 3000)):
             lat, lon = vessel.get("lat"), vessel.get("lon")
             if lat is None or lon is None:
                 continue
@@ -1043,7 +1045,7 @@ class RadarCore:
 
     def sea_without_position(self, limit=1000) -> list:
         """Связанные суда без позиции: сигнала AIS нет, но они в списке."""
-        return [vessel for vessel in self.related_vessels(limit)
+        return [vessel for vessel in self.related_vessels(max(limit, 3000))
                 if vessel.get("lat") is None or vessel.get("lon") is None]
 
     def profile_candidates(self, limit=200) -> list:
