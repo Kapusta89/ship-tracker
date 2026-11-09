@@ -12,6 +12,7 @@
 закрывается и порт становится «откуда вышел».
 """
 
+import functools
 import json
 import queue
 import re
@@ -245,29 +246,56 @@ def save_config(config: dict, path=None) -> Path:
 
 # -------------------------------------------------------------- сопоставление
 
+@functools.lru_cache(maxsize=8192)
 def norm(value) -> str:
     if value is None:
         return ""
-    return re.sub(r"\s+", " ", str(value)).strip().upper()
+    # split() без аргумента режет по любым пробельным и быстрее re.sub
+    return " ".join(str(value).split()).upper()
+
+
+# Слово в Destination: любые разделители (запятая, «>», «/», скобки) режем один раз.
+_WORD_SPLIT = re.compile(r"[^0-9A-Z]+")
 
 
 def port_matches(value, targets) -> bool:
-    """Ищет название порта внутри строки: «IZMAIL», «IZMAIL, UA», «IZMAIL>RENI»."""
+    """Ищет название порта внутри строки: «IZMAIL», «IZMAIL, UA», «IZMAIL>RENI».
+
+    Проверка по готовым словам, а не регуляркой на каждое название: срабатывает
+    на каждом сообщении AIS для каждого судна, и старая версия съедала
+    секунды на каждом обновлении карты.
+    """
     text = norm(value)
     if not text:
         return False
+    words = None
     for target in targets or []:
         target = norm(target)
-        if target and re.search(r"\b" + re.escape(target) + r"\b", text):
+        if not target:
+            continue
+        if " " in target:
+            if target in text:
+                return True
+            continue
+        if words is None:
+            words = set(_WORD_SPLIT.split(text))
+        if target in words:
             return True
     return False
 
 
 def matched_port(value, targets):
     """Название цели, которая совпала (для подписи в интерфейсе)."""
+    text = norm(value)
+    if not text:
+        return None
+    words = set(_WORD_SPLIT.split(text))
     for target in targets or []:
-        if port_matches(value, [target]):
-            return norm(target)
+        target = norm(target)
+        if not target:
+            continue
+        if (target in text) if " " in target else (target in words):
+            return target
     return None
 
 
@@ -827,8 +855,7 @@ class RadarCore:
                 return True
         if self._history_related(mmsi):
             return True
-        variants = geo.port_aliases(ports)
-        names = [variant for group in variants.values() for variant in group]
+        names = self._destination_names(ports)
         text = destination if destination is not None else (vessel or {}).get("destination")
         if text and matched_port(text, names):
             return True
@@ -938,6 +965,21 @@ class RadarCore:
         """Было ли судно в нашем порту или вышло оттуда за последние дни."""
         return self._history_related(mmsi)
 
+    def _destination_names(self, ports) -> list:
+        """Все варианты наших портов для поля Destination — с кэшем.
+
+        Список строится один раз на настройки, а не для каждого судна:
+        он одинаков для всей выборки и меняется только в настройках портов.
+        """
+        key = tuple(norm(port.get("name")) for port in ports or [])
+        cached = getattr(self, "_names_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        variants = geo.port_aliases(ports)
+        names = [variant for group in variants.values() for variant in group]
+        self._names_cache = (key, names)
+        return names
+
     def _history_related(self, mmsi) -> bool:
         """Был ли визит в наш порт / выход из него. Ответ кэшируется на минуту:
         иначе на каждое сообщение AIS шло бы по два запроса в базу."""
@@ -955,6 +997,20 @@ class RadarCore:
         cache[mmsi] = (value, now)
         return value
 
+    def _cached_selection(self, key, builder, seconds=2.0) -> list:
+        """Отбор судов с коротким кэшем: карта перерисовывается чаще, чем
+        меняются данные, и пересчитывать сотни судов на каждый кадр незачем."""
+        now = time.monotonic()
+        cached = getattr(self, "_selection_cache", None)
+        if cached is None:
+            cached = self._selection_cache = {}
+        hit = cached.get(key)
+        if hit and now - hit[0] < seconds:
+            return hit[1]
+        value = builder()
+        cached[key] = (now, value)
+        return value
+
     def related_vessels(self, limit=1000) -> list:
         """Только суда, связанные с нашими портами — для карты и списков.
 
@@ -962,9 +1018,12 @@ class RadarCore:
         прошло рядом и ушло в море, может ещё полежать в базе. На экран оно
         уже не попадает: фильтр проверяется при каждой отрисовке.
         """
-        return [vessel for vessel in self.store.vessels(limit)
-                if self._vessel_related(vessel.get("mmsi"), vessel.get("lat"),
-                                        vessel.get("lon"), vessel)]
+        def select():
+            return [vessel for vessel in self.store.vessels(limit)
+                    if self._vessel_related(vessel.get("mmsi"), vessel.get("lat"),
+                                            vessel.get("lon"), vessel)]
+
+        return self._cached_selection(("related", limit), select)
 
     def area_vessels(self, limit=2000) -> list:
         """Все суда района — в радиусе `area_radius_km` от любого нашего порта.
@@ -972,28 +1031,31 @@ class RadarCore:
         В базу такие суда уже пишутся (проверка района есть при сохранении),
         поэтому здесь достаточно отдать записи: они и есть «все суда» вкладки.
         """
-        try:
-            rows = self.store.vessels(limit)
-        except Exception:
-            return []
-        radius = self.area_radius_km()
-        ports = self.config.get("ports") or []
-        result = []
-        for row in rows:
-            lat, lon = row.get("lat"), row.get("lon")
-            if lat is None or lon is None:
-                result.append(row)
-                continue
-            if self._vessel_related(row.get("mmsi"), lat, lon, row, area=True):
-                result.append(row)
-                continue
-            nearest = min((geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
-                           for port in ports
-                           if port.get("lat") is not None and port.get("lon") is not None),
-                          default=None)
-            if nearest is not None and nearest <= radius:
-                result.append(row)
-        return result
+        def select():
+            try:
+                rows = self.store.vessels(limit)
+            except Exception:
+                return []
+            radius = self.area_radius_km()
+            ports = self.config.get("ports") or []
+            result = []
+            for row in rows:
+                lat, lon = row.get("lat"), row.get("lon")
+                if lat is None or lon is None:
+                    result.append(row)
+                    continue
+                if self._vessel_related(row.get("mmsi"), lat, lon, row, area=True):
+                    result.append(row)
+                    continue
+                nearest = min((geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+                               for port in ports
+                               if port.get("lat") is not None and port.get("lon") is not None),
+                              default=None)
+                if nearest is not None and nearest <= radius:
+                    result.append(row)
+            return result
+
+        return self._cached_selection(("area", limit), select, seconds=3.0)
 
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.

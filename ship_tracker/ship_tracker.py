@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.1"
+APP_VERSION = "2026.12.2"
 
 import ais_feed
 import cargo
@@ -2515,7 +2516,13 @@ class App:
             self._targets = {}
         if hasattr(self, "targets_tree"):
             self.refresh_targets_table()
-        self.refresh_vessels_table()
+        # «Все суда» — самая тяжёлая таблица (тысячи строк): не пересобираем её
+        # каждые три секунды, иначе окно постоянно занято и карта тормозит.
+        # Заход на вкладку и кнопка «Обновить» пересобирают её сразу.
+        now = time.monotonic()
+        if now - getattr(self, "_vessels_drawn_at", 0.0) >= 8.0:
+            self.refresh_vessels_table()
+            self._vessels_drawn_at = now
         self.refresh_sea_table()
         self.refresh_visits()
         if hasattr(self, "visit_history_tree"):
