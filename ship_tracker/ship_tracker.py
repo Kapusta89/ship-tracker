@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.23"
+APP_VERSION = "2026.11.24"
 
 import ais_feed
 import cargo
@@ -835,9 +835,10 @@ class App:
         frame = self.tab_sea
         ttk.Label(frame, text="Все суда в море, которые как-либо связаны с нашими портами, на "
                               "любом расстоянии: у судна в Destination стоит наш порт или оно "
-                              "стояло/выходило из нашего порта. Кнопки портов оставляют только "
-                              "суда, связанные с выбранным портом. Расстояние и прибытие — по "
-                              "прямой и текущей скорости; заявленный капитаном ETA — в карточке.",
+                              "стояло/выходило из нашего порта. Суда, которые только проходят "
+                              "рядом, не показываются. Кнопки портов оставляют только суда, "
+                              "связанные с выбранным портом. Расстояние и прибытие — по прямой "
+                              "и текущей скорости; заявленный капитаном ETA — в карточке.",
                   foreground="#555", wraplength=1200, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
         port_bar = ttk.Frame(frame)
@@ -858,7 +859,7 @@ class App:
         self.sea_tree = self.make_tree(
             frame, (("name", "Судно", 170), ("flag", "Флаг", 140),
                     ("type", "Тип", 105), ("dest", "Назначение", 140),
-                    ("link", "Связь с портом", 170),
+                    ("link", "Связь с портом", 190),
                     ("sog", "Узлы", 55), ("course", "Курс", 70),
                     ("distance", "До порта", 145), ("eta", "Прибытие", 150),
                     ("updated", "Обновлено", 125), ("mmsi", "MMSI", 95)))
@@ -2561,20 +2562,17 @@ class App:
             f"«Все суда». Обновляется само; двойной щелчок открывает карточку.")
 
     def sea_link_text(self, vessel, voyage=None):
-        """Чем судно связано с нашими портами: идёт в порт, был в нём, сколько км до него."""
+        """Чем судно связано с нашими портами: идёт в порт или был в нём."""
         links = vessel.get("links") or {}
         parts = []
         for name in sorted(links):
-            info = links[name] or {}
-            kind = info.get("kind")
+            kind = (links[name] or {}).get("kind")
             if kind == "идёт":
                 parts.append(f"идёт в {name}")
             elif kind == "был":
                 parts.append(f"был в {name}")
-            elif info.get("km") is not None:
-                parts.append(f"в {round(info['km'])} км от {name}")
             else:
-                parts.append(f"рядом с {name}")
+                parts.append(name)
         return " · ".join(parts) or "—"
 
     def course_text(self, vessel):

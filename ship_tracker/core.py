@@ -837,12 +837,12 @@ class RadarCore:
         return max(0.0, min(1500.0, value))
 
     def vessel_links(self, vessel, visit_ports=None) -> dict:
-        """Связи судна с нашими портами: {порт: {"kind": «идёт»|«был»|«рядом», km}}.
+        """Связи судна с нашими портами: {порт: {"kind": «идёт» | «был»}}.
 
         «Идёт» — порт в поле Destination; «был» — программа видела визит
-        (стоял или выходил); «рядом» — судно в пределах `port_watch_km` от
-        порта. Расстояние при этом не важно: далёкое судно с нашим портом
-        в Destination тоже связано с ним.
+        (стоял в порту или выходил оттуда). Расстояние не важно: далёкое
+        судно с нашим портом в Destination тоже связано с ним. Судно, которое
+        просто проходит рядом с портом, связанным не считается.
         """
         links = {}
         if not vessel:
@@ -868,23 +868,26 @@ class RadarCore:
                             links[name] = {"kind": "был"}
                 except Exception:
                     pass
-        lat, lon = vessel.get("lat"), vessel.get("lon")
-        try:
-            watch = float(self.config.get("port_watch_km") or 0)
-        except (TypeError, ValueError):
-            watch = 0.0
-        if lat is not None and lon is not None and watch > 0:
-            for port in ports:
-                name = str(port.get("name") or "").strip().upper()
-                if not name or name in links:
-                    continue
-                try:
-                    km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if km <= watch:
-                    links[name] = {"kind": "рядом", "km": km}
         return links
+
+    def linked_vessels(self, limit=2000) -> list:
+        """Суда, связанные с нашими портами по данным AIS, без ограничения
+        по расстоянию: наш порт в Destination или визит в наш порт.
+        Просто проходящие рядом суда сюда не попадают.
+        """
+        try:
+            visit_ports = self.store.visit_ports()
+        except Exception:
+            visit_ports = {}
+        result = []
+        try:
+            rows = self.store.vessels(limit)
+        except Exception:
+            return result
+        for vessel in rows:
+            if self.vessel_links(vessel, visit_ports):
+                result.append(vessel)
+        return result
 
     def _history_related(self, mmsi) -> bool:
         """Был ли визит в наш порт / выход из него. Ответ кэшируется на минуту:
@@ -946,10 +949,11 @@ class RadarCore:
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
 
-        Берём только связанные с нашими портами суда, у которых есть свежая
-        позиция вне портовых геозон. «В море» — это и идущие под ходом, и те,
-        кто стоит на рейде или на якоре перед входом: любой, кто не в порту.
-        Порядок: сначала под ходом (быстрее — выше), потом остальные.
+        Берём только связанные с нашими портами суда (наш порт в Destination
+        или визит в наш порт) с свежей позицией вне портовых геозон; суда,
+        которые лишь проходят рядом, не показываются. «В море» — это и идущие
+        под ходом, и те, кто стоит на рейде или на якоре перед входом: любой,
+        кто не в порту. Порядок: сначала под ходом (быстрее — выше).
         """
         try:
             fresh_hours = float(self.config.get("sea_fresh_hours") or 12)
@@ -958,7 +962,7 @@ class RadarCore:
         ports = self.config.get("ports") or []
         now = datetime.now()
         rows = []
-        for vessel in self.related_vessels(limit):
+        for vessel in self.linked_vessels(limit):
             lat, lon = vessel.get("lat"), vessel.get("lon")
             if lat is None or lon is None:
                 continue
