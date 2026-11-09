@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.30"
+APP_VERSION = "2026.11.31"
 
 import ais_feed
 import cargo
@@ -837,6 +837,8 @@ class App:
                         command=self.toggle_schematic).pack(side="left", padx=(8, 0))
         ttk.Label(toolbar, text="колесо — масштаб, перетаскивание — сдвиг, клик — карточка судна",
                   foreground="#777").pack(side="left", padx=12)
+        ttk.Button(toolbar, text="Обновить",
+                   command=lambda: self.refresh_tab(self.tab_radar)).pack(side="right")
 
         self.photo_label = tk.Label(panel, text="фото судна", background="#eef2f4",
                                     foreground="#777", height=9, width=34,
@@ -1570,6 +1572,13 @@ class App:
     def build_filters(self):
         tk, ttk = self.tk, self.ttk
         frame = self.tab_filters
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(top, text="Кнопка «Обновить» перечитывает сохранённые настройки "
+                            "из файла и затирает несохранённые правки.",
+                  foreground="#555").pack(side="left")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_tab(self.tab_filters)).pack(side="right")
         box = ttk.Frame(frame)
         box.pack(fill="x", padx=10, pady=8)
         box.columnconfigure(1, weight=1)
@@ -1688,6 +1697,9 @@ class App:
 
         ttk.Button(box, text="Отправить тестовое сообщение",
                    command=self.test_telegram).grid(row=3, column=1, sticky="w", pady=8)
+        ttk.Button(box, text="Обновить",
+                   command=lambda: self.refresh_tab(self.tab_telegram)
+                   ).grid(row=3, column=2, sticky="w", pady=8)
 
         ttk.Label(
             frame,
@@ -1710,8 +1722,12 @@ class App:
         canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
         scroll.pack(side="right", fill="y", padx=(0, 10), pady=8)
 
-        ttk.Label(inner, text="Альтернативные источники AIS и сервисы для проверки судов",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(0, 6))
+        top = ttk.Frame(inner)
+        top.pack(fill="x", pady=(0, 6))
+        ttk.Label(top, text="Альтернативные источники AIS и сервисы для проверки судов",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_tab(self.tab_services)).pack(side="right")
         ttk.Label(inner, text="Можно использовать как запасной источник или для перепроверки по MMSI/IMO",
                   foreground="#555").pack(anchor="w", pady=(0, 12))
 
@@ -1771,6 +1787,8 @@ class App:
                    command=lambda: (self.log_text.configure(state="normal"),
                                     self.log_text.delete("1.0", "end"),
                                     self.log_text.configure(state="disabled"))).pack(side="left")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_tab(self.tab_log)).pack(side="left", padx=(6, 0))
         ttk.Label(top, text=f"База: {DB_PATH}", foreground="#777").pack(side="right")
         self.log_text = tk.Text(frame, state="disabled", wrap="word", font=("Consolas", 9))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
@@ -2480,16 +2498,83 @@ class App:
             tab = self.notebook.nametowidget(self.notebook.select())
         except Exception:
             return
-        if tab is getattr(self, "tab_visit_history", None):
-            self.refresh_visit_history()
-        elif tab is getattr(self, "tab_visits", None):
-            self.refresh_visits()
-        elif tab is getattr(self, "tab_expected", None):
-            self.refresh_expected()
-        elif tab is getattr(self, "tab_vessels", None):
-            self.refresh_vessels_table()
-        elif tab is getattr(self, "tab_sea", None):
-            self.refresh_sea_table()
+        self.refresh_tab(tab)
+
+    def refresh_tab(self, tab=None):
+        """Обновляет данные выбранной вкладки — при заходе и по кнопке."""
+        if tab is None:
+            try:
+                tab = self.notebook.nametowidget(self.notebook.select())
+            except Exception:
+                return
+        try:
+            if tab is getattr(self, "tab_radar", None):
+                self.redraw_map()
+                if hasattr(self, "targets_tree"):
+                    self.refresh_targets_table()
+                self.update_detail(force=True)
+            elif tab is getattr(self, "tab_visit_history", None):
+                self.refresh_visit_history()
+            elif tab is getattr(self, "tab_visits", None):
+                self.refresh_visits()
+            elif tab is getattr(self, "tab_expected", None):
+                self.refresh_expected()
+            elif tab is getattr(self, "tab_vessels", None):
+                self.refresh_vessels_table()
+            elif tab is getattr(self, "tab_sea", None):
+                self.refresh_sea_table()
+            elif tab is getattr(self, "tab_alerts", None):
+                self.refresh_alerts()
+            elif tab is getattr(self, "tab_connection", None):
+                self.update_feed_status()
+                self.update_key_info()
+            elif tab is getattr(self, "tab_filters", None):
+                self.reload_filter_fields()
+            elif tab is getattr(self, "tab_telegram", None):
+                self.reload_telegram_fields()
+            elif tab is getattr(self, "tab_services", None):
+                self.update_feed_status()
+            elif tab is getattr(self, "tab_log", None):
+                self.log_text.see("end")
+        except Exception as error:
+            self.log(f"Обновление вкладки: {error}")
+
+    def reload_filter_fields(self):
+        """Перечитывает сохранённые настройки фильтров в поля вкладки."""
+        try:
+            config = self.core.config
+        except Exception:
+            return
+        pairs = (("var_dest", ", ".join(config.get("filter_destinations") or [])),
+                 ("var_orig", ", ".join(config.get("filter_origins") or [])),
+                 ("var_window", config.get("trip_window_hours", 96)),
+                 ("var_speed", config.get("min_speed_knots", 2)),
+                 ("var_cooldown", config.get("alert_cooldown_hours", 6)),
+                 ("var_history", config.get("history_days", 7)),
+                 ("var_interval", config.get("position_interval_seconds", 60)),
+                 ("var_stale_minutes", config.get("stale_minutes", 15)),
+                 ("var_watch_km", config.get("port_watch_km", 50)),
+                 ("var_area_km", config.get("area_radius_km", 900)))
+        for name, value in pairs:
+            var = getattr(self, name, None)
+            if var is not None:
+                var.set(str(value).replace(".0", "") if isinstance(value, float) else str(value))
+
+    def reload_telegram_fields(self):
+        """Перечитывает токен и chat_id из сохранённых настроек."""
+        try:
+            config = self.core.config
+        except Exception:
+            return
+        token = getattr(self, "var_token", None)
+        chat = getattr(self, "var_chat", None)
+        commands = getattr(self, "var_commands", None)
+        if token is not None:
+            token.set(str(config.get("telegram_token") or ""))
+        if chat is not None:
+            chat.set(str(config.get("telegram_chat_id") or ""))
+        if commands is not None:
+            commands.set(bool(config.get("telegram_commands", True)))
 
     def refresh_targets_table(self):
         tree = self.targets_tree
