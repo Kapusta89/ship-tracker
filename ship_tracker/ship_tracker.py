@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.3"
+APP_VERSION = "2026.12.4"
 
 import ais_feed
 import cargo
@@ -998,7 +998,9 @@ class App:
                  "путь до порта, сколько простоит и маршрут в море на оставшийся срок "
                  "(стоянка сутки — море три дня, стоянка двое — два дня). Стоянка оценивается "
                  "по прежним визитам этого судна, иначе по среднему в порту; если наблюдений "
-                 "нет — сутки. Скорость и курс берутся из AIS. Двойной щелчок открывает карточку.",
+                 "нет — сутки. Скорость и курс берутся из AIS. «Ит. путь» — сколько всего "
+                 "времени от текущего момента до выхода из порта, включая стоянку. "
+                 "Двойной щелчок открывает карточку.",
             foreground="#555", wraplength=1150, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
         bar = ttk.Frame(frame)
@@ -1010,7 +1012,8 @@ class App:
         self.forecast_tree = self.make_tree(
             frame, (("name", "Судно", 170), ("port", "Порт", 110),
                     ("arrival", "Приход", 145), ("stay", "Стоянка", 110),
-                    ("departure", "Выход", 145), ("sea", "Море", 100),
+                    ("departure", "Выход", 145), ("total", "Ит. путь", 175),
+                    ("sea", "Море", 100),
                     ("route", "Маршрут", 320), ("mmsi", "MMSI", 95)))
         self.forecast_tree.bind("<<TreeviewSelect>>", self.show_forecast_detail)
         self.forecast_tree.tag_configure("in_port", foreground="#1f7a52")
@@ -1095,12 +1098,19 @@ class App:
                 arrival_text = "нет позиции"
             else:
                 arrival_text = "не доходит"
+            # Итоговый путь — от текущего момента до выхода из порта:
+            # дорога до порта плюс стоянка.
+            total_text = "—"
+            if departure:
+                total_hours = max(0.0, (departure - datetime.now()).total_seconds() / 3600.0)
+                total_text = f"{forecast.duration_text(total_hours)} · {departure:%d.%m %H:%M}"
             tree.insert("", "end", iid=mmsi, tags=tags, values=(
                 vessel.get("name") or "—",
                 result.get("port_label") or result.get("port") or "—",
                 arrival_text,
                 forecast.duration_text(result.get("stay_hours")),
                 f"{departure:%d.%m %H:%M}" if departure else "—",
+                total_text,
                 forecast.duration_text(result.get("sea_hours")) if result.get("sea_hours") else "—",
                 forecast.plan_route_text(result),
                 mmsi))
@@ -2170,16 +2180,19 @@ class App:
                 # только причал и рейд: чужие точки района и суда в море не нужны
                 vessels = self.core.port_vessels(600)
                 traffic = []
-            else:
-                # На карте — все суда базы района, а не только «свои»: так видна
-                # вся обстановка у портов, а не несколько десятков точек.
+            elif getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
+                # Галочка «трафик района» включена: вся обстановка — вся база
+                # района плюс внешние точки, которых в базе ещё нет.
                 vessels = self.core.area_vessels(4000)
+                try:
+                    traffic = self.core.traffic_vessels(800)
+                except Exception:
+                    traffic = []
+            else:
+                # Галочка снята: остаются только «свои» суда (идут в наш порт,
+                # стояли в нём или рядом). Вся база района не рисуется.
+                vessels = self.core.related_vessels(3000)
                 traffic = []
-                if getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
-                    try:
-                        traffic = self.core.traffic_vessels(800)
-                    except Exception:
-                        traffic = []
             self.radar.draw(vessels, set(self._targets.keys()), traffic)
         except Exception as error:
             self.log(f"Отрисовка радара: {error}")
