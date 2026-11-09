@@ -303,6 +303,23 @@ def split_list(text) -> list:
     return [part.strip() for part in re.split(r"[,;\n]+", text or "") if part.strip()]
 
 
+def parse_chat_ids(value) -> list:
+    """Все chat_id из настроек: «123, -100456;789» → ['123', '-100456', '789'].
+
+    Один бот может работать на нескольких устройствах: у каждого свой чат,
+    поэтому в поле chat_id допускается несколько id через запятую.
+    """
+    result = []
+    for part in re.split(r"[,;\s]+", str(value or "")):
+        part = part.strip()
+        if not part:
+            continue
+        # u Telegram id числовые, у групп и каналов они отрицательные
+        if part.lstrip("-").isdigit() and part not in result:
+            result.append(part)
+    return result
+
+
 # ------------------------------------------------------------------ телеграм
 
 class TelegramError(AppError):
@@ -1923,7 +1940,7 @@ class RadarCore:
 
     def _telegram_ready(self) -> bool:
         return bool((self.config.get("telegram_token") or "").strip()
-                    and str(self.config.get("telegram_chat_id") or "").strip())
+                    and parse_chat_ids(self.config.get("telegram_chat_id")))
 
     def _maybe_alert(self, mmsi):
         if not self.alerts_enabled:
@@ -1960,21 +1977,31 @@ class RadarCore:
 
     def _send_alert(self, target, text):
         key = target["key"]
-        try:
-            send_telegram(self.config.get("telegram_token"),
-                          self.config.get("telegram_chat_id"), text)
-        except AppError as error:
+        # Алерт уходит во все чаты из настроек — по одному на устройство.
+        token = self.config.get("telegram_token")
+        chats = parse_chat_ids(self.config.get("telegram_chat_id"))
+        errors = []
+        sent = 0
+        for chat in chats or [""]:
+            try:
+                send_telegram(token, chat, text)
+                sent += 1
+            except AppError as error:
+                errors.append(str(error))
+        if not sent:
+            error_text = errors[0] if errors else "не задан chat_id"
             self.store.log_alert(key, target["mmsi"], target["name"], target["origin"],
-                                 target["destination"], False, str(error), text)
-            self.log(f"Алерт по {target['name']} не отправлен: {error}")
-            self.on_alert({**target, "ok": False, "error": str(error), "text": text})
+                                 target["destination"], False, error_text, text)
+            self.log(f"Алерт по {target['name']} не отправлен: {error_text}")
+            self.on_alert({**target, "ok": False, "error": error_text, "text": text})
             return
 
         self.store.log_alert(key, target["mmsi"], target["name"], target["origin"],
                              target["destination"], True, None, text)
         self.stats["alerts"] += 1
-        self.log(f"Алерт отправлен: {target['name']} {target['origin']} → {target['destination']}.")
-        self.on_alert({**target, "ok": True, "error": "", "text": text})
+        self.log(f"Алерт отправлен: {target['name']} {target['origin']} → {target['destination']} "
+                 f"(чатов: {sent}).")
+        self.on_alert({**target, "ok": True, "error": "; ".join(errors), "text": text})
 
     # ------------------------------------------------------------- отчёты
     def status_text(self) -> str:
@@ -2116,8 +2143,8 @@ class BotCommander(threading.Thread):
             self.reply(chat_id, f"chat_id этого чата: {chat_id}")
             return
 
-        owner = str(self.config.get("telegram_chat_id") or "").strip()
-        if owner and str(chat_id) != owner:
+        owners = parse_chat_ids(self.config.get("telegram_chat_id"))
+        if owners and str(chat_id) not in owners:
             self.reply(chat_id, "Доступ запрещён: этот чат не указан в настройках.")
             return
 

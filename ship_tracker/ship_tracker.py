@@ -29,7 +29,6 @@ import subprocess
 import sys
 import threading
 import time
-import time
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.4"
+APP_VERSION = "2026.12.5"
 
 import ais_feed
 import cargo
@@ -51,9 +50,10 @@ import metrics
 import photos
 import portcalls
 import services_feed
-from core import (AppError, BotCommander, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
+from core import (AppError, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
                   duration_text, fmt_moment, fmt_number, fmt_tons, load_config, span_text,
-                  norm, port_matches, save_config, send_telegram, split_list, telegram_call)
+                  norm, parse_chat_ids, port_matches, save_config, send_telegram, split_list,
+                  telegram_call)
 from store import Store, parse_iso
 
 AIRSTREAM_SITE = "https://aisstream.io"
@@ -696,7 +696,8 @@ class App:
         self.core.on_service_status = self._on_service_status
         # когда источники ответили на стартовое обновление — обновить экран
         self.core.on_refresh = lambda: self.events.put(("refresh", None))
-        self.bot = None
+        # бот Telegram — отдельный процесс telegram_bot.py, поднимается при старте
+        self.bot_process = None
         self._targets = {}
         self._banner_job = None
         self._key_checking = False
@@ -1905,8 +1906,12 @@ class App:
                         command=lambda: token_entry.config(show="" if show.get() else "*")
                         ).grid(row=0, column=2, sticky="w")
 
-        ttk.Label(box, text="chat_id").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(box, text="chat_id (можно несколько) \nчерез запятую").grid(
+            row=1, column=0, sticky="w", pady=4)
         ttk.Entry(box, textvariable=self.var_chat).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(box, text="например: 123456789, -1001234567890 — алерты и сводки уйдут "
+                            "во все чаты (несколько устройств)",
+                  foreground="#666").grid(row=1, column=2, sticky="w", padx=(8, 0))
         ttk.Checkbutton(box, text="принимать команды (/status, /last, /mute)",
                         variable=self.var_commands).grid(row=2, column=1, sticky="w")
 
@@ -1922,7 +1927,11 @@ class App:
                  "2. Напишите боту любое сообщение (без этого он не сможет ответить).\n"
                  "3. Нажмите «Отправить тестовое сообщение»: если chat_id пуст, программа "
                  "найдёт его сама и подставит.\n"
-                 "4. Сохраните настройки — алерты пойдут в этот чат.",
+                 "4. Сохраните настройки — алерты пойдут во все указанные чаты.\n"
+                 "5. Несколько устройств: с каждого напишите боту /id и добавьте id "
+                 "в поле chat_id через запятую — сводки и алерты получат все.\n"
+                 "6. Бот теперь запускается вместе с приложением и закрывается вместе с ним; "
+                 "галочка «принимать команды» выключает его.",
             justify="left", foreground="#444").pack(anchor="w", padx=12, pady=(16, 0))
 
     def build_services(self):
@@ -3463,8 +3472,8 @@ class App:
         chat = str(self.config.get("telegram_chat_id") or "").strip()
         try:
             if not chat:
-                if self.bot and self.bot.is_alive():
-                    # поток команд уже слушает getUpdates — второй запрос даст 409
+                if self.bot_process is not None and self.bot_process.poll() is None:
+                    # бот уже слушает getUpdates — второй запрос даст 409
                     raise AppError("chat_id не задан. Напишите боту в Telegram команду /id — "
                                    "он пришлёт chat_id, вставьте его в поле и повторите.")
                 updates = telegram_call(token, "getUpdates", params={"timeout": 1},
@@ -3480,8 +3489,12 @@ class App:
                                    "Напишите боту любое сообщение и повторите.")
                 chat = str(chat_ids[-1])
                 self.root.after(0, lambda value=chat: self._apply_found_chat(value))
-            send_telegram(token, chat,
-                          "✅ Ship Tracker на связи. Алерты будут приходить сюда.")
+            targets = parse_chat_ids(chat) or [chat]
+            for target in targets:
+                send_telegram(token, target,
+                              "✅ Ship Tracker на связи. Алерты будут приходить сюда.")
+            if len(targets) > 1:
+                self.log(f"Тест Telegram: отправлено в {len(targets)} чата.")
         except AppError as error:
             self.log(f"Тест Telegram: {error}")
             text = str(error)
@@ -3499,34 +3512,54 @@ class App:
         save_config(self.config, self.config_path)
         self.log(f"chat_id найден и сохранён: {chat}")
 
-    # -- телеграм-команды
+    # -- бот Telegram
     def start_bot(self, restart=False):
-        if restart and self.bot and self.bot.is_alive():
-            # даём старому поллеру выйти из getUpdates, иначе Telegram ответит 409
-            old = self.bot
-            self.bot = None
-            old.stop_event.set()
-            threading.Thread(target=self._restart_bot_worker, args=(old,),
-                             daemon=True, name="tg-restart").start()
-            return
+        """Поднимает полного бота отдельным процессом — при открытии приложения.
+
+        Бот тот же, что запускают руками (telegram_bot.py): его кнопки
+        повторяют вкладки приложения, а данные он берёт из общей базы. Если
+        бот уже запущен — руками или прошлым окном — data/bot.lock у него,
+        и новый процесс молча выйдет: второго поллера не будет.
+        """
         if not self.config.get("telegram_commands"):
+            self.stop_bot_process()
             return
         if not (self.config.get("telegram_token") or "").strip():
+            self.stop_bot_process()
             return
-        if self.bot and self.bot.is_alive():
-            return
-        self.bot = BotCommander(self.config, self.store, self.core, log=self.log)
-        self.bot.start()
+        process = self.bot_process
+        if process is not None and process.poll() is None:
+            if not restart:
+                return
+            self.stop_bot_process()
+        try:
+            log_path = DATA_DIR / "bot_run.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(log_path, "a", encoding="utf-8", errors="replace")
+            flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.bot_process = subprocess.Popen(
+                [sys.executable, "-X", "utf8", str(APP_DIR / "telegram_bot.py")],
+                cwd=str(APP_DIR), stdout=handle, stderr=subprocess.STDOUT,
+                creationflags=flags)
+            self.log("Бот Telegram запущен вместе с приложением.")
+        except Exception as error:
+            self.bot_process = None
+            self.log(f"Бот Telegram не запущен: {error}")
 
-    def _restart_bot_worker(self, old):
-        old.join(timeout=30)
-        lock = getattr(old, "_lock", None)
-        if lock is not None:
+    def stop_bot_process(self):
+        """Останавливает только тот бот, который запустило это окно."""
+        process = self.bot_process
+        self.bot_process = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
             try:
-                lock.close()
-            except OSError:
+                process.kill()
+            except Exception:
                 pass
-        self.start_bot()
 
 
     def check_snapshot(self):
@@ -3725,9 +3758,7 @@ class App:
     def close(self):
         try:
             self.core.stop()
-            if self.bot:
-                self.bot.stop_event.set()
-                self.bot.join(timeout=3)
+            self.stop_bot_process()
         except Exception:
             pass
         finally:

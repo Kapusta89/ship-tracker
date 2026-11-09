@@ -47,13 +47,14 @@ ALL_BUTTON = "🚢 Все суда"
 SEA_BUTTON = "🌊 В море"
 VISITS_BUTTON = "⚓ Стоянки"
 HISTORY_BUTTON = "🕘 История стоянок"
+PLAN_BUTTON = "📅 Прогноз 4 дня"
 EXPECTED_BUTTON = "⏱ Ожидаемые"
 ALERTS_BUTTON = "🚨 Алерты"
 SOURCES_BUTTON = "🔌 Источники"
 
 # Пункты меню — те же, что вкладки в приложении
 MENU_BUTTONS: List[str] = [
-    MAP_BUTTON, ALL_BUTTON, SEA_BUTTON, VISITS_BUTTON,
+    MAP_BUTTON, ALL_BUTTON, SEA_BUTTON, PLAN_BUTTON, VISITS_BUTTON,
     HISTORY_BUTTON, EXPECTED_BUTTON, ALERTS_BUTTON, SOURCES_BUTTON,
 ]
 
@@ -670,6 +671,7 @@ async def cmd_help(message: Message):
         "⚓ /port — кто стоит в портах и на рейде, с грузом и осадкой.\n"
         "⚓ /visits — открытые стоянки сейчас (приход и длительность).\n"
         "🕘 /history — история завершённых стоянок по портам.\n"
+        "📅 /plan — прогноз на 4 дня: путь до порта, стоянка и выход в море.\n"
         "⏱ /expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
         "🚨 /alerts — журнал алертов: что отправлено и с каким результатом.\n"
         "🚢 /vessel MMSI или название — карточка любого судна.\n"
@@ -874,6 +876,90 @@ async def cmd_sea(message: Message):
         lines.append(f"📵 Без сигнала AIS: <b>{len(silent)}</b> — " + ", ".join(names)
                      + ("…" if len(silent) > 10 else ""))
     await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_plan(message: Message):
+    """Прогноз на 4 дня: путь до порта, стоянка и выход в море.
+
+    Одини и тот же план, что во вкладке «Прогноз 4 дня»: стройтся для каждого
+    судна, которое идёт в наш порт или уже стоит в нём.
+    """
+    core = get_core()
+    store = get_store()
+    forecast = _import("forecast")
+    geo = _import("geo")
+    ports = reload_config().get("ports") or []
+
+    def build():
+        names = {(port.get("name") or "").upper() for port in ports}
+        opens = {}
+        try:
+            for visit in store.open_visits():
+                if (visit.get("port") or "").upper() in names:
+                    opens[str(visit.get("mmsi"))] = visit
+        except Exception:
+            opens = {}
+        result = []
+        for vessel in core.related_vessels(3000):
+            mmsi = str(vessel.get("mmsi"))
+            port = core.destination_port(vessel)
+            if not port:
+                visit = opens.get(mmsi)
+                if not visit:
+                    continue
+                port = geo.port_by_name(visit.get("port"), ports)
+            if not port:
+                continue
+            try:
+                stay = core.port_stay(vessel, port=port)
+            except Exception:
+                stay = None
+            plan = forecast.plan(vessel, ports, stay=stay, track=store.track(mmsi, 24))
+            if plan:
+                result.append((vessel, plan))
+        result.sort(key=lambda pair: (pair[1].get("arrival_hours") is None,
+                                      pair[1].get("arrival_hours") or 0.0))
+        return result
+
+    try:
+        rows = await asyncio.to_thread(build)
+    except Exception as error:
+        await message.answer(f"Прогноз недоступен: {error}")
+        return
+
+    in_port = sum(1 for _, plan in rows if plan.get("in_port"))
+    missing = sum(1 for _, plan in rows
+                  if plan.get("no_position") and not plan.get("in_port"))
+    lines = ["📅 <b>Прогноз на 4 дня</b>",
+             f"Судов в плане: <b>{len(rows)}</b> — в порту {in_port}, "
+             f"в пути {len(rows) - in_port - missing}."
+             + (f" Без позиции: {missing}." if missing else ""),
+             "Путь до порта — по курсу и скорости AIS, стоянка — по истории визитов, "
+             "выход и маршрут в море — оценка на остаток четырёх дней.", ""]
+    for vessel, plan in rows[:25]:
+        name = html.escape(str(vessel.get("name") or f"MMSI {vessel.get('mmsi')}"))
+        parts = [html.escape(str(plan.get("port_label") or plan.get("port") or "—"))]
+        if plan.get("in_port"):
+            parts.append("в порту")
+        elif plan.get("arrival_at"):
+            mark = "≈" if plan.get("arrival_estimate") else ""
+            parts.append(f"приход {mark}{plan['arrival_at']:%d.%m %H:%M}")
+        else:
+            parts.append("нет позиции")
+        if plan.get("departure_at"):
+            parts.append(f"стоянка {forecast.duration_text(plan.get('stay_hours'))}")
+            parts.append(f"выход {plan['departure_at']:%d.%m %H:%M}")
+        if plan.get("sea_hours"):
+            parts.append(f"море {forecast.duration_text(plan.get('sea_hours'))}")
+        lines.append(f"• <b>{name}</b> — " + " · ".join(parts))
+    if len(rows) > 25:
+        lines.append(f"…и ещё {len(rows) - 25}")
+    lines.append("")
+    lines.append("Карточка судна: /vessel MMSI или название.")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    await message.answer(text, disable_web_page_preview=True)
 
 
 def _age_hours(value) -> Optional[float]:
@@ -1262,8 +1348,10 @@ async def expected_watcher(bot: Bot) -> None:
         try:
             portcalls = _import("portcalls")
             rows = portcalls.expected_rows()
-            chat_id = (reload_config().get("telegram_chat_id") or "").strip()
-            if rows and chat_id:
+            core_module = _import("core")
+            # уведомления — во все чаты из настроек, по одному на устройство
+            chats = core_module.parse_chat_ids(reload_config().get("telegram_chat_id"))
+            if rows and chats:
                 seen = _load_expected_seen()
                 known = {str(m) for m in (seen.get("mmsi") or [])}
                 current = {str(row.get("mmsi")) for row in rows if row.get("mmsi")}
@@ -1276,8 +1364,13 @@ async def expected_watcher(bot: Bot) -> None:
                     when = (rows[0].get("updated") or "")[:16].replace("T", " ")
                     if when:
                         lines.append(f"\nСписок обновлён: {when} UTC.")
-                    await bot.send_message(int(chat_id), "\n".join(lines),
-                                          disable_web_page_preview=True)
+                    for chat in chats:
+                        try:
+                            await bot.send_message(int(chat), "\n".join(lines),
+                                                   disable_web_page_preview=True)
+                        except Exception as error:
+                            logging.warning("AIS-catcher: чат %s не получил сводку (%s)",
+                                            chat, error)
                 _save_expected_seen({"mmsi": sorted(current),
                                      "updated": rows[0].get("updated") or ""})
         except Exception as error:
@@ -1296,6 +1389,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp = Dispatcher()
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
+    dp.message.register(cmd_plan, Command("plan"))
     dp.message.register(cmd_expected, Command("expected"))
     dp.message.register(cmd_sea, Command("sea"))
     dp.message.register(cmd_port, Command("port"))
@@ -1310,6 +1404,7 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_all, F.text == ALL_BUTTON)
     dp.message.register(cmd_sea, F.text == SEA_BUTTON)
+    dp.message.register(cmd_plan, F.text == PLAN_BUTTON)
     dp.message.register(cmd_visits, F.text == VISITS_BUTTON)
     dp.message.register(cmd_history, F.text == HISTORY_BUTTON)
     dp.message.register(cmd_expected, F.text == EXPECTED_BUTTON)
@@ -1325,6 +1420,7 @@ BOT_COMMANDS: List[Tuple[str, str]] = [
     ("map", "карта с судами"),
     ("all", "все суда в базе"),
     ("sea", "кто сейчас в море"),
+    ("plan", "прогноз 4 дня: приход, стоянка, выход"),
     ("port", "кто в портах и на рейде"),
     ("visits", "стоянки сейчас"),
     ("history", "история стоянок"),
