@@ -60,6 +60,15 @@ DEFAULT_CONFIG = {
     # всё, что попадает в этот радиус от любого нашего порта, — «своё» судно:
     # пишется в базу и показывается во вкладке «Все суда» (800–1000 км)
     "area_radius_km": 900,
+    # дальние районы наблюдения: суда, идущие к нашим портам через Средиземное
+    # море, за 800–1500 км от Дуная. Снимок района такие суда не видит, поэтому
+    # они запрашиваются отдельными прямоугольниками. Судно попадает в базу
+    # только если у него в Destination наш порт (остальной трафик отсеивается).
+    "far_boxes": [
+        [[35.0, 22.0], [42.0, 30.0]],   # Мраморное и Эгейское моря, Босфор
+        [[30.0, 25.0], [38.0, 36.0]],   # восток Средиземного: Кипр, Левант
+        [[30.0, 10.0], [38.0, 25.0]],   # центр Средиземного: Италия, Греция
+    ],
     "use_history": True,
     "use_vf": False,
     "use_vfa": False,
@@ -220,6 +229,10 @@ def load_config(path=None) -> dict:
             config.update(saved)
     config["ports"] = merge_ports(config.get("ports"), geo.DEFAULT_PORTS)
     config["bounding_boxes"] = ensure_boxes(config.get("bounding_boxes"), config["ports"])
+    # пустой/null в файле не должен отключать дальние районы: без них суда,
+    # идущие к нам из Средиземного моря, вообще не видны
+    if not config.get("far_boxes"):
+        config["far_boxes"] = [list(box) for box in DEFAULT_CONFIG["far_boxes"]]
     return config
 
 
@@ -517,8 +530,11 @@ class RadarCore:
             except Exception as error:
                 self.log(f"Слежение по MMSI: не удалось запустить ({error})")
         # Снимок района: последние известные позиции всех судов вокруг портов
+        # плюс дальние районы (Средиземное море) — чтобы видеть суда, которые
+        # идут к нам за сотни километров, а не только у самого порта
         if config.get("use_snapshot", True):
-            boxes = ais_feed.tile_boxes(config.get("bounding_boxes"))
+            boxes = ais_feed.tile_boxes(list(config.get("bounding_boxes") or [])
+                                        + list(config.get("far_boxes") or []))
             if not boxes:
                 port_box = ais_feed.ports_bbox(config.get("ports") or [])
                 if port_box:
@@ -830,6 +846,23 @@ class RadarCore:
                         return True
         return False
 
+    def _within_area(self, lat, lon) -> bool:
+        """Судно в пределах района наблюдения (`area_radius_km`) от любого порта."""
+        ports = self.config.get("ports") or []
+        if lat is None or lon is None or not ports:
+            return False
+        radius = self.area_radius_km()
+        if radius <= 0:
+            return False
+        for port in ports:
+            try:
+                km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if km <= radius:
+                return True
+        return False
+
     def area_radius_km(self) -> float:
         """Радиус района вокруг портов, по которому суда считаются своими."""
         try:
@@ -965,9 +998,14 @@ class RadarCore:
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
 
-        Берём только связанные с нашими портами суда, у которых есть свежая
-        позиция вне портовых геозон. «В море» — это и идущие под ходом, и те,
-        кто стоит на рейде или на якоре перед входом: любой, кто не в порту.
+        Берём только связанные с нашими портами суда, у которых есть позиция
+        вне портовых геозон. «В море» — это и идущие под ходом, и те, кто
+        стоит на рейде или на якоре перед входом: любой, кто не в порту.
+
+        Судно с нашим портом в Destination показывается на любом расстоянии:
+        идущее из Средиземного моря за 1000 км — тоже наше судно, а срок
+        давности позиции у него больше (дальние районы опрашиваются реже),
+        поэтому для таких судов фильтр `sea_fresh_hours` не применяется.
         Порядок: сначала под ходом (быстрее — выше), потом остальные.
         """
         try:
@@ -990,10 +1028,12 @@ class RadarCore:
                     age = (now - datetime.fromisoformat(str(updated)[:19])).total_seconds() / 3600
                 except ValueError:
                     age = None
-            if age is not None and age > fresh_hours:
+            ours = self.destination_is_ours(vessel.get("destination"))
+            if age is not None and age > fresh_hours and not ours:
                 continue
             row = dict(vessel)
             row["age_hours"] = age
+            row["dest_ours"] = ours
             row["underway"] = (vessel.get("sog") or 0) > 0.5
             rows.append(row)
         rows.sort(key=lambda item: (0 if item["underway"] else 1,
@@ -1305,11 +1345,19 @@ class RadarCore:
         if any(x in name_cand for x in ["TEST", "DEMO", "EXAMPLE", "SAMPLE"]) or mmsi in LEGACY_DEMO_MMSI:
             return
         before = self.store.vessel(mmsi)
+        # Дальние районы (Средиземное море) присылают тысячи чужих судов:
+        # сохраняем только те, у которых в Destination наш порт
+        lat, lon = event.get("lat"), event.get("lon")
+        if (before is None and lat is not None and lon is not None
+                and not self._within_area(lat, lon)
+                and not self.destination_is_ours(event.get("destination"))):
+            return
         # в базу попадают только суда, связанные с нашими портами; но статика
         # приходит без координат, и у судна, уже записанного по позиции,
         # близость к порту здесь не проверить — его не отбрасываем и не удаляем
         if before is None and not self._vessel_related(
-                mmsi, None, None, None, destination=event.get("destination"), area=True):
+                mmsi, event.get("lat"), event.get("lon"), None,
+                destination=event.get("destination"), area=True):
             return
         code = event.get("type_code")
         self.store.upsert_static(
@@ -1345,7 +1393,19 @@ class RadarCore:
         port = geo.port_at(lat, lon, self.config.get("ports") or [])
         port_name = port["name"] if port else None
         vessel = self.store.vessel(mmsi)
-        if not self._vessel_related(mmsi, lat, lon, vessel, area=True):
+        # Снимок приходит и из дальних районов (Средиземное море), где
+        # тысячи чужих судов. Своё там — только судно с нашим портом
+        # в Destination; остальное не трогаем, чтобы не грузить базу.
+        if not port and not self._within_area(lat, lon):
+            ours = (self.destination_is_ours(event.get("destination"))
+                    or self.destination_is_ours((vessel or {}).get("destination")))
+            if not ours:
+                if vessel is not None and not self._history_related(mmsi):
+                    self.store.drop_vessel(mmsi)
+                self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+                return
+        if not self._vessel_related(mmsi, lat, lon, vessel, area=True,
+                                    destination=event.get("destination")):
             # чужое судно: в базу не пишем, а ранее записанное — убираем,
             # но позицию сохраняем в трафик района для вкладки «В море»
             if vessel is not None:
@@ -1363,6 +1423,10 @@ class RadarCore:
             existing = self.store.vessel(mmsi)
             if existing and not existing.get("name"):
                 self.store.upsert_static(mmsi, name=event["name"])
+        # снимок отдаёт назначение вместе с позицией: без него далёкое судно
+        # в базе есть, но в списках не считается «идущим в наш порт»
+        if event.get("destination") and not (vessel or {}).get("destination"):
+            self.store.upsert_static(mmsi, destination=event["destination"])
 
         last_stored = self._last_stored.get(mmsi)
         interval = float(self.config.get("position_interval_seconds") or 60)
@@ -1380,8 +1444,25 @@ class RadarCore:
         """Копит чужой трафик района для вкладки «В море».
 
         Пишем не чаще раза в 10 минут на судно: снимок приходит сотнями судов,
-        иначе база переписывалась бы на каждое сообщение.
+        иначе база переписывалась бы на каждое сообщение. Дальние районы
+        (Средиземное море) нужны только для наших судов, поэтому чужой трафик
+        за пределами `area_radius_km` не записываем — иначе база распухает.
         """
+        ports = self.config.get("ports") or []
+        if ports:
+            radius = self.area_radius_km()
+            if radius > 0:
+                nearest = None
+                for port in ports:
+                    try:
+                        km = geo.haversine_km(lat, lon, float(port["lat"]),
+                                              float(port["lon"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if nearest is None or km < nearest:
+                        nearest = km
+                if nearest is not None and nearest > radius:
+                    return
         cache = getattr(self, "_sea_written", None)
         if cache is None:
             cache = self._sea_written = {}

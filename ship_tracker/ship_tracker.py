@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.29"
+APP_VERSION = "2026.11.30"
 
 import ais_feed
 import cargo
@@ -895,10 +895,12 @@ class App:
         tk, ttk = self.tk, self.ttk
         frame = self.tab_sea
         ttk.Label(frame, text="Судна в море, связанные с нашими портами: в Destination стоит "
-                              "наш порт (идут в него) или судно вышло из нашего порта за "
-                              "последние дни. Остальной трафик района скрыт — его можно "
-                              "включить галочкой. Расстояние и прибытие — по прямой и "
-                              "текущей скорости; заявленный капитаном ETA — в карточке.",
+                              "наш порт (идут в него), судно вышло из нашего порта за "
+                              "последние дни или находится рядом с ним. Судно с нашим портом "
+                              "в назначении остаётся в списке на любой дистанции — в том "
+                              "числе из Средиземного моря за 1000 км. Расстояние и прибытие — "
+                              "по прямой и текущей скорости; заявленный капитаном ETA — "
+                              "в карточке.",
                   foreground="#555", wraplength=1100, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
         port_bar = ttk.Frame(frame)
@@ -913,12 +915,6 @@ class App:
             button.pack(side="left", padx=(0, 4))
             self.sea_port_buttons[name] = button
         ttk.Button(port_bar, text="Обновить", command=self.refresh_sea_table).pack(side="right")
-        controls = ttk.Frame(frame)
-        controls.pack(fill="x", padx=8, pady=(0, 4))
-        self.var_sea_all = tk.IntVar(value=0)
-        ttk.Checkbutton(controls, text="Показывать весь трафик района, а не только связанный "
-                                       "с нашими портами",
-                        variable=self.var_sea_all, command=self.refresh_sea_table).pack(side="left")
         self.sea_info = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.sea_info, foreground="#333", wraplength=1200,
                   justify="left").pack(anchor="w", padx=8, pady=(0, 4))
@@ -1585,7 +1581,9 @@ class App:
         self.var_cooldown = tk.StringVar(value=str(self.config.get("alert_cooldown_hours", 6)))
         self.var_history = tk.StringVar(value=str(self.config.get("history_days", 7)))
         self.var_interval = tk.StringVar(value=str(self.config.get("position_interval_seconds", 60)))
-        self.var_stale = tk.StringVar(value=str(self.config.get("stale_minutes", 15)))
+        # отдельное имя: этот StringVar из настроек раньше затирал галочку
+        # «устаревшие» на карте, и выключить её было невозможно
+        self.var_stale_minutes = tk.StringVar(value=str(self.config.get("stale_minutes", 15)))
         self.var_watch_km = tk.StringVar(value=str(self.config.get("port_watch_km", 50)))
         self.var_area_km = tk.StringVar(value=str(self.config.get("area_radius_km", 900)))
 
@@ -1635,7 +1633,7 @@ class App:
             ("Хранить историю, дней", self.var_history, "Старые позиции удаляются автоматически."),
             ("Запись точки раз в, сек", self.var_interval,
              "Позиции с AIS приходят часто — в базу пишем с этим шагом."),
-            ("Считать устаревшим, мин", self.var_stale,
+            ("Считать устаревшим, мин", self.var_stale_minutes,
              "Судно без сообщений дольше выглядит на карте бледным; 0 — не приглушать."),
             ("Радиус интереса, км", self.var_watch_km,
              "Судно ближе этого расстояния к нашему порту считается своим и показывается "
@@ -2634,10 +2632,9 @@ class App:
                 button.configure(text=f"{label} ({counts.get(name, 0)})")
             else:
                 button.configure(text=f"Все порты ({len(linked)})")
-        show_all = bool(getattr(self, "var_sea_all", None) is not None
-                        and self.var_sea_all.get())
-        if not show_all:
-            rows = linked
+        # во вкладке только суда, связанные с нашими портами: чужой трафик
+        # района здесь больше не показывается (он остаётся слоем на карте)
+        rows = linked
         if chosen:
             rows = [vessel for vessel in rows if chosen in (vessel.get("links") or {})]
         moved = 0
@@ -2672,46 +2669,20 @@ class App:
                 vessel.get("mmsi"),
             ))
         try:
-            others = self.core.traffic_vessels(400) if show_all else []
-        except Exception as error:
-            self.log(f"Трафик района: {error}")
-            others = []
-        if chosen:
-            others = [vessel for vessel in others
-                      if (vessel.get("nearest_port") or "").upper() == chosen]
-        if others:
-            tree.insert("", "end", tags=("group",), values=(
-                f"— трафик района, не идущие в наши порты: {len(others)} —",
-                "", "", "", "", "", "", "", "", ""))
-            for vessel in others:
-                distance = "—"
-                if vessel.get("nearest_km") is not None:
-                    distance = (f"{fmt_number(round(vessel['nearest_km']))} км · "
-                                f"{vessel.get('nearest_port') or '—'}")
-                tree.insert("", "end", tags=(str(vessel.get("mmsi")),), values=(
-                    vessel.get("name") or "—",
-                    flags.flag_text(vessel.get("mmsi")),
-                    vessel.get("type_label") or "—",
-                    vessel.get("destination") or "—",
-                    fmt_number(vessel.get("sog")),
-                    self.course_text(vessel),
-                    distance,
-                    "—",
-                    self.fmt_time(vessel.get("updated_at")),
-                    vessel.get("mmsi"),
-                ))
-        try:
             silent = self.core.sea_without_position(500)
         except Exception:
             silent = []
+        far = sum(1 for vessel in rows
+                  if not any((link or {}).get("kind") == "рядом"
+                             for link in (vessel.get("links") or {}).values()))
         top = f"по порту {chosen}" if chosen else "по всем нашим портам"
         self.sea_info.set(
             f"В море и связаны с нашими портами {top}: {len(rows)} "
             f"(под ходом {moved}, на рейде/якоре {len(rows) - moved}). "
-            f"Скрыто несвязанного трафика: {hidden}."
-            + (f" Трафик района показан: {len(others)}." if show_all else "")
-            + f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
-              f"Обновляется само; двойной щелчок открывает карточку.")
+            f"Из них далеко от порта (только по Destination или визиту): {far}. "
+            f"Не показываются: {hidden} чужих судов района."
+            f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
+            f"Обновляется само; двойной щелчок открывает карточку.")
 
     def course_text(self, vessel):
         """Курс судна в градусах и по стороне света."""
@@ -2865,7 +2836,7 @@ class App:
             cooldown = float(str(self.var_cooldown.get()).replace(",", "."))
             history = float(str(self.var_history.get()).replace(",", "."))
             interval = float(str(self.var_interval.get()).replace(",", "."))
-            stale = float(str(self.var_stale.get()).replace(",", "."))
+            stale = float(str(self.var_stale_minutes.get()).replace(",", "."))
             watch_km = float(str(getattr(self, "var_watch_km", None).get() or 50).replace(",", "."))
             area_km = float(str(getattr(self, "var_area_km", None).get() or 900).replace(",", "."))
             snapshot_minutes = float(str(getattr(self, "var_snapshot_minutes", None).get() or 10)

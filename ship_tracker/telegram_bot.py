@@ -826,7 +826,6 @@ async def cmd_sea(message: Message):
     try:
         vessels = await asyncio.to_thread(core.sea_vessels, 500)
         silent = await asyncio.to_thread(core.sea_without_position, 500)
-        others = await asyncio.to_thread(core.traffic_vessels, 400)
     except Exception as error:
         await message.answer(f"Список судов в море недоступен: {error}")
         return
@@ -834,24 +833,15 @@ async def cmd_sea(message: Message):
     lines = ["🌊 <b>Суда в море сейчас</b>",
              f"Всего: <b>{len(vessels)}</b> (под ходом {moved}, "
              f"на рейде/якоре {len(vessels) - moved}).",
-             "Позиции собраны всеми каналами: поток района, снимок района, "
-             "Open Waters и глобальное слежение по MMSI."]
+             "Позиции собраны всеми каналами: AISStream, Open Waters, снимок района "
+             "(включая Средиземное море) и глобальное слежение по MMSI. Сюда попадают "
+             "и суда с нашим портом в Destination за 1000 км от него."]
     lines += _sea_lines(vessels[:25], core)
     if len(vessels) > 25:
         lines.append(f"…и ещё {len(vessels) - 25}")
     if not vessels:
         lines.append("Сейчас ни у одного связанного судна нет свежей позиции вне порта: "
                      "они могут стоять в порту или не передавать AIS.")
-    if others:
-        lines.append("")
-        lines.append(f"🌐 <b>Трафик района</b> (не идут в наши порты): {len(others)}")
-        for vessel in others[:10]:
-            name = html.escape(str(vessel.get("name") or vessel.get("mmsi")))
-            km = vessel.get("nearest_km")
-            where = f"{round(km)} км от {vessel.get('nearest_port') or '—'}" if km is not None else "—"
-            lines.append(f"• {name} — {where}")
-        if len(others) > 10:
-            lines.append(f"…и ещё {len(others) - 10}")
     if silent:
         names = [html.escape(str(vessel.get("name") or vessel.get("mmsi"))) for vessel in silent[:10]]
         lines.append("")

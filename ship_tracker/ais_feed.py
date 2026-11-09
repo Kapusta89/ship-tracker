@@ -624,7 +624,15 @@ def snapshot_event(feature, max_age_hours=6.0):
         heading = None
     if heading is not None and not 0 <= heading <= 359:
         heading = None
-    return {
+    # Снимок отдаёт не только точку: в свойствах есть назначение, IMO,
+    # позывной, тип и размеры — это те же поля, что приходят в статике AIS.
+    # Раньше они выбрасывались, и дальние суда оставались безымянными.
+    type_code = props.get("type")
+    try:
+        type_code = int(type_code)
+    except (TypeError, ValueError):
+        type_code = None
+    event = {
         "kind": "position",
         "mmsi": str(mmsi).strip().zfill(9),
         "lat": lat,
@@ -633,9 +641,29 @@ def snapshot_event(feature, max_age_hours=6.0):
         "cog": to_float(props.get("cog")),
         "heading": heading,
         "name": clean_text(props.get("name") or props.get("shipname")),
+        "destination": clean_text(props.get("destination")),
         "at": moment,
         "source": "snapshot",
     }
+    # паспорт из того же ответа — отдельным событием, чтобы база дополнилась
+    static = {
+        "kind": "static",
+        "mmsi": event["mmsi"],
+        "lat": lat,
+        "lon": lon,
+        "name": event["name"],
+        "destination": event["destination"],
+        "imo": clean_text(props.get("imo")),
+        "callsign": clean_text(props.get("callsign")),
+        "type_code": type_code,
+        "length_m": to_float(props.get("length")),
+        "beam_m": to_float(props.get("beam")),
+        "draft": to_float(props.get("draught")),
+        "source": "snapshot",
+    }
+    if static["name"] or static["destination"] or static["imo"] or type_code is not None:
+        event["static"] = static
+    return event
 
 
 class SnapshotFeed(threading.Thread):
@@ -719,7 +747,11 @@ class SnapshotFeed(threading.Thread):
                     continue
                 ships += 1
                 self.events += 1
+                static = event.pop("static", None)
                 self.on_event(event)
+                # паспорт из того же ответа: назначение, IMO, тип, размеры
+                if static:
+                    self.on_event(static)
 
         if failed and not ships:
             self.connected = False
@@ -735,7 +767,11 @@ class SnapshotFeed(threading.Thread):
         self.last_ships = ships
         self.last_stale = stale
         tail = f", устаревших пропущено {stale}" if stale else ""
-        boxes_text = " + ".join(", ".join(f"{value:.2f}" for value in box) for box in self.bboxes)
+        if len(self.bboxes) <= 2:
+            boxes_text = " + ".join(", ".join(f"{value:.2f}" for value in box)
+                                    for box in self.bboxes)
+        else:
+            boxes_text = f"{len(self.bboxes)} прямоугольников, включая дальние районы"
         self.log(f"Снимок района ({boxes_text}): судов {ships}{tail}.")
         return ships
 
