@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.27"
+APP_VERSION = "2026.11.28"
 
 import ais_feed
 import cargo
@@ -242,6 +242,10 @@ class RadarCanvas:
         self.selected = None
         self.show_tracks = True
         self.show_forecast = True
+        # Устаревшие позиции по умолчанию не рисуются: точки, которым больше
+        # stale_minutes, кучкой висят у причалов и на рейдах и мешают смотреть
+        # свежую обстановку. Включить их можно галочкой «устаревшие».
+        self.show_stale = False
         self.targets_only = False
         self.schematic_view = False
         self.track = []
@@ -351,6 +355,8 @@ class RadarCanvas:
         now = datetime.now()
         drawn = 0
         stale_count = 0
+        stale_drawn = 0
+        stale_hidden = 0
         for vessel in vessels:
             lat, lon = vessel.get("lat"), vessel.get("lon")
             # На карту попадают только суда с реальной позицией. Суда без
@@ -361,15 +367,20 @@ class RadarCanvas:
             is_target = vessel["mmsi"] in target_mmsi
             if self.targets_only and not is_target:
                 continue
-            x, y = projector.to_screen(lat, lon)
-            if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
-                continue
-            drawn += 1
-            self._hits.append((x, y, vessel["mmsi"]))
             updated = parse_iso(vessel.get("updated_at"))
             stale = not updated or (now - updated).total_seconds() > self.stale_seconds()
             if stale:
                 stale_count += 1
+                if not self.show_stale and vessel["mmsi"] != self.selected:
+                    stale_hidden += 1
+                    continue
+            x, y = projector.to_screen(lat, lon)
+            if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
+                continue
+            drawn += 1
+            if stale:
+                stale_drawn += 1
+            self._hits.append((x, y, vessel["mmsi"]))
             # Цвета в зависимости от типа и схемatical режима
             if is_target:
                 color, radius = "#ff3b30", 5
@@ -406,6 +417,7 @@ class RadarCanvas:
                                        font=("Consolas", 7))
         # Весь остальной трафик района: мелкие точки, чтобы на карте были все суда.
         shown_traffic = 0
+        traffic_hidden = 0
         if traffic:
             known = {str(vessel.get("mmsi")) for vessel in vessels if vessel.get("mmsi")}
             for vessel in traffic:
@@ -415,6 +427,12 @@ class RadarCanvas:
                 lat, lon = vessel.get("lat"), vessel.get("lon")
                 if lat is None or lon is None:
                     continue
+                updated = parse_iso(vessel.get("updated_at"))
+                if (not self.show_stale and mmsi != self.selected
+                        and (not updated
+                             or (now - updated).total_seconds() > self.stale_seconds())):
+                    traffic_hidden += 1
+                    continue
                 x, y = projector.to_screen(lat, lon)
                 if not (0 <= x <= width and 0 <= y <= height):
                     continue
@@ -422,9 +440,10 @@ class RadarCanvas:
                 canvas.create_oval(x - 1.5, y - 1.5, x + 1.5, y + 1.5,
                                    fill=color, outline="", tags=("traffic",))
                 shown_traffic += 1
-        self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_count,
+        self._draw_legend(width, height, len(vessels), len(target_mmsi), drawn, stale_drawn,
                           len([v for v in vessels if v.get("lat") is None]),
-                          traffic=shown_traffic)
+                          traffic=shown_traffic, stale_hidden=stale_hidden,
+                          traffic_hidden=traffic_hidden)
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -515,12 +534,16 @@ class RadarCanvas:
         self._forecast_cache[mmsi] = (key, points)
         return points
 
-    def _forecast_ready(self, vessel):
-        """Стоит ли строить прогноз: судно актуально, в море и идёт в наш порт."""
+    def _forecast_ready(self, vessel, allow_stale=False):
+        """Стоит ли строить прогноз: судно актуально, в море и идёт в наш порт.
+
+        allow_stale — для выбранного судна: раз пользователь кликнул именно по
+        нему, прогноз по последним известным данным полезнее, чем ничего.
+        """
         if vessel.get("lat") is None or vessel.get("lon") is None:
             return False
         age = metrics.freshness_hours(vessel.get("updated_at"))
-        if age is not None and age * 3600 > self.stale_seconds():
+        if not allow_stale and age is not None and age * 3600 > self.stale_seconds():
             return False
         ports = self.config.get("ports") or []
         if ports and geo.port_at(vessel.get("lat"), vessel.get("lon"), ports):
@@ -534,41 +557,40 @@ class RadarCanvas:
         return forecast.target_port(vessel, ports) is not None
 
     def _draw_forecasts(self, projector, vessels):
-        """Прогноз пути до нашего порта: пунктир, метки суток и время прибытия."""
-        if not self.show_forecast:
+        """Прогноз пути до нашего порта — только для выбранного судна.
+
+        Линии у всех судов сразу превращали карту в паутину, поэтому прогноз
+        рисуется по клику: выбрали судно — видите его маршрут и время прибытия.
+        """
+        if not self.show_forecast or not self.selected:
+            return
+        vessel = next((item for item in vessels
+                       if str(item.get("mmsi")) == str(self.selected)), None)
+        if not vessel or not self._forecast_ready(vessel, allow_stale=True):
+            return
+        points = self._forecast_for(vessel)
+        if len(points) < 2:
             return
         canvas = self.canvas
-        for vessel in vessels:
-            is_selected = vessel.get("mmsi") == self.selected
-            if self.targets_only and not is_selected:
-                continue
-            if not self._forecast_ready(vessel):
-                continue
-            points = self._forecast_for(vessel)
-            if len(points) < 2:
-                continue
-            coords = []
-            for point in points:
-                x, y = projector.to_screen(point["lat"], point["lon"])
-                coords.extend((x, y))
-            if len(coords) < 4:
-                continue
-            color = "#39d3ff" if is_selected else "#2b6f80"
-            canvas.create_line(*coords, fill=color, dash=(4, 3),
-                               width=2 if is_selected else 1)
-            if is_selected:
-                for point in forecast.daily_points(points):
-                    x, y = projector.to_screen(point["lat"], point["lon"])
-                    canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
-                                       outline=color, width=1)
-                    canvas.create_text(x + 6, y - 6, text=point["label"], anchor="w",
-                                       fill="#8fe6ff", font=("Consolas", 7))
-            last = points[-1]
-            if is_selected and last.get("arrived"):
-                x, y = projector.to_screen(last["lat"], last["lon"])
-                canvas.create_text(x + 8, y + 10,
-                                   text=f"{last.get('port') or ''} {last['at']:%d.%m %H:%M}",
-                                   anchor="w", fill="#8fe6ff", font=("Consolas", 7))
+        coords = []
+        for point in points:
+            x, y = projector.to_screen(point["lat"], point["lon"])
+            coords.extend((x, y))
+        if len(coords) < 4:
+            return
+        color = "#39d3ff"
+        canvas.create_line(*coords, fill=color, dash=(4, 3), width=2)
+        for point in forecast.daily_points(points):
+            x, y = projector.to_screen(point["lat"], point["lon"])
+            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, width=1)
+            canvas.create_text(x + 6, y - 6, text=point["label"], anchor="w",
+                               fill="#8fe6ff", font=("Consolas", 7))
+        last = points[-1]
+        if last.get("arrived"):
+            x, y = projector.to_screen(last["lat"], last["lon"])
+            canvas.create_text(x + 8, y + 10,
+                               text=f"{last.get('port') or ''} {last['at']:%d.%m %H:%M}",
+                               anchor="w", fill="#8fe6ff", font=("Consolas", 7))
 
     def stale_seconds(self):
         """Через сколько секунд без сообщений судно считается устаревшим."""
@@ -581,15 +603,20 @@ class RadarCanvas:
         return minutes * 60
 
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
-                     traffic=0):
+                     traffic=0, stale_hidden=0, traffic_hidden=0):
         fresh = drawn - stale
         text = (f"источник: живой AIS (AISStream, Open Waters)\n"
                 f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
-                f"свежих: {fresh}   без данных > {self._stale_label()}: {stale}\n")
+                f"свежих: {fresh}   старых > {self._stale_label()}: {stale + stale_hidden}\n")
+        if stale_hidden:
+            text += f"из них скрыто на карте: {stale_hidden} (галочка «устаревшие»)\n"
         if without_position:
             text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
         if traffic:
-            text += f"трафик района (точки): {traffic}\n"
+            text += f"трафик района (точки): {traffic}"
+            if traffic_hidden:
+                text += f", скрыто старых: {traffic_hidden}"
+            text += "\n"
         if self.show_forecast:
             text += (f"пунктир — прогноз пути до нашего порта "
                      f"(до {int(forecast.MAX_DAYS)} сут)\n")
@@ -802,6 +829,9 @@ class App:
         self.var_forecast = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="прогноз 4 дня", variable=self.var_forecast,
                         command=self.toggle_forecast).pack(side="left", padx=(8, 0))
+        self.var_stale = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="устаревшие", variable=self.var_stale,
+                        command=self.toggle_stale).pack(side="left", padx=(8, 0))
         self.var_schematic = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="схематический вид", variable=self.var_schematic,
                         command=self.toggle_schematic).pack(side="left", padx=(8, 0))
@@ -1898,6 +1928,11 @@ class App:
 
     def toggle_forecast(self):
         self.radar.show_forecast = bool(self.var_forecast.get())
+        self.redraw_map()
+
+    def toggle_stale(self):
+        """Показать или скрыть суда с устаревшей позицией."""
+        self.radar.show_stale = bool(self.var_stale.get())
         self.redraw_map()
 
     def toggle_schematic(self):

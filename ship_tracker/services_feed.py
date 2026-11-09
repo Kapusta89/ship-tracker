@@ -1091,7 +1091,7 @@ class GoradarFeed(ServiceFeed):
     """
 
     key = "gor"
-    interval = 900.0
+    interval = 600.0
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1172,8 +1172,8 @@ class MarineTrafficLiveFeed(ServiceFeed):
     """
 
     key = "mlive"
-    interval = 900.0
-    radius_km = 120
+    interval = 600.0
+    radius_km = 200
     limit = 500
 
     def __init__(self, *args, **kwargs):

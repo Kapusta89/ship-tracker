@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     "openwaters_token": "",
     "use_openwaters": True,
     "use_snapshot": True,
-    "snapshot_minutes": 10,
+    "snapshot_minutes": 5,
     "snapshot_max_age_hours": 6,
     # слежение за нашими судами по MMSI по всему миру (AISStream FiltersShipMMSI):
     # единственный бесплатный способ увидеть судно, ушедшее за пределы района
