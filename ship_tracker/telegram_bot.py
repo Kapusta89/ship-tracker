@@ -43,6 +43,19 @@ MAP_PATH = BASE_DIR / "data" / "map.png"
 
 CAPTION_LIMIT = 1024
 MAP_BUTTON = "🗺 Карта"
+ALL_BUTTON = "🚢 Все суда"
+SEA_BUTTON = "🌊 В море"
+VISITS_BUTTON = "⚓ Стоянки"
+HISTORY_BUTTON = "🕘 История стоянок"
+EXPECTED_BUTTON = "⏱ Ожидаемые"
+ALERTS_BUTTON = "🚨 Алерты"
+SOURCES_BUTTON = "🔌 Источники"
+
+# Пункты меню — те же, что вкладки в приложении
+MENU_BUTTONS: List[str] = [
+    MAP_BUTTON, ALL_BUTTON, SEA_BUTTON, VISITS_BUTTON,
+    HISTORY_BUTTON, EXPECTED_BUTTON, ALERTS_BUTTON, SOURCES_BUTTON,
+]
 
 DEFAULT_PORT_NAMES: List[str] = [
     "RENI", "IZMAIL", "VYLKOVE", "CHORNOMORSK", "ODESSA", "YUZHNY",
@@ -105,10 +118,12 @@ def get_core():
 
 # ── клавиатура ─────────────────────────────────────────────────────────────
 def make_port_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура с портами и пунктами меню, как вкладки приложения."""
     builder = ReplyKeyboardBuilder()
     for name in DEFAULT_PORT_NAMES:
         builder.button(text=name)
-    builder.button(text=MAP_BUTTON)
+    for text in MENU_BUTTONS:
+        builder.button(text=text)
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
@@ -241,22 +256,16 @@ def get_vessels_for_port(port_name: str) -> List[dict]:
 
 
 def route_text(vessel: dict) -> str:
-    """Маршрут координатами: где судно сейчас и где будет в ближайшие дни."""
+    """Маршрут координатами: где судно сейчас и где будет через 1–3 суток."""
+    ports = CONFIG.get("ports") or []
     try:
         forecast = _import("forecast")
-        points = forecast.route(vessel, CONFIG.get("ports") or [])
+        points = forecast.route(vessel, ports)
     except Exception as error:
         log.info("Прогноз для %s не построен: %s", vessel.get("mmsi"), error)
-        points = []
+        return "🗺 Маршрут: прогноз не построен"
 
     if len(points) < 2:
-        ports = CONFIG.get("ports") or []
-        try:
-            ours = forecast.target_port(vessel, ports) is not None
-        except Exception:
-            ours = False
-        if not ours:
-            return "🗺 Маршрут: в Destination нет нашего порта — прогноз до порта не строится"
         sog = vessel.get("sog") or 0
         try:
             sog = float(sog)
@@ -266,12 +275,23 @@ def route_text(vessel: dict) -> str:
             return "🗺 Маршрут: судно почти не движется — прогноз не строится"
         return "🗺 Маршрут: нет курса в AIS — прогноз не строится"
 
-    lines = ["🗺 Маршрут (прогноз до нашего порта, до 4 сут):"]
-    for point in forecast.daily_points(points):
+    port = forecast.target_port(vessel, ports)
+    speed, course, _source = forecast.estimates(vessel)
+    if port:
+        head = (f"🗺 Маршрут (прогноз до нашего порта, до "
+                f"{int(forecast.MAX_DAYS)} сут):")
+    else:
+        head = (f"🗺 Маршрут (прогноз по курсу {forecast.course_text(course)}, "
+                f"{float(speed or 0):.1f} уз, до {int(forecast.MAX_DAYS)} сут):")
+    lines = [head]
+    daily = [point for point in forecast.daily_points(points) if point["hours"] > 0]
+    for point in daily:
         suffix = f" ({point['port']})" if point.get("port") else ""
         when = f"{point['at']:%d.%m %H:%M}" if point.get("at") else ""
         lines.append(f"  {point['label']}: {point['lat']:.3f}, {point['lon']:.3f}"
                      + (f" · {when}" if when else "") + suffix)
+    if not port:
+        lines.append("  конечная точка — по текущему курсу; при повороте сдвинется")
     return "\n".join(lines)
 
 
@@ -637,18 +657,24 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     await message.answer(
         "🆘 <b>Справка</b>\n\n"
+        "Кнопки меню — те же пункты, что вкладки в приложении.\n"
         "Нажмите кнопку порта — бот покажет все суда, идущие в этот порт, "
         "с теми же данными, что и в приложении.\n"
-        "В карточке есть маршрут: текущие координаты и прогноз на 5 дней.\n"
+        "В карточке есть маршрут: текущие координаты и прогноз на 3 дня "
+        "(в наш порт или по текущему курсу).\n"
         "Карточки обновляются сами каждые 2 минуты.\n"
-        "При выборе другого порта прошлый список удаляется.\n"
-        "/sea — кто сейчас в море: скорость, расстояние до порта и прибытие.\n"
-        "/port — кто стоит в портах и на рейде (у причала и ждёт лоцмана) "
-        "с грузом и осадкой.\n"
-        "/expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
-        "/map — карта-картинка с портами и судами, у которых есть позиция.\n"
-        "/sources — подключения и проверка источников (живы ли и читаются ли).\n"
-        "/start — вернуть клавиатуру портов.",
+        "При выборе другого порта прошлый список удаляется.\n\n"
+        "🗺 /map — карта-картинка с портами и судами.\n"
+        "🚢 /all — все суда в базе: сколько, типы, назначения, свежесть.\n"
+        "🌊 /sea — кто сейчас в море: скорость, расстояние и прибытие.\n"
+        "⚓ /port — кто стоит в портах и на рейде, с грузом и осадкой.\n"
+        "⚓ /visits — открытые стоянки сейчас (приход и длительность).\n"
+        "🕘 /history — история завершённых стоянок по портам.\n"
+        "⏱ /expected — кто сообщил наш порт пунктом назначения (AIS-catcher).\n"
+        "🚨 /alerts — журнал алертов: что отправлено и с каким результатом.\n"
+        "🚢 /vessel MMSI или название — карточка любого судна.\n"
+        "🔌 /sources — подключения и проверка источников (живы ли и читаются ли).\n"
+        "/start — вернуть клавиатуру портов и меню.",
         reply_markup=make_port_keyboard(),
     )
 
@@ -850,6 +876,262 @@ async def cmd_sea(message: Message):
     await message.answer("\n".join(lines), disable_web_page_preview=True)
 
 
+def _age_hours(value) -> Optional[float]:
+    """Сколько часов прошло с момента в базе — для отметки устаревших."""
+    store_module = _import("store")
+    try:
+        moment = store_module.parse_iso(value)
+    except Exception:
+        return None
+    if moment is None:
+        return None
+    return max(0.0, (datetime.now() - moment).total_seconds() / 3600.0)
+
+
+async def cmd_all(message: Message):
+    """Все суда в базе — сводка и последние по времени AIS."""
+    store = get_store()
+    core_module = _import("core")
+    try:
+        vessels = await asyncio.to_thread(store.vessels, 3000)
+    except Exception as error:
+        await message.answer(f"Список судов недоступен: {error}")
+        return
+    if not vessels:
+        await message.answer("В базе пока нет судов — поток AIS ещё не собрал данные.")
+        return
+    config = reload_config()
+    try:
+        stale_hours = max(0.0, float(config.get("stale_minutes") or 15)) / 60.0
+    except (TypeError, ValueError):
+        stale_hours = 0.25
+    with_pos = sum(1 for vessel in vessels if vessel.get("lat") is not None)
+    fresh = 0
+    for vessel in vessels:
+        age = _age_hours(vessel.get("updated_at"))
+        if age is None or age <= stale_hours:
+            fresh += 1
+    lines = ["🚢 <b>Все суда</b>",
+             f"В базе: <b>{len(vessels)}</b>, с позицией: {with_pos}, "
+             f"без позиции: {len(vessels) - with_pos}.",
+             f"Свежие (AIS не старше {int(stale_hours * 60)} мин): <b>{fresh}</b> · "
+             f"устаревшие: {len(vessels) - fresh}.", ""]
+
+    kinds: dict = {}
+    for vessel in vessels:
+        label = vessel.get("type_label") or "тип неизвестен"
+        kinds[label] = kinds.get(label, 0) + 1
+    top_kinds = sorted(kinds.items(), key=lambda item: -item[1])[:5]
+    if top_kinds:
+        lines.append("<b>Типы</b>: " + ", ".join(f"{name} — {count}"
+                                                 for name, count in top_kinds))
+    destinations: dict = {}
+    for vessel in vessels:
+        destination = (vessel.get("destination") or "").strip()
+        if destination:
+            destinations[destination] = destinations.get(destination, 0) + 1
+    top_dest = sorted(destinations.items(), key=lambda item: -item[1])[:8]
+    if top_dest:
+        lines.append("<b>Назначение</b>: " + ", ".join(f"{name} — {count}"
+                                                    for name, count in top_dest))
+    lines.append("")
+    lines.append(f"<b>Последние {min(25, len(vessels))} по времени AIS</b>")
+    for vessel in vessels[:25]:
+        name = html.escape(str(vessel.get("name") or f"MMSI {vessel.get('mmsi')}"))
+        tail = [html.escape(str(vessel.get("type_label") or "—"))]
+        if vessel.get("destination"):
+            tail.append("→ " + html.escape(str(vessel["destination"])))
+        sog = vessel.get("sog")
+        try:
+            value = float(sog)
+        except (TypeError, ValueError):
+            value = 0.0
+        tail.append(f"{value:.1f} уз" if value > 0.5 else "без хода")
+        age = _age_hours(vessel.get("updated_at"))
+        if age is not None:
+            tail.append(core_module.span_text(age) + " назад")
+        stale = age is not None and age > stale_hours
+        marker = "🕓 " if stale else ""
+        lines.append(f"• {marker}<b>{name}</b> — " + " · ".join(tail))
+    lines.append("")
+    lines.append("Карточка любого судна: /vessel MMSI или /vessel название.")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…"
+    await message.answer(text, disable_web_page_preview=True)
+
+
+async def cmd_visits(message: Message):
+    """Стоянки в наших портах, которые идут сейчас."""
+    store = get_store()
+    core_module = _import("core")
+    try:
+        visits = await asyncio.to_thread(store.visits, 600)
+    except Exception as error:
+        await message.answer(f"Стоянки недоступны: {error}")
+        return
+    current = [visit for visit in visits if not visit.get("left_at")]
+    lines = ["⚓ <b>Стоянки сейчас</b>",
+             f"Открытых стоянок: <b>{len(current)}</b> из {len(visits)} в базе.", ""]
+    if not current:
+        lines.append("Сейчас никто из наблюдаемых судов не стоит в наших портах.")
+    groups: dict = {}
+    for visit in current:
+        groups.setdefault(str(visit.get("port") or "—"), []).append(visit)
+    for port, items in sorted(groups.items()):
+        lines.append(f"<b>{html.escape(port)}</b> — {len(items)}")
+        for visit in items[:15]:
+            vessel = store.vessel(visit.get("mmsi")) or {}
+            name = html.escape(str(vessel.get("name") or f"MMSI {visit.get('mmsi')}"))
+            entered = _import("store").parse_iso(visit.get("entered_at"))
+            if entered is not None:
+                hours = (datetime.now() - entered).total_seconds() / 3600.0
+                tail = f"стоит {core_module.span_text(hours)}, с {entered:%d.%m %H:%M}"
+            else:
+                tail = "время входа неизвестно"
+            draft = visit.get("draft_in")
+            if draft:
+                tail += f", осадка {draft:g} м" if isinstance(draft, float) else f", осадка {draft} м"
+            cargo = visit.get("cargo_kind")
+            if cargo:
+                tail += f", {html.escape(str(cargo))}"
+            lines.append(f"  • <b>{name}</b> — {tail}")
+        if len(items) > 15:
+            lines.append(f"  …и ещё {len(items) - 15}")
+    lines.append("")
+    lines.append("Источник — геозона порта по живому AIS; время идёт по часам.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_history(message: Message):
+    """История завершённых стоянок: приход, уход, длительность, осадка."""
+    store = get_store()
+    store_module = _import("store")
+    core_module = _import("core")
+    try:
+        visits = await asyncio.to_thread(store.visits, 500)
+        counts = await asyncio.to_thread(store.visit_counts)
+    except Exception as error:
+        await message.answer(f"История стоянок недоступна: {error}")
+        return
+    ended = [visit for visit in visits if visit.get("left_at")]
+    lines = ["🕘 <b>История стоянок</b>",
+             f"В базе: <b>{len(visits)}</b> стоянок, завершённых {len(ended)}.", ""]
+    if counts:
+        lines.append("<b>По портам</b>: " + ", ".join(
+            f"{html.escape(port)} — {data.get('visits', 0)}"
+            for port, data in sorted(counts.items())))
+        lines.append("")
+    if not ended:
+        lines.append("Завершённых стоянок пока нет — программа только начала наблюдение.")
+    for visit in ended[:20]:
+        vessel = store.vessel(visit.get("mmsi")) or {}
+        name = html.escape(str(vessel.get("name") or f"MMSI {visit.get('mmsi')}"))
+        entered = store_module.parse_iso(visit.get("entered_at"))
+        left = store_module.parse_iso(visit.get("left_at"))
+        if entered is not None and left is not None:
+            stay = core_module.span_text((left - entered).total_seconds() / 3600.0)
+            when = f"{entered:%d.%m %H:%M} → {left:%d.%m %H:%M}"
+        else:
+            stay, when = "—", "—"
+        tail = [html.escape(str(visit.get("port") or "—")), when, stay]
+        draft_in, draft_out = visit.get("draft_in"), visit.get("draft_out")
+        if draft_in is not None or draft_out is not None:
+            tail.append(f"осадка {core_module.fmt_number(draft_in)} → "
+                        f"{core_module.fmt_number(draft_out)} м")
+        if visit.get("cargo_kind"):
+            tail.append(html.escape(str(visit["cargo_kind"])))
+        lines.append(f"• <b>{name}</b> — " + " · ".join(tail))
+    if len(ended) > 20:
+        lines.append(f"…и ещё {len(ended) - 20}")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_alerts(message: Message):
+    """Журнал алертов: что отправлено и с каким результатом."""
+    store = get_store()
+    store_module = _import("store")
+    try:
+        rows = await asyncio.to_thread(store.alerts, 30)
+        today = await asyncio.to_thread(store.alerts_count_today)
+    except Exception as error:
+        await message.answer(f"Журнал алертов недоступен: {error}")
+        return
+    lines = ["🚨 <b>Алерты</b>",
+             f"Отправлено сегодня: <b>{today}</b> · в журнале последних: {len(rows)}.", ""]
+    if not rows:
+        lines.append("Алертов пока не было.")
+    for row in rows:
+        sent = store_module.parse_iso(row.get("sent_at"))
+        when = f"{sent:%d.%m %H:%M}" if sent is not None else "—"
+        icon = "✅" if row.get("ok") else "❌"
+        name = html.escape(str(row.get("name") or f"MMSI {row.get('mmsi')}"))
+        route = " → ".join(part for part in (row.get("origin"), row.get("destination"))
+                            if part)
+        tail = [when]
+        if route:
+            tail.append(html.escape(route))
+        error = (row.get("error") or "").strip()
+        if error:
+            tail.append(html.escape(error[:80]))
+        lines.append(f"{icon} <b>{name}</b> — " + " · ".join(tail))
+    lines.append("")
+    lines.append("Алерт — судно-танкер вышло из порта и идёт в один из наших портов.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+def _find_vessels(query: str) -> Tuple[Optional[dict], List[dict]]:
+    """Поиск судна по MMSI, IMO или части названия."""
+    store = get_store()
+    query = (query or "").strip()
+    if not query:
+        return None, []
+    if query.isdigit():
+        vessel = store.vessel(query)
+        if vessel:
+            return vessel, []
+        if len(query) >= 7:
+            for vessel in store.vessels(3000):
+                if str(vessel.get("imo") or "") == query:
+                    return vessel, []
+    needle = query.lower()
+    matches = [vessel for vessel in store.vessels(3000)
+               if needle in str(vessel.get("name") or "").lower()]
+    if len(matches) == 1:
+        return matches[0], []
+    return None, matches[:15]
+
+
+async def cmd_vessel(message: Message):
+    """Карточка любого судна: /vessel MMSI или /vessel название."""
+    parts = (message.text or "").split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    if not query:
+        await message.answer("Напишите MMSI или название: <code>/vessel 271072871</code>\n"
+                             "Найти MMSI можно в «🚢 Все суда» или «🌊 В море».",
+                             reply_markup=make_port_keyboard())
+        return
+    try:
+        vessel, matches = await asyncio.to_thread(_find_vessels, query)
+    except Exception as error:
+        await message.answer(f"Поиск не удался: {error}")
+        return
+    if vessel:
+        core = get_core()
+        photo = await asyncio.to_thread(_fetch_photo, vessel)
+        await send_vessel(message.bot, message.chat.id, vessel, core, photo)
+        return
+    if not matches:
+        await message.answer(f"Судно «{html.escape(query)}» не найдено в базе.",
+                             reply_markup=make_port_keyboard())
+        return
+    lines = [f"Нашлось несколько судов по «{html.escape(query)}» — уточните:"]
+    for vessel in matches:
+        name = html.escape(str(vessel.get("name") or "—"))
+        lines.append(f"• {name} — <code>/vessel {vessel.get('mmsi')}</code>")
+    await message.answer("\n".join(lines), reply_markup=make_port_keyboard())
+
+
 async def cmd_map(message: Message):
     """Карта-картинка: все суда, включая те, у кого нет координат."""
     try:
@@ -1017,12 +1299,50 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_expected, Command("expected"))
     dp.message.register(cmd_sea, Command("sea"))
     dp.message.register(cmd_port, Command("port"))
+    dp.message.register(cmd_all, Command("all"))
+    dp.message.register(cmd_visits, Command("visits"))
+    dp.message.register(cmd_history, Command("history"))
+    dp.message.register(cmd_alerts, Command("alerts"))
+    dp.message.register(cmd_vessel, Command("vessel"))
     dp.message.register(cmd_map, Command("map"))
-    dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_sources, Command("sources"))
+    # кнопки меню — те же пункты, что вкладки в приложении
+    dp.message.register(cmd_map, F.text == MAP_BUTTON)
+    dp.message.register(cmd_all, F.text == ALL_BUTTON)
+    dp.message.register(cmd_sea, F.text == SEA_BUTTON)
+    dp.message.register(cmd_visits, F.text == VISITS_BUTTON)
+    dp.message.register(cmd_history, F.text == HISTORY_BUTTON)
+    dp.message.register(cmd_expected, F.text == EXPECTED_BUTTON)
+    dp.message.register(cmd_alerts, F.text == ALERTS_BUTTON)
+    dp.message.register(cmd_sources, F.text == SOURCES_BUTTON)
     dp.message.register(handle_port, F.text.in_(DEFAULT_PORT_NAMES))
     dp.message.register(fallback)
     return bot, dp
+
+
+BOT_COMMANDS: List[Tuple[str, str]] = [
+    ("start", "клавиатура портов и меню"),
+    ("map", "карта с судами"),
+    ("all", "все суда в базе"),
+    ("sea", "кто сейчас в море"),
+    ("port", "кто в портах и на рейде"),
+    ("visits", "стоянки сейчас"),
+    ("history", "история стоянок"),
+    ("expected", "ожидаемые прибытия"),
+    ("alerts", "журнал алертов"),
+    ("vessel", "карточка судна по MMSI или названию"),
+    ("sources", "подключения и источники"),
+    ("help", "справка"),
+]
+
+
+async def publish_commands(bot: Bot) -> None:
+    """Меню команд в Telegram — те же пункты, что вкладки приложения."""
+    try:
+        await bot.set_my_commands([types.BotCommand(command=name, description=text)
+                                   for name, text in BOT_COMMANDS])
+    except Exception as error:
+        log.warning("Меню команд не обновлено: %s", error)
 
 
 def acquire_single_instance() -> bool:
@@ -1078,6 +1398,7 @@ async def run_bot():
         logging.error("Не задан telegram_token в data/config.json — бот не запущен.")
         return
     bot, dp = make_dispatcher()
+    await publish_commands(bot)
     ingesting = start_ingest()
     watcher = asyncio.create_task(expected_watcher(bot))
     logging.info("Ship Radar Bot запущен, ожидаю сообщения.")

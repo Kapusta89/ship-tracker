@@ -1,10 +1,12 @@
-"""Прогноз маршрута судна до нашего порта на 3–4 дня вперёд.
+"""Прогноз маршрута судна на 3 дня вперёд.
 
 AIS передаёт только текущую точку, курс и скорость, поэтому будущий путь
-считаем сами: каждые два часа сдвигаем судно, плавно доворачивая его к порту
-назначения. Если в поле Destination стоит наш порт, линия доводится до порта,
-и судно «входит» в него в расчётное время, а не уходит мимо. Суда без нашего
-порта в Destination прогноза не получают: для них он был бы гаданием по курсу.
+считаем сами: каждые два часа сдвигаем судно. Если в поле Destination стоит
+наш порт, линия доводится до порта и судно «входит» в него в расчётное время,
+а не уходит мимо. Если нашего порта в назначении нет (или назначение не
+передано), строим линию по текущему курсу и скорости — она показывает, где
+судно окажется через сутки, двое и трое, и куда его снесёт, если оно не
+свернёт. Дальше трёх дней прогноз по курсу смысла не имеет.
 """
 
 import math
@@ -12,9 +14,9 @@ from datetime import datetime, timedelta
 
 import geo
 
-# Дальше четырёх дней прогноз по курсу не имеет смысла: судно успевает
+# Дальше трёх дней прогноз по курсу не имеет смысла: судно успевает
 # сменить рейс, а погода и течения не учитываются вовсе.
-MAX_DAYS = 4.0
+MAX_DAYS = 3.0
 STEP_HOURS = 2.0
 # Насколько быстро судно может довернуть на новый курс: больше 20° в час
 # на практике не бывает, а мгновенный разворот на карте выглядел бы обманом.
@@ -130,13 +132,14 @@ def target_port(vessel, ports):
 
 
 def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
-    """Точки прогноза до нашего порта: [{'hours', 'at', 'lat', 'lon', 'label'}].
+    """Точки прогноза: [{'hours', 'at', 'lat', 'lon', 'label', 'course', ...}].
 
     Первая точка — текущее место, дальше — каждые `step_hours` часов. Если на
     Destination наш порт, маршрут ведёт в него: судно плавно доворачивает на
     порт и, дойдя, получает точку с `port` и `arrived`. Без нашего порта в
-    Destination прогноза нет. Последняя точка — через `days` дней или момент
-    прибытия, если судно успевает.
+    Destination линия идёт по текущему курсу и скорости — это ответ на вопрос
+    «где судно будет через сутки, двое, трое». Последняя точка — через `days`
+    дней или момент прибытия, если судно успевает.
     """
     vessel = vessel or {}
     try:
@@ -145,21 +148,25 @@ def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
     except (TypeError, ValueError):
         return []
     port = target_port(vessel, ports)
-    if not port:
-        return []
-    try:
-        target_lat, target_lon = float(port["lat"]), float(port["lon"])
-    except (KeyError, TypeError, ValueError):
-        return []
+    target = None
+    if port:
+        try:
+            target = (float(port["lat"]), float(port["lon"]))
+        except (KeyError, TypeError, ValueError):
+            port, target = None, None
 
     speed, course, source = estimates(vessel, track)
     if speed is None or not (MIN_SPEED_KNOTS <= speed <= 40):
+        return []
+    if target is None and course is None:
+        # без порта и без курса рисовать нечего: получилась бы точка на месте
         return []
 
     speed_kmh = speed * KNOT_KMH
     started = datetime.now()
     points = [{"hours": 0.0, "at": started, "lat": lat, "lon": lon,
-               "label": _label(0), "source": source}]
+               "label": _label(0), "source": source, "course": course,
+               "port": (port or {}).get("name")}]
     hours = 0.0
     horizon = days * 24
     while hours < horizon - 1e-9:
@@ -167,26 +174,53 @@ def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
         step_km = speed_kmh * step
         if step_km <= 0:
             break
-        distance = geo.haversine_km(lat, lon, target_lat, target_lon)
-        desired = bearing_deg(lat, lon, target_lat, target_lon)
-        new_course = _turn(course, desired, TURN_DEG_PER_HOUR * step)
-        off = abs(((desired - new_course + 540.0) % 360.0) - 180.0)
-        # Входим в порт, только если он рядом и судно уже смотрит в его сторону:
-        # иначе судно, выходящее из порта, «прибывало» бы в него же на первом шаге.
-        if distance <= step_km and (course is None or off <= 45):
-            hours += distance / speed_kmh
-            points.append({"hours": hours, "at": started + timedelta(hours=hours),
-                           "lat": target_lat, "lon": target_lon,
-                           "label": _label(hours), "port": port.get("name"),
-                           "arrived": True})
-            break
+        if target is not None:
+            target_lat, target_lon = target
+            distance = geo.haversine_km(lat, lon, target_lat, target_lon)
+            desired = bearing_deg(lat, lon, target_lat, target_lon)
+            new_course = _turn(course, desired, TURN_DEG_PER_HOUR * step)
+            off = abs(((desired - new_course + 540.0) % 360.0) - 180.0)
+            # Входим в порт, только если он рядом и судно уже смотрит в его
+            # сторону: иначе выходящее из порта судно «прибывало» бы в него же.
+            if distance <= step_km and (course is None or off <= 45):
+                hours += distance / speed_kmh
+                points.append({"hours": hours, "at": started + timedelta(hours=hours),
+                               "lat": target_lat, "lon": target_lon,
+                               "label": _label(hours), "port": port.get("name"),
+                               "course": desired, "arrived": True})
+                break
+        else:
+            new_course = course
         lat, lon = destination_point(lat, lon, new_course, step_km)
         course = new_course
         hours += step
         points.append({"hours": hours, "at": started + timedelta(hours=hours),
                        "lat": lat, "lon": lon, "label": _label(hours),
-                       "source": source})
+                       "source": source, "course": new_course,
+                       "port": (port or {}).get("name")})
     return points
+
+
+def course_text(course):
+    """Курс словами: 245° — юго-запад."""
+    if course is None:
+        return "—"
+    names = ("север", "северо-восток", "восток", "юго-восток", "юг", "юго-запад",
+             "запад", "северо-запад")
+    index = int((float(course) % 360) / 45.0 + 0.5) % 8
+    return f"{float(course) % 360:.0f}° ({names[index]})"
+
+
+def distance_text(points, index=-1):
+    """Сколько километров пройдёт судно от текущей точки до точки index."""
+    if len(points) < 2:
+        return None
+    subset = points if index is None or index < 0 else points[:index + 1]
+    total = 0.0
+    for first, second in zip(subset, subset[1:]):
+        total += geo.haversine_km(float(first["lat"]), float(first["lon"]),
+                                  float(second["lat"]), float(second["lon"]))
+    return total
 
 
 def daily_points(points):

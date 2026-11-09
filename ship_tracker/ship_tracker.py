@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.31"
+APP_VERSION = "2026.12.1"
 
 import ais_feed
 import cargo
@@ -535,7 +535,7 @@ class RadarCanvas:
         return points
 
     def _forecast_ready(self, vessel, allow_stale=False):
-        """Стоит ли строить прогноз: судно актуально, в море и идёт в наш порт.
+        """Стоит ли строить прогноз: судно актуально, в море и куда-то идёт.
 
         allow_stale — для выбранного судна: раз пользователь кликнул именно по
         нему, прогноз по последним известным данным полезнее, чем ничего.
@@ -554,7 +554,12 @@ class RadarCanvas:
             return False
         if not (forecast.MIN_SPEED_KNOTS <= sog <= 40):
             return False
-        return forecast.target_port(vessel, ports) is not None
+        if forecast.target_port(vessel, ports) is not None:
+            return True
+        # нашего порта в назначении нет — строим линию по курсу, но без курса
+        # она бессмысленна (стоящее судно и так видно на карте)
+        _speed, course, _source = forecast.estimates(vessel)
+        return course is not None
 
     def _draw_forecasts(self, projector, vessels):
         """Прогноз пути до нашего порта — только для выбранного судна.
@@ -578,19 +583,29 @@ class RadarCanvas:
             coords.extend((x, y))
         if len(coords) < 4:
             return
-        color = "#39d3ff"
+        # в наш порт — голубая, по курсу — жёлтая: видно, где прогноз твёрдый,
+        # а где это просто продолжение текущего курса
+        ports = self.config.get("ports") or []
+        to_port = forecast.target_port(vessel, ports) is not None
+        color = "#39d3ff" if to_port else "#ffc247"
+        text_color = "#8fe6ff" if to_port else "#ffdf9a"
         canvas.create_line(*coords, fill=color, dash=(4, 3), width=2)
         for point in forecast.daily_points(points):
             x, y = projector.to_screen(point["lat"], point["lon"])
             canvas.create_oval(x - 3, y - 3, x + 3, y + 3, outline=color, width=1)
             canvas.create_text(x + 6, y - 6, text=point["label"], anchor="w",
-                               fill="#8fe6ff", font=("Consolas", 7))
+                               fill=text_color, font=("Consolas", 7))
         last = points[-1]
+        x, y = projector.to_screen(last["lat"], last["lon"])
         if last.get("arrived"):
-            x, y = projector.to_screen(last["lat"], last["lon"])
             canvas.create_text(x + 8, y + 10,
                                text=f"{last.get('port') or ''} {last['at']:%d.%m %H:%M}",
-                               anchor="w", fill="#8fe6ff", font=("Consolas", 7))
+                               anchor="w", fill=text_color, font=("Consolas", 7))
+        else:
+            canvas.create_text(x + 8, y + 10,
+                               text=f"{last['at']:%d.%m %H:%M} · курс "
+                                    f"{forecast.course_text(last.get('course'))}",
+                               anchor="w", fill=text_color, font=("Consolas", 7))
 
     def stale_seconds(self):
         """Через сколько секунд без сообщений судно считается устаревшим."""
@@ -618,8 +633,8 @@ class RadarCanvas:
                 text += f", скрыто старых: {traffic_hidden}"
             text += "\n"
         if self.show_forecast:
-            text += (f"пунктир — прогноз пути до нашего порта "
-                     f"(до {int(forecast.MAX_DAYS)} сут)\n")
+            text += (f"пунктир — прогноз выбранного судна на {int(forecast.MAX_DAYS)} сут: "
+                     f"голубой — в наш порт, жёлтый — по текущему курсу\n")
         text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
         self.canvas.create_text(10, 10, anchor="nw", text=text,
                                 fill="#5f8ea3", font=("Consolas", 8))
@@ -827,7 +842,7 @@ class App:
         ttk.Checkbutton(toolbar, text="трек", variable=self.var_tracks,
                         command=self.toggle_tracks).pack(side="left", padx=(8, 0))
         self.var_forecast = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="прогноз 4 дня", variable=self.var_forecast,
+        ttk.Checkbutton(toolbar, text="прогноз 3 дня", variable=self.var_forecast,
                         command=self.toggle_forecast).pack(side="left", padx=(8, 0))
         self.var_stale = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="устаревшие", variable=self.var_stale,
@@ -2301,11 +2316,14 @@ class App:
         return "\n".join(lines)
 
     def forecast_lines(self, vessel):
-        """Блок карточки: прогноз пути до нашего порта на 3–4 дня вперёд."""
+        """Блок карточки: прогноз пути на 3 суток вперёд.
+
+        Если в Destination наш порт — линия ведёт в него и показывает время
+        прибытия. Если нет — прогноз идёт по текущему курсу и скорости:
+        где судно окажется через сутки, двое и трое.
+        """
         ports = self.config.get("ports") or []
         port = forecast.target_port(vessel, ports)
-        if not port:
-            return []
         if vessel.get("lat") is None or vessel.get("lon") is None:
             return []
         if ports and geo.port_at(vessel.get("lat"), vessel.get("lon"), ports):
@@ -2313,29 +2331,44 @@ class App:
         track = None
         if getattr(self, "radar", None) is not None and vessel.get("mmsi") == self.selected:
             track = self.radar.track
+        speed, course, source = forecast.estimates(vessel, track)
         try:
             points = forecast.route(vessel, ports, track=track)
         except Exception:
             points = []
-        name = port.get("name")
         if len(points) < 2:
-            sog = vessel.get("sog")
-            if sog is None:
-                return ["Прогноз маршрута: не строится — AIS не передал скорость"]
-            return [f"Прогноз маршрута: не строится — скорость {fmt_number(sog)} уз "
-                    f"слишком мала для расчёта"]
-        source = (points[0] or {}).get("source") or "AIS"
-        speed, _course, _src = forecast.estimates(vessel, track)
-        head = (f"Прогноз маршрута до {name} (до {int(forecast.MAX_DAYS)} сут, "
-                f"скорость {fmt_number(speed)} уз — {source}):")
+            if speed is None or not (forecast.MIN_SPEED_KNOTS <= speed <= 40):
+                return ["Прогноз пути: не строится — AIS не передал скорость"]
+            return [f"Прогноз пути: не строится — нет курса (скорость "
+                    f"{fmt_number(speed)} уз, но судно не передало COG/heading)"]
+        name = (port or {}).get("name")
+        if port:
+            head = (f"Прогноз пути до {name} (до {int(forecast.MAX_DAYS)} сут, "
+                    f"скорость {fmt_number(speed)} уз — {source}):")
+        else:
+            head = (f"Прогноз пути по курсу на {int(forecast.MAX_DAYS)} сут "
+                    f"({forecast.course_text(course)}, скорость {fmt_number(speed)} уз — "
+                    f"{source}):")
         lines = [head]
-        for point in forecast.daily_points(points)[1:]:
-            km = geo.haversine_km(point["lat"], point["lon"],
-                                  float(port["lat"]), float(port["lon"]))
+        daily = [point for point in forecast.daily_points(points) if point["hours"] > 0]
+        for point in daily:
+            index = next((i for i, item in enumerate(points) if item is point), None)
+            passed = forecast.distance_text(points, index) if index is not None else None
             where = f"{point['lat']:.2f}, {point['lon']:.2f}"
-            lines.append(f"  {point['label']:<8} {point['at']:%d.%m %H:%M} · {where} · "
-                         f"{fmt_number(round(km))} км до {name}")
-        lines.append("  " + forecast.summary(points, name))
+            if port:
+                km = geo.haversine_km(point["lat"], point["lon"],
+                                      float(port["lat"]), float(port["lon"]))
+                tail = f"{fmt_number(round(km))} км до {name}"
+            else:
+                tail = (f"пройдёт {fmt_number(round(passed))} км"
+                        if passed is not None else "")
+            lines.append(f"  {point['label']:<8} {point['at']:%d.%m %H:%M} · {where}"
+                         + (f" · {tail}" if tail else ""))
+        if port:
+            lines.append("  " + forecast.summary(points, name))
+        else:
+            lines.append("  конечная точка — по текущему курсу без учёта поворотов; "
+                         "если судно сменит курс, линия сдвинется")
         return lines
 
     def explain(self, vessel) -> str:
