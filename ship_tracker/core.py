@@ -836,58 +836,18 @@ class RadarCore:
             value = 900.0
         return max(0.0, min(1500.0, value))
 
-    def vessel_links(self, vessel, visit_ports=None) -> dict:
-        """Связи судна с нашими портами: {порт: {"kind": «идёт» | «был»}}.
+    def port_names(self) -> list:
+        """Все написания наших портов, как они бывают в поле Destination."""
+        variants = geo.port_aliases(self.config.get("ports") or [])
+        return [variant for group in variants.values() for variant in group]
 
-        «Идёт» — порт в поле Destination; «был» — программа видела визит
-        (стоял в порту или выходил оттуда). Расстояние не важно: далёкое
-        судно с нашим портом в Destination тоже связано с ним. Судно, которое
-        просто проходит рядом с портом, связанным не считается.
-        """
-        links = {}
-        if not vessel:
-            return links
-        ports = self.config.get("ports") or []
-        destination = str(vessel.get("destination") or "")
-        if destination:
-            for name, variants in geo.port_aliases(ports).items():
-                if matched_port(destination, list(variants)):
-                    links[name] = {"kind": "идёт"}
-        mmsi = str(vessel.get("mmsi") or "")
-        if mmsi:
-            # visit_ports — один запрос на все суда списка: иначе вкладка
-            # «В море» делала бы по запросу в базу на каждую строку
-            if isinstance(visit_ports, dict):
-                for name in visit_ports.get(mmsi, ()):
-                    links.setdefault(name, {"kind": "был"})
-            else:
-                try:
-                    for visit in self.store.visits(20, mmsi=mmsi):
-                        name = str(visit.get("port") or "").strip().upper()
-                        if name and name not in links:
-                            links[name] = {"kind": "был"}
-                except Exception:
-                    pass
-        return links
+    def destination_is_ours(self, text) -> bool:
+        """Стоит ли в Destination нашего судна один из наших портов."""
+        return bool(text) and bool(matched_port(text, self.port_names()))
 
-    def linked_vessels(self, limit=2000) -> list:
-        """Суда, связанные с нашими портами по данным AIS, без ограничения
-        по расстоянию: наш порт в Destination или визит в наш порт.
-        Просто проходящие рядом суда сюда не попадают.
-        """
-        try:
-            visit_ports = self.store.visit_ports()
-        except Exception:
-            visit_ports = {}
-        result = []
-        try:
-            rows = self.store.vessels(limit)
-        except Exception:
-            return result
-        for vessel in rows:
-            if self.vessel_links(vessel, visit_ports):
-                result.append(vessel)
-        return result
+    def was_in_our_port(self, mmsi) -> bool:
+        """Было ли судно в нашем порту или вышло оттуда за последние дни."""
+        return self._history_related(mmsi)
 
     def _history_related(self, mmsi) -> bool:
         """Был ли визит в наш порт / выход из него. Ответ кэшируется на минуту:
@@ -949,11 +909,10 @@ class RadarCore:
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
 
-        Берём только связанные с нашими портами суда (наш порт в Destination
-        или визит в наш порт) с свежей позицией вне портовых геозон; суда,
-        которые лишь проходят рядом, не показываются. «В море» — это и идущие
-        под ходом, и те, кто стоит на рейде или на якоре перед входом: любой,
-        кто не в порту. Порядок: сначала под ходом (быстрее — выше).
+        Берём только связанные с нашими портами суда, у которых есть свежая
+        позиция вне портовых геозон. «В море» — это и идущие под ходом, и те,
+        кто стоит на рейде или на якоре перед входом: любой, кто не в порту.
+        Порядок: сначала под ходом (быстрее — выше), потом остальные.
         """
         try:
             fresh_hours = float(self.config.get("sea_fresh_hours") or 12)
@@ -962,7 +921,7 @@ class RadarCore:
         ports = self.config.get("ports") or []
         now = datetime.now()
         rows = []
-        for vessel in self.linked_vessels(limit):
+        for vessel in self.related_vessels(limit):
             lat, lon = vessel.get("lat"), vessel.get("lon")
             if lat is None or lon is None:
                 continue

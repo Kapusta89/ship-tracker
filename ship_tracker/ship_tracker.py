@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.24"
+APP_VERSION = "2026.11.22"
 
 import ais_feed
 import cargo
@@ -833,46 +833,29 @@ class App:
         """Вкладка «В море»: суда с позицией вне портов и без статики AIS."""
         tk, ttk = self.tk, self.ttk
         frame = self.tab_sea
-        ttk.Label(frame, text="Все суда в море, которые как-либо связаны с нашими портами, на "
-                              "любом расстоянии: у судна в Destination стоит наш порт или оно "
-                              "стояло/выходило из нашего порта. Суда, которые только проходят "
-                              "рядом, не показываются. Кнопки портов оставляют только суда, "
-                              "связанные с выбранным портом. Расстояние и прибытие — по прямой "
-                              "и текущей скорости; заявленный капитаном ETA — в карточке.",
-                  foreground="#555", wraplength=1200, justify="left").pack(
+        ttk.Label(frame, text="Судна в море, связанные с нашими портами: в Destination стоит "
+                              "наш порт (идут в него) или судно вышло из нашего порта за "
+                              "последние дни. Остальной трафик района скрыт — его можно "
+                              "включить галочкой. Расстояние и прибытие — по прямой и "
+                              "текущей скорости; заявленный капитаном ETA — в карточке.",
+                  foreground="#555", wraplength=1100, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
-        port_bar = ttk.Frame(frame)
-        port_bar.pack(fill="x", padx=8, pady=(0, 4))
-        self.sea_port = tk.StringVar(value="")
-        self.sea_port_buttons = {}
-        ports = [((port.get("name") or "").upper(), port.get("label") or port.get("name"))
-                 for port in self.config.get("ports") or []]
-        for name, label in [("", "Все порты")] + ports:
-            button = tk.Button(port_bar, text=label, command=lambda key=name: self.pick_sea_port(key),
-                               relief="groove", padx=8, pady=2, font=("Segoe UI", 9))
-            button.pack(side="left", padx=(0, 4))
-            self.sea_port_buttons[name] = button
-        ttk.Button(port_bar, text="Обновить", command=self.refresh_sea_table).pack(side="right")
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", padx=8, pady=(0, 4))
+        self.var_sea_all = tk.IntVar(value=0)
+        ttk.Checkbutton(controls, text="Показывать весь трафик района, а не только связанный "
+                                       "с нашими портами",
+                        variable=self.var_sea_all, command=self.refresh_sea_table).pack(side="left")
+        ttk.Button(controls, text="Обновить", command=self.refresh_sea_table).pack(side="right")
         self.sea_info = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.sea_info, foreground="#333", wraplength=1200,
                   justify="left").pack(anchor="w", padx=8, pady=(0, 4))
         self.sea_tree = self.make_tree(
-            frame, (("name", "Судно", 170), ("flag", "Флаг", 140),
-                    ("type", "Тип", 105), ("dest", "Назначение", 140),
-                    ("link", "Связь с портом", 190),
-                    ("sog", "Узлы", 55), ("course", "Курс", 70),
-                    ("distance", "До порта", 145), ("eta", "Прибытие", 150),
-                    ("updated", "Обновлено", 125), ("mmsi", "MMSI", 95)))
-        self.pick_sea_port("")
-
-    def pick_sea_port(self, name):
-        """Выбор порта во вкладке «В море»: подсветка кнопки и фильтр списка."""
-        self.sea_port.set(name or "")
-        for key, button in getattr(self, "sea_port_buttons", {}).items():
-            active = (key == (name or ""))
-            button.configure(relief="sunken" if active else "groove",
-                             background="#d7e6f5" if active else "#f0f0f0")
-        self.refresh_sea_table()
+            frame, (("name", "Судно", 180), ("flag", "Флаг", 150),
+                    ("type", "Тип", 110), ("dest", "Назначение", 150),
+                    ("sog", "Узлы", 60), ("course", "Курс", 70),
+                    ("distance", "До порта", 150), ("eta", "Прибытие", 155),
+                    ("updated", "Обновлено", 130), ("mmsi", "MMSI", 95)))
 
     def build_visits(self):
         tk, ttk = self.tk, self.ttk
@@ -2482,47 +2465,30 @@ class App:
                 f"Обновляется само; двойной щелчок открывает карточку.")
 
     def refresh_sea_table(self):
-        """Вкладка «В море»: все суда, связанные с нашими портами, на любом расстоянии.
-
-        Связь — наш порт в Destination (идёт к нам) или визит в наш порт: судно
-        стояло в нём или вышло оттуда. Далёкое судно в Средиземном море тоже
-        здесь, если оно идёт в Рени или было в Измаиле.
-        """
+        """Обновляет вкладку «В море»: только свежие позиции вне портов."""
         if not hasattr(self, "sea_tree"):
             return
         tree = self.sea_tree
         for item in tree.get_children():
             tree.delete(item)
         try:
-            rows = self.core.sea_vessels(1000)
+            rows = self.core.sea_vessels(500)
         except Exception as error:
             self.log(f"Список «В море»: {error}")
             rows = []
-        try:
-            visit_ports = self.store.visit_ports()
-        except Exception:
-            visit_ports = {}
+        linked = []
         for vessel in rows:
-            try:
-                vessel["links"] = self.core.vessel_links(vessel, visit_ports)
-            except Exception:
-                vessel["links"] = {}
-        counts = {}
-        for vessel in rows:
-            for port in vessel["links"]:
-                counts[port] = counts.get(port, 0) + 1
-        chosen = (self.sea_port.get() if getattr(self, "sea_port", None) is not None else "")
-        chosen = (chosen or "").upper()
-        for name, button in getattr(self, "sea_port_buttons", {}).items():
-            label = next((p.get("label") or p.get("name")
-                          for p in self.config.get("ports") or []
-                          if (p.get("name") or "").upper() == name), "Все порты")
-            if name:
-                button.configure(text=f"{label} ({counts.get(name, 0)})")
-            else:
-                button.configure(text=f"Все порты ({len(rows)})")
-        if chosen:
-            rows = [vessel for vessel in rows if chosen in (vessel.get("links") or {})]
+            ours = self.core.destination_is_ours(vessel.get("destination"))
+            was = self.core.was_in_our_port(vessel.get("mmsi"))
+            vessel["dest_ours"] = ours
+            vessel["was_in_port"] = was
+            if ours or was:
+                linked.append(vessel)
+        hidden = len(rows) - len(linked)
+        show_all = bool(getattr(self, "var_sea_all", None) is not None
+                        and self.var_sea_all.get())
+        if not show_all:
+            rows = linked
         moved = 0
         for vessel in rows:
             try:
@@ -2537,12 +2503,16 @@ class App:
                             f"{voyage.get('port') or '—'}")
             elif voyage.get("port"):
                 distance = f"→ {voyage.get('port')}"
+            note = ""
+            if vessel.get("dest_ours"):
+                note = " · наш порт"
+            elif vessel.get("was_in_port"):
+                note = " · вышло из нашего порта"
             tree.insert("", "end", tags=(vessel["mmsi"],), values=(
                 vessel.get("name") or "—",
                 flags.flag_text(vessel.get("mmsi")),
                 vessel.get("type_label") or "—",
-                vessel.get("destination") or "—",
-                self.sea_link_text(vessel, voyage),
+                (vessel.get("destination") or "—") + note,
                 fmt_number(vessel.get("sog")),
                 self.course_text(vessel),
                 distance,
@@ -2551,29 +2521,42 @@ class App:
                 vessel.get("mmsi"),
             ))
         try:
+            others = self.core.traffic_vessels(400) if show_all else []
+        except Exception as error:
+            self.log(f"Трафик района: {error}")
+            others = []
+        if others:
+            tree.insert("", "end", tags=("group",), values=(
+                f"— трафик района, не идущие в наши порты: {len(others)} —",
+                "", "", "", "", "", "", "", "", ""))
+            for vessel in others:
+                distance = "—"
+                if vessel.get("nearest_km") is not None:
+                    distance = (f"{fmt_number(round(vessel['nearest_km']))} км · "
+                                f"{vessel.get('nearest_port') or '—'}")
+                tree.insert("", "end", tags=(str(vessel.get("mmsi")),), values=(
+                    vessel.get("name") or "—",
+                    flags.flag_text(vessel.get("mmsi")),
+                    vessel.get("type_label") or "—",
+                    vessel.get("destination") or "—",
+                    fmt_number(vessel.get("sog")),
+                    self.course_text(vessel),
+                    distance,
+                    "—",
+                    self.fmt_time(vessel.get("updated_at")),
+                    vessel.get("mmsi"),
+                ))
+        try:
             silent = self.core.sea_without_position(500)
         except Exception:
             silent = []
-        where = f"по порту {chosen}" if chosen else "по всем нашим портам"
         self.sea_info.set(
-            f"В море и связаны с нашими портами {where}: {len(rows)} "
-            f"(под ходом {moved}, на рейде/якоре {len(rows) - moved}), без ограничения "
-            f"по расстоянию. Без сигнала AIS: {len(silent)} — они остаются во вкладке "
-            f"«Все суда». Обновляется само; двойной щелчок открывает карточку.")
-
-    def sea_link_text(self, vessel, voyage=None):
-        """Чем судно связано с нашими портами: идёт в порт или был в нём."""
-        links = vessel.get("links") or {}
-        parts = []
-        for name in sorted(links):
-            kind = (links[name] or {}).get("kind")
-            if kind == "идёт":
-                parts.append(f"идёт в {name}")
-            elif kind == "был":
-                parts.append(f"был в {name}")
-            else:
-                parts.append(name)
-        return " · ".join(parts) or "—"
+            f"В море и связаны с нашими портами: {len(rows)} "
+            f"(под ходом {moved}, на рейде/якоре {len(rows) - moved}). "
+            f"Скрыто несвязанного трафика: {hidden}."
+            + (f" Трафик района показан: {len(others)}." if show_all else "")
+            + f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
+              f"Обновляется само; двойной щелчок открывает карточку.")
 
     def course_text(self, vessel):
         """Курс судна в градусах и по стороне света."""
