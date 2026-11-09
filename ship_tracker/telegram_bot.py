@@ -250,6 +250,13 @@ def route_text(vessel: dict) -> str:
         points = []
 
     if len(points) < 2:
+        ports = CONFIG.get("ports") or []
+        try:
+            ours = forecast.target_port(vessel, ports) is not None
+        except Exception:
+            ours = False
+        if not ours:
+            return "🗺 Маршрут: в Destination нет нашего порта — прогноз до порта не строится"
         sog = vessel.get("sog") or 0
         try:
             sog = float(sog)
@@ -259,7 +266,7 @@ def route_text(vessel: dict) -> str:
             return "🗺 Маршрут: судно почти не движется — прогноз не строится"
         return "🗺 Маршрут: нет курса в AIS — прогноз не строится"
 
-    lines = ["🗺 Маршрут (прогноз на 5 дней):"]
+    lines = ["🗺 Маршрут (прогноз до нашего порта, до 4 сут):"]
     for point in forecast.daily_points(points):
         suffix = f" ({point['port']})" if point.get("port") else ""
         when = f"{point['at']:%d.%m %H:%M}" if point.get("at") else ""

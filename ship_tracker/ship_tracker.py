@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.11.26"
+APP_VERSION = "2026.11.27"
 
 import ais_feed
 import cargo
@@ -498,14 +498,16 @@ class RadarCanvas:
 
     def _forecast_for(self, vessel):
         """Прогноз маршрута с кэшем: пересчёт только при новых данных AIS."""
+        ports = self.config.get("ports") or []
         key = (vessel.get("updated_at"), vessel.get("sog"), vessel.get("cog"),
-               vessel.get("heading"), vessel.get("destination"))
+               vessel.get("heading"), vessel.get("destination"),
+               forecast.MAX_DAYS, tuple(sorted((p.get("name") or "") for p in ports)))
         mmsi = vessel.get("mmsi")
         cached = self._forecast_cache.get(mmsi)
         if cached and cached[0] == key:
             return cached[1]
         try:
-            points = forecast.route(vessel, self.config.get("ports") or [])
+            points = forecast.route(vessel, ports)
         except Exception:
             points = []
         if len(self._forecast_cache) > 5000:
@@ -513,14 +515,34 @@ class RadarCanvas:
         self._forecast_cache[mmsi] = (key, points)
         return points
 
+    def _forecast_ready(self, vessel):
+        """Стоит ли строить прогноз: судно актуально, в море и идёт в наш порт."""
+        if vessel.get("lat") is None or vessel.get("lon") is None:
+            return False
+        age = metrics.freshness_hours(vessel.get("updated_at"))
+        if age is not None and age * 3600 > self.stale_seconds():
+            return False
+        ports = self.config.get("ports") or []
+        if ports and geo.port_at(vessel.get("lat"), vessel.get("lon"), ports):
+            return False
+        try:
+            sog = float(vessel.get("sog") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not (forecast.MIN_SPEED_KNOTS <= sog <= 40):
+            return False
+        return forecast.target_port(vessel, ports) is not None
+
     def _draw_forecasts(self, projector, vessels):
-        """Линии прогноза: пунктир — ожидаемый путь, метки — сутки вперёд."""
+        """Прогноз пути до нашего порта: пунктир, метки суток и время прибытия."""
         if not self.show_forecast:
             return
         canvas = self.canvas
         for vessel in vessels:
             is_selected = vessel.get("mmsi") == self.selected
             if self.targets_only and not is_selected:
+                continue
+            if not self._forecast_ready(vessel):
                 continue
             points = self._forecast_for(vessel)
             if len(points) < 2:
@@ -541,6 +563,12 @@ class RadarCanvas:
                                        outline=color, width=1)
                     canvas.create_text(x + 6, y - 6, text=point["label"], anchor="w",
                                        fill="#8fe6ff", font=("Consolas", 7))
+            last = points[-1]
+            if is_selected and last.get("arrived"):
+                x, y = projector.to_screen(last["lat"], last["lon"])
+                canvas.create_text(x + 8, y + 10,
+                                   text=f"{last.get('port') or ''} {last['at']:%d.%m %H:%M}",
+                                   anchor="w", fill="#8fe6ff", font=("Consolas", 7))
 
     def stale_seconds(self):
         """Через сколько секунд без сообщений судно считается устаревшим."""
@@ -562,6 +590,9 @@ class RadarCanvas:
             text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
         if traffic:
             text += f"трафик района (точки): {traffic}\n"
+        if self.show_forecast:
+            text += (f"пунктир — прогноз пути до нашего порта "
+                     f"(до {int(forecast.MAX_DAYS)} сут)\n")
         text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
         self.canvas.create_text(10, 10, anchor="nw", text=text,
                                 fill="#5f8ea3", font=("Consolas", 8))
@@ -769,7 +800,7 @@ class App:
         ttk.Checkbutton(toolbar, text="трек", variable=self.var_tracks,
                         command=self.toggle_tracks).pack(side="left", padx=(8, 0))
         self.var_forecast = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="прогноз 5 дн", variable=self.var_forecast,
+        ttk.Checkbutton(toolbar, text="прогноз 4 дня", variable=self.var_forecast,
                         command=self.toggle_forecast).pack(side="left", padx=(8, 0))
         self.var_schematic = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="схематический вид", variable=self.var_schematic,
@@ -2096,6 +2127,7 @@ class App:
                              f"({fmt_number(voyage['distance_km'])} км до {port_name})")
         lines.append(f"Срок прибытия (AIS): {fmt_moment(declared) if declared else '—'} "
                       f"(передаёт капитан, в UTC)")
+        lines += self.forecast_lines(vessel)
         expected = portcalls.expected_for_mmsi(mmsi)
         if expected:
             lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
@@ -2216,6 +2248,44 @@ class App:
                 lines.append(f"  {visit['port']}: {self.fmt_time(visit.get('entered_at'))} → {left}{span}"
                              + (f" · {visit_cargo}" if visit_cargo else "") + drafts)
         return "\n".join(lines)
+
+    def forecast_lines(self, vessel):
+        """Блок карточки: прогноз пути до нашего порта на 3–4 дня вперёд."""
+        ports = self.config.get("ports") or []
+        port = forecast.target_port(vessel, ports)
+        if not port:
+            return []
+        if vessel.get("lat") is None or vessel.get("lon") is None:
+            return []
+        if ports and geo.port_at(vessel.get("lat"), vessel.get("lon"), ports):
+            return []
+        track = None
+        if getattr(self, "radar", None) is not None and vessel.get("mmsi") == self.selected:
+            track = self.radar.track
+        try:
+            points = forecast.route(vessel, ports, track=track)
+        except Exception:
+            points = []
+        name = port.get("name")
+        if len(points) < 2:
+            sog = vessel.get("sog")
+            if sog is None:
+                return ["Прогноз маршрута: не строится — AIS не передал скорость"]
+            return [f"Прогноз маршрута: не строится — скорость {fmt_number(sog)} уз "
+                    f"слишком мала для расчёта"]
+        source = (points[0] or {}).get("source") or "AIS"
+        speed, _course, _src = forecast.estimates(vessel, track)
+        head = (f"Прогноз маршрута до {name} (до {int(forecast.MAX_DAYS)} сут, "
+                f"скорость {fmt_number(speed)} уз — {source}):")
+        lines = [head]
+        for point in forecast.daily_points(points)[1:]:
+            km = geo.haversine_km(point["lat"], point["lon"],
+                                  float(port["lat"]), float(port["lon"]))
+            where = f"{point['lat']:.2f}, {point['lon']:.2f}"
+            lines.append(f"  {point['label']:<8} {point['at']:%d.%m %H:%M} · {where} · "
+                         f"{fmt_number(round(km))} км до {name}")
+        lines.append("  " + forecast.summary(points, name))
+        return lines
 
     def explain(self, vessel) -> str:
         if not ais_feed.is_tanker_code(vessel.get("type_code")):
