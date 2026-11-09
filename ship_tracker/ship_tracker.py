@@ -1077,18 +1077,37 @@ class App:
             hours += int(value) / 60 if unit == "m" else int(value)
         return hours
 
+    # Месяцы AIS-catcher пишет по-английски («09 Nov 18:00»); разбираем
+    # по словарю, а не через strptime: тот ругается на дату без года и зависит
+    # от системной локали (в русской «Nov» уже не месяц).
+    _MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+               "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
     @staticmethod
     def _eta_state(text):
-        """Прошёл ли заявленный ETA: строка вида «09 Nov 18:00» (без года)."""
-        from datetime import datetime as _dt
-        raw = str(text or "").strip()
+        """Сколько часов осталось до заявленного ETA (отрицательное — прошёл)."""
+        parts = str(text or "").strip().split()
+        if len(parts) != 3:
+            return None
         try:
-            moment = _dt.strptime(raw, "%d %b %H:%M").replace(year=datetime.now().year)
+            day = int(parts[0])
+            month = App._MONTHS.get(parts[1].strip(".").lower())
+            hour, minute = (int(piece) for piece in parts[2].split(":"))
+        except (ValueError, TypeError):
+            return None
+        if not month:
+            return None
+        now = datetime.now()
+        try:
+            moment = datetime(now.year, month, day, hour, minute)
         except ValueError:
             return None
-        if moment > datetime.now() + timedelta(days=300):   # ETA «прошлого года»
-            moment = moment.replace(year=moment.year - 1)
-        return round((moment - datetime.now()).total_seconds() / 3600, 1)
+        if moment > now + timedelta(days=300):   # ETA «прошлого года»
+            try:
+                moment = moment.replace(year=moment.year - 1)
+            except ValueError:
+                return None
+        return round((moment - now).total_seconds() / 3600, 1)
 
     def _expected_watch(self):
         """Раз в минуту смотрим, не обновил ли файл фоновый канал AIS-catcher."""
