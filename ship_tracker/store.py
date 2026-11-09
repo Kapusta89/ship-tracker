@@ -312,6 +312,16 @@ class Store:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
+    def visit_ports(self) -> dict:
+        """MMSI → порты, в которых судно было (по всем визитам в базе)."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT mmsi, UPPER(port) AS port FROM port_visits").fetchall()
+        result = {}
+        for row in rows:
+            result.setdefault(str(row["mmsi"]), set()).add(row["port"])
+        return result
+
     def visit_counts(self) -> dict:
         """Сколько визитов и сколько судов было в каждом нашем порту."""
         with self._lock:

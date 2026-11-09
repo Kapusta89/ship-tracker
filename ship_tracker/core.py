@@ -836,18 +836,55 @@ class RadarCore:
             value = 900.0
         return max(0.0, min(1500.0, value))
 
-    def port_names(self) -> list:
-        """Все написания наших портов, как они бывают в поле Destination."""
-        variants = geo.port_aliases(self.config.get("ports") or [])
-        return [variant for group in variants.values() for variant in group]
+    def vessel_links(self, vessel, visit_ports=None) -> dict:
+        """Связи судна с нашими портами: {порт: {"kind": «идёт»|«был»|«рядом», km}}.
 
-    def destination_is_ours(self, text) -> bool:
-        """Стоит ли в Destination нашего судна один из наших портов."""
-        return bool(text) and bool(matched_port(text, self.port_names()))
-
-    def was_in_our_port(self, mmsi) -> bool:
-        """Было ли судно в нашем порту или вышло оттуда за последние дни."""
-        return self._history_related(mmsi)
+        «Идёт» — порт в поле Destination; «был» — программа видела визит
+        (стоял или выходил); «рядом» — судно в пределах `port_watch_km` от
+        порта. Расстояние при этом не важно: далёкое судно с нашим портом
+        в Destination тоже связано с ним.
+        """
+        links = {}
+        if not vessel:
+            return links
+        ports = self.config.get("ports") or []
+        destination = str(vessel.get("destination") or "")
+        if destination:
+            for name, variants in geo.port_aliases(ports).items():
+                if matched_port(destination, list(variants)):
+                    links[name] = {"kind": "идёт"}
+        mmsi = str(vessel.get("mmsi") or "")
+        if mmsi:
+            # visit_ports — один запрос на все суда списка: иначе вкладка
+            # «В море» делала бы по запросу в базу на каждую строку
+            if isinstance(visit_ports, dict):
+                for name in visit_ports.get(mmsi, ()):
+                    links.setdefault(name, {"kind": "был"})
+            else:
+                try:
+                    for visit in self.store.visits(20, mmsi=mmsi):
+                        name = str(visit.get("port") or "").strip().upper()
+                        if name and name not in links:
+                            links[name] = {"kind": "был"}
+                except Exception:
+                    pass
+        lat, lon = vessel.get("lat"), vessel.get("lon")
+        try:
+            watch = float(self.config.get("port_watch_km") or 0)
+        except (TypeError, ValueError):
+            watch = 0.0
+        if lat is not None and lon is not None and watch > 0:
+            for port in ports:
+                name = str(port.get("name") or "").strip().upper()
+                if not name or name in links:
+                    continue
+                try:
+                    km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if km <= watch:
+                    links[name] = {"kind": "рядом", "km": km}
+        return links
 
     def _history_related(self, mmsi) -> bool:
         """Был ли визит в наш порт / выход из него. Ответ кэшируется на минуту:
