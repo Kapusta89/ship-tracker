@@ -15,6 +15,7 @@
 
 import functools
 import json
+import math
 import queue
 import re
 import threading
@@ -138,6 +139,14 @@ DEFAULT_CONFIG = {
     # Стоящее в порту или на рейде судно не двигается: его позиция остаётся
     # верной дольше, чем у идущего. 0 — не разрешать вовсе.
     "berth_stale_hours": 12,
+    # суда без нашего порта в AIS, идущие к нам по курсу: осторожный фильтр
+    "approach_radius_km": 300,
+    "approach_angle_deg": 25,
+    "approach_min_sog": 1.5,
+    "approach_min_closing_km": 2.0,
+    "approach_min_track_minutes": 15,
+    "approach_confirm_hits": 2,
+    "approach_confirm_minutes": 10,
     "history_days": 7,
     "forget_vessels_hours": 24,
     "telegram_token": "",
@@ -147,6 +156,14 @@ DEFAULT_CONFIG = {
 
 # MMSI демо-судов из старых версий с тестовым потоком: их удаляем из базы,
 # чтобы на карте оставались только настоящие суда AIS.
+# Порты соседей: судно с таким портом в AIS не считается идущим к нам,
+# даже если по курсу оно пока совпадает с направлением на наш порт.
+FOREIGN_PORTS = ("CONSTANTA", "CONSTANTZA", "AGIGEA", "MIDIA", "MANGALIA",
+                 "VARNA", "BURGAS", "SOZOPOL", "BALCHIK", "RENI", "RENII",
+                 "GALATI", "GALATZ", "BRAILA", "TULCEA", "SULINA", "SFANTU",
+                 "ISTANBUL", "BOSPHORUS", "AMBARLI", "TUZLA", "NOVOROSSIYSK",
+                 "POTI", "BATUMI", "SAMSUN", "TRABZON", "KARASU", "EREĞLI")
+
 LEGACY_DEMO_MMSI = ("272123456", "272654321", "272998877", "272001122",
                     "272445566", "272334455")
 
@@ -614,6 +631,9 @@ class RadarCore:
         self._alert_queue = queue.Queue()
         self.alert_worker = None
         self._last_housekeeping = 0.0
+        # суда без нашего порта в AIS, которые по ходу идут к нам:
+        # {mmsi: {port, km, angle, closing_km, first, last, hits, confirmed}}
+        self._approach = {}
         self.service_status = {}
         self.on_service_status = None
         self._feed_lock = None
@@ -759,6 +779,9 @@ class RadarCore:
         # устаревшие суда не выбрасываем сразу: сначала ищем их AIS заново
         threading.Thread(target=self._stale_worker, daemon=True,
                          name="stale-revival").start()
+        # суда без нашего порта в AIS, но идущие к нам по курсу
+        threading.Thread(target=self._approach_worker, daemon=True,
+                         name="approach-scan").start()
         self._start_services()
 
     def _start_startup_refresh(self):
@@ -1438,6 +1461,10 @@ class RadarCore:
                 return "в порту"
         if self.destination_is_ours(vessel.get("destination")):
             return "идёт в наш порт"
+        # порта нет в AIS, но по ходу судно идёт к нам — с осторожным допуском
+        approach = self.approach_confirmed(vessel.get("mmsi"))
+        if approach:
+            return f"идёт к нам по курсу: {approach.get('port_name')}"
         return None
 
     def port_focus_vessels(self, limit=3000) -> list:
@@ -1450,6 +1477,204 @@ class RadarCore:
             return [row for row in rows if self.port_focus(row)]
 
         return self._cached_selection(("focus", limit), select, seconds=3.0)
+
+    # ------------------------- суда без нашего порта в AIS, но идущие к нам
+    def _setting_float(self, name, default: float) -> float:
+        """Число из настроек: пустое или битое значение — берём умолчание."""
+        try:
+            value = float(self.config.get(name))
+        except (TypeError, ValueError):
+            return float(default)
+        return value if value > 0 else float(default)
+
+    def approach_radius_km(self) -> float:
+        return self._setting_float("approach_radius_km", 300.0)
+
+    def approach_angle_deg(self) -> float:
+        return min(60.0, self._setting_float("approach_angle_deg", 25.0))
+
+    def approach_min_sog(self) -> float:
+        return self._setting_float("approach_min_sog", 1.5)
+
+    def approach_min_closing_km(self) -> float:
+        return self._setting_float("approach_min_closing_km", 2.0)
+
+    def approach_min_track_minutes(self) -> float:
+        return self._setting_float("approach_min_track_minutes", 15.0)
+
+    def approach_confirm_hits(self) -> int:
+        return max(2, int(self._setting_float("approach_confirm_hits", 2)))
+
+    def approach_confirm_minutes(self) -> float:
+        return self._setting_float("approach_confirm_minutes", 10.0)
+
+    def _bearing_deg(self, lat1, lon1, lat2, lon2) -> float:
+        """Начальный пеленг с первой точки на вторую, в градусах."""
+        phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
+        dlon = math.radians(float(lon2) - float(lon1))
+        x = math.sin(dlon) * math.cos(phi2)
+        y = (math.cos(phi1) * math.sin(phi2)
+             - math.sin(phi1) * math.cos(phi2) * math.cos(dlon))
+        return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+    def _angle_gap(self, first, second) -> float:
+        """Разница между двумя направлениями по модулю, 0–180°."""
+        return abs(((float(first) - float(second) + 180.0) % 360.0) - 180.0)
+
+    def approach_port(self, vessel) -> dict | None:
+        """Идёт ли судно к нашему порту по своему ходу, без порта в AIS.
+
+        Проверяется только геометрия, без догадок по названию или типу:
+        судно под ходом, ближайший наш порт в пределах `approach_radius_km`,
+        курс совпадает с направлением на порт (не больше
+        `approach_angle_deg`), а по точкам трека расстояние до порта убывает.
+        Возвращает {port_name, km, angle, closing_km, span_min} или None.
+        """
+        if not vessel:
+            return None
+        try:
+            lat, lon = float(vessel.get("lat")), float(vessel.get("lon"))
+            sog = float(vessel.get("sog") or 0)
+        except (TypeError, ValueError):
+            return None
+        if sog < self.approach_min_sog():
+            return None
+        destination = str(vessel.get("destination") or "").strip().upper()
+        if any(name in destination for name in FOREIGN_PORTS):
+            # судно явно идёт в порт соседей: даже похожий курс — не повод
+            return None
+        ports = self.config.get("ports") or []
+        best = None
+        for port in ports:
+            try:
+                km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if best is None or km < best[0]:
+                best = (km, port)
+        if not best or best[0] > self.approach_radius_km():
+            return None
+        km, port = best
+        course = vessel.get("cog")
+        if course is None:
+            course = vessel.get("heading")
+        points = self._recent_track(vessel.get("mmsi"))
+        span_min = 0.0
+        if len(points) >= 2:
+            try:
+                first_at = parse_iso(points[0]["ts"])
+                last_at = parse_iso(points[-1]["ts"])
+                span_min = (last_at - first_at).total_seconds() / 60.0
+            except (TypeError, ValueError):
+                span_min = 0.0
+            if course is None and span_min > 0:
+                course = self._bearing_deg(points[0]["lat"], points[0]["lon"],
+                                           points[-1]["lat"], points[-1]["lon"])
+        try:
+            course = float(course)
+        except (TypeError, ValueError):
+            return None
+        bearing = self._bearing_deg(lat, lon, port["lat"], port["lon"])
+        angle = self._angle_gap(course, bearing)
+        if angle > self.approach_angle_deg():
+            return None
+        closing = None
+        if len(points) >= 2:
+            try:
+                first_km = geo.haversine_km(float(points[0]["lat"]), float(points[0]["lon"]),
+                                            float(port["lat"]), float(port["lon"]))
+                closing = first_km - km
+            except (KeyError, TypeError, ValueError):
+                closing = None
+        return {"port_name": port.get("name"), "km": km, "angle": angle,
+                "closing_km": closing, "span_min": span_min}
+
+    def _recent_track(self, mmsi, hours=3.0) -> list:
+        """Последние точки трека судна — для проверки, куда оно реально идёт."""
+        mmsi = str(mmsi or "")
+        if not mmsi:
+            return []
+        try:
+            return self.store.track(mmsi, hours=hours)[-12:]
+        except Exception:
+            return []
+
+    def scan_approaches(self, limit=3000) -> dict:
+        """Ищет суда без нашего порта в AIS, которые по ходу идут к нам.
+
+        Один кадр ничего не решает: судно подтверждается либо убыванием
+        расстояния до порта по треку (не меньше `approach_min_closing_km`
+        за `approach_min_track_minutes`), либо повторными наблюдениями
+        с тем же курсом (`approach_confirm_hits` за `approach_confirm_minutes`).
+        """
+        now = time.monotonic()
+        state = self._approach
+        checked = confirmed = 0
+        seen = set()
+        known_place = self.config.get("ports") or []
+        for vessel in self.store.vessels(limit):
+            mmsi = str(vessel.get("mmsi") or "")
+            if not mmsi:
+                continue
+            # уже наши — по порту в Destination или по стоянке в порту/на рейде
+            if self.destination_is_ours(vessel.get("destination")):
+                state.pop(mmsi, None)
+                continue
+            if port_place(vessel, known_place):
+                state.pop(mmsi, None)
+                continue
+            hit = self.approach_port(vessel)
+            if not hit:
+                state.pop(mmsi, None)
+                continue
+            checked += 1
+            seen.add(mmsi)
+            entry = state.get(mmsi)
+            if not entry or entry.get("port") != hit["port_name"]:
+                entry = {"first": now, "hits": 0}
+            entry.update(hit)
+            entry["last"] = now
+            entry["hits"] = int(entry.get("hits") or 0) + 1
+            closing = hit.get("closing_km")
+            by_track = (closing is not None
+                        and closing >= self.approach_min_closing_km()
+                        and (hit.get("span_min") or 0) >= self.approach_min_track_minutes())
+            entry["confirmed"] = bool(by_track or (
+                entry["hits"] >= self.approach_confirm_hits()
+                and now - entry["first"] >= self.approach_confirm_minutes() * 60.0))
+            state[mmsi] = entry
+            if entry["confirmed"]:
+                confirmed += 1
+        # забываем тех, кого долго не видели или кто уже не идёт к нам
+        for mmsi in list(state):
+            if mmsi not in seen and now - state[mmsi].get("last", 0.0) > 1800.0:
+                state.pop(mmsi, None)
+        if confirmed:
+            names = [mmsi for mmsi, entry in state.items() if entry.get("confirmed")]
+            self.log(f"По курсу к нашим портам: подтверждено {confirmed} "
+                     f"(проверено {checked}): {', '.join(names[:8])}")
+        return {"checked": checked, "confirmed": confirmed}
+
+    def approach_confirmed(self, mmsi):
+        """Подтверждённое судно, идущее к нам по курсу — или None."""
+        entry = self._approach.get(str(mmsi or ""))
+        return entry if entry and entry.get("confirmed") else None
+
+    def approach_mmsis(self) -> set:
+        """MMSI всех подтверждённых «идёт к нам по курсу»."""
+        return {mmsi for mmsi, entry in self._approach.items() if entry.get("confirmed")}
+
+    def _approach_worker(self):
+        """Каждые две минуты проверяет, кто идёт к нам без порта в AIS."""
+        if self.stop_event.wait(45):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.scan_approaches()
+            except Exception as error:
+                self.log(f"Проверка курса к портам: {error}")
+            if self.stop_event.wait(120):
+                break
 
     def _accept_position(self, mmsi, lat, lon, sog=None, cog=None, moment=None) -> bool:
         """Пишет найденную в источнике позицию, если она новее сохранённой."""

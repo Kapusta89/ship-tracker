@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.11"
+APP_VERSION = "2026.12.12"
 
 import ais_feed
 import cargo
@@ -363,7 +363,8 @@ class RadarCanvas:
         self.request_redraw()
 
     # -- отрисовка
-    def draw(self, vessels, target_mmsi, traffic=None, allowed_mmsi=None):
+    def draw(self, vessels, target_mmsi, traffic=None, allowed_mmsi=None,
+             approach_mmsi=None):
         canvas = self.canvas
         canvas.delete("all")
         # Get canvas size; if 1x1 (before window mapping), use default
@@ -422,8 +423,12 @@ class RadarCanvas:
             drawn += 1
             self._hits.append((x, y, vessel["mmsi"]))
             # Цвета в зависимости от типа и схемatical режима
+            is_approach = bool(approach_mmsi and vessel["mmsi"] in approach_mmsi)
             if is_target:
                 color, radius = "#ff3b30", 5
+            elif is_approach:
+                # идёт к нам по курсу, но порта в AIS нет — отдельный цвет
+                color, radius = "#39d3ff", 4
             elif ais_feed.is_tanker_code(vessel.get("type_code")):
                 color, radius = "#ffd166", 4
             else:
@@ -451,6 +456,9 @@ class RadarCanvas:
                 canvas.create_text(x + 7, y + 8, anchor="w", fill="#5d7786",
                                    font=("Consolas", 6),
                                    text=f"{age / 3600.0:.0f} ч назад")
+            elif is_approach:
+                canvas.create_text(x + 7, y + 8, anchor="w", fill="#39d3ff",
+                                   font=("Consolas", 6), text="≈ к нам")
             if drawn % 7 == 0 and vessel.get("name"):
                 if self.schematic_view:
                     canvas.create_text(x + 7, y - 7, text="", anchor="w",
@@ -491,7 +499,8 @@ class RadarCanvas:
                           len([v for v in vessels if v.get("lat") is None]),
                           traffic=shown_traffic, stale_hidden=stale_hidden,
                           traffic_hidden=traffic_hidden, faded=faded,
-                          newest=min(ages) if ages else None)
+                          newest=min(ages) if ages else None,
+                          approach=len(approach_mmsi or ()))
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -666,7 +675,8 @@ class RadarCanvas:
         return minutes * 60
 
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
-                     traffic=0, stale_hidden=0, traffic_hidden=0, faded=0, newest=None):
+                     traffic=0, stale_hidden=0, traffic_hidden=0, faded=0, newest=None,
+                     approach=0):
         fresh = drawn - stale - faded
         berth = core_module.berth_stale_hours(self.config)
         limit = (f"{self._stale_label()}"
@@ -675,6 +685,8 @@ class RadarCanvas:
                 f"наших судов: {vessels}   целей: {targets}   на экране: {drawn}\n"
                 f"со свежим сигналом: {fresh}   стоящих со старым (приглушены): {faded}\n"
                 f"скрыто устаревших: {stale + stale_hidden} (порог {limit})\n")
+        if approach:
+            text += (f"идёт к нашим портам по курсу (≈, подтверждено): {approach}\n")
         if newest is not None:
             if newest < 1.0:
                 text += f"последний сигнал AIS в районе: {newest * 60:.0f} мин назад\n"
@@ -2355,8 +2367,12 @@ class App:
                 vessels = self.core.port_focus_vessels(3000)
             if targets_only:
                 allowed = set(self._targets.keys())
+            try:
+                approach = self.core.approach_mmsis()
+            except Exception:
+                approach = set()
             self.radar.draw(vessels, set(self._targets.keys()), [],
-                            allowed_mmsi=allowed)
+                            allowed_mmsi=allowed, approach_mmsi=approach)
         except Exception as error:
             self.log(f"Отрисовка радара: {error}")
 
