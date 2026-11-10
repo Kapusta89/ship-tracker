@@ -410,6 +410,22 @@ class AISStreamFeed(threading.Thread):
             "FilterMessageTypes": self.message_types,
         }
 
+    def recv_timeout(self) -> float:
+        """Сколько ждать кадр, прежде чем проверить свои дела.
+
+        Слежение по MMSI сокращает ожидание, чтобы обновить подписку точно
+        по расписанию, а не через полминуты после следующего кадра.
+        """
+        return 30.0
+
+    def maybe_resubscribe(self, socket):
+        """Хук: обновление подписки прямо на живом соединении.
+
+        Базовому потоку не нужно — у него фиксированные прямоугольники.
+        Слежение по MMSI переопределяет: список судов со временем меняется.
+        """
+        return
+
     def run(self):
         if not self.api_key:
             self.last_error = "не задан API-ключ потока"
@@ -449,16 +465,18 @@ class AISStreamFeed(threading.Thread):
                     self.last_frame_at = time.monotonic()
                     while not self.stop_event.is_set():
                         try:
-                            frame = socket.recv(timeout=30)
+                            frame = socket.recv(timeout=self.recv_timeout())
                         except TimeoutError:
                             quiet = time.monotonic() - self.last_frame_at
                             if quiet >= self.idle_reconnect_seconds:
                                 self.log(f"{self.feed_title}: сообщений нет "
                                          f"{quiet / 60:.0f} мин — переподключаюсь.")
                                 break
+                            self.maybe_resubscribe(socket)
                             continue
                         self.last_frame_at = time.monotonic()
                         self.handle_frame(frame)
+                        self.maybe_resubscribe(socket)
             except Exception as error:  # сеть, ключ, лимиты — всё лечится переподключением
                 text, status = describe_error(error)
                 if text != self.last_error:
@@ -510,7 +528,8 @@ class MmsiWatchFeed(AISStreamFeed):
     feed_title = "AISStream — слежение по MMSI (весь мир)"
 
     def __init__(self, api_key, mmsis, message_types, on_event, log, stop_event,
-                 stream_url=None, name="ais-feed-mmsi", part=0, parts=1):
+                 stream_url=None, name="ais-feed-mmsi", part=0, parts=1,
+                 resubscribe_seconds=600.0):
         super().__init__(api_key, [], message_types, on_event, log, stop_event,
                          stream_url=stream_url, name=name)
         self.mmsi_source = mmsis if callable(mmsis) else (lambda: list(mmsis or []))
@@ -518,9 +537,17 @@ class MmsiWatchFeed(AISStreamFeed):
         # Поэтому список один, а каждое соединение берёт свою долю: part из parts.
         self.part = max(0, int(part))
         self.parts = max(1, int(parts))
+        # Список судов меняется: пока судно идёт к нам, оно важнее стоящего
+        # вдали. AISStream разрешает обновлять подписку на живом соединении
+        # (не чаще раза в секунду) — пересобираем список раз в `resubscribe_seconds`.
+        self.resubscribe_seconds = float(resubscribe_seconds or 600.0)
+        self._sent_mmsis = None
+        self._next_resub = 0.0
         if self.parts > 1:
             self.feed_title = (f"AISStream — слежение по MMSI, соединение "
                                f"{self.part + 1} из {self.parts}")
+        else:
+            self.feed_title = "AISStream — слежение по MMSI (весь мир)"
 
     def mmsis(self) -> list:
         try:
@@ -541,6 +568,50 @@ class MmsiWatchFeed(AISStreamFeed):
             return {}
         return {"APIKey": self.api_key, "FiltersShipMMSI": mmsis,
                 "FilterMessageTypes": self.message_types}
+
+    def recv_timeout(self) -> float:
+        """Ждём кадр не дольше, чем осталось до пересборки списка."""
+        if self._next_resub <= 0:
+            return 30.0
+        left = self._next_resub - time.monotonic()
+        return max(1.0, min(30.0, left))
+
+    def maybe_resubscribe(self, socket):
+        """Пересылает подписку, когда список судов изменился.
+
+        Например, судно встало у причала, а другое вышло в море и теперь идёт
+        к нашему порту — такие суда поднимаются в списке, и слежение тратит
+        слоты на актуальные. Отправка редкая (раз в `resubscribe_seconds`),
+        лимит сервиса — одно обновление в секунду на соединение.
+        """
+        now = time.monotonic()
+        if now < self._next_resub:
+            return
+        self._next_resub = now + self.resubscribe_seconds
+        try:
+            payload = self.subscription()
+        except Exception as error:
+            self.log(f"{self.feed_title}: не удалось пересобрать список ({error})")
+            return
+        mmsis = set(payload.get("FiltersShipMMSI") or [])
+        if not mmsis:
+            return
+        if self._sent_mmsis is None:
+            # Первая проверка после подключения: подписка уже ушла из run().
+            self._sent_mmsis = mmsis
+            return
+        if mmsis == self._sent_mmsis:
+            return
+        try:
+            socket.send(json.dumps(payload))
+        except Exception as error:
+            self.log(f"{self.feed_title}: обновление подписки не отправлено ({error})")
+            return
+        added = len(mmsis - self._sent_mmsis)
+        dropped = len(self._sent_mmsis - mmsis)
+        self._sent_mmsis = mmsis
+        self.log(f"{self.feed_title}: список обновлён — {len(mmsis)} судов "
+                 f"(+{added}, −{dropped}).")
 
 
 # --------------------------------------------------------------- снимок района

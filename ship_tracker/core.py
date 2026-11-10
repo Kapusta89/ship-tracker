@@ -74,6 +74,9 @@ DEFAULT_CONFIG = {
     # а всего их не больше `ais_connection_limit` — районный поток тоже ест слот.
     "mmsi_watch_connections": 3,
     "ais_connection_limit": 3,
+    # как часто пересобирать список MMSI на живом соединении: суда в пути
+    # поднимаются выше стоящих, чтобы лимит тратился на актуальные
+    "mmsi_refresh_minutes": 10,
     # районный поток AISStream (живые позиции всего трафика в прямоугольниках).
     # Если освободить его слот, MMSI-слежение получит третье соединение.
     "use_area_feed": True,
@@ -809,6 +812,11 @@ class RadarCore:
             except (TypeError, ValueError):
                 wanted = 1
             wanted = max(1, wanted)
+            try:
+                refresh_minutes = float(config.get("mmsi_refresh_minutes") or 10)
+            except (TypeError, ValueError):
+                refresh_minutes = 10.0
+            refresh_minutes = min(60.0, max(1.0, refresh_minutes))
             count = max(0, min(wanted, slots_total - slots_used))
             started = 0
             if not count:
@@ -823,7 +831,8 @@ class RadarCore:
                         config.get("message_types"),
                         self._receive, self.log, self.stop_event,
                         stream_url=ais_feed.STREAM_URL,
-                        name=f"ais-feed-mmsi-{index + 1}", part=index, parts=count)
+                        name=f"ais-feed-mmsi-{index + 1}", part=index, parts=count,
+                        resubscribe_seconds=refresh_minutes * 60.0)
                     watch.start()
                     self.feeds.append(watch)
                     started += 1
@@ -835,7 +844,9 @@ class RadarCore:
             if started:
                 self.log(f"Слежение по MMSI: соединений {started}, по 190 MMSI — "
                          f"до {started * 190} судов (AISStream занято "
-                         f"{slots_used + started} из {slots_total}).")
+                         f"{slots_used + started} из {slots_total}); список "
+                         f"пересобирается каждые {refresh_minutes:g} мин — идущие "
+                         f"к нашим портам поднимаются выше стоящих.")
             if count < wanted:
                 self.log("Для следующего MMSI-соединения нужен свободный слот: "
                          "отключите районный поток (use_area_feed: false) — тогда "
@@ -1070,14 +1081,28 @@ class RadarCore:
             except (TypeError, ValueError):
                 return False
 
+        def underway(row):
+            """Есть ли подтверждённый ход: стоящее судно следить не срочно."""
+            try:
+                return float(row.get("sog")) >= 0.5
+            except (TypeError, ValueError):
+                return False
+
         def rank(row):
+            # Самое ценное — судно, которое прямо сейчас идёт к нашему порту:
+            # его позиция нужна каждую минуту. Стоящие в порту и так видны
+            # районным потоком, поэтому они ниже.
+            if ours(row) and underway(row):
+                return 0                      # идёт к нам на ходу
             if near_port(row):
-                return 0                      # стоит в порту — самое важное
+                return 1                      # у причала или в акватории
             if near_port(row, 50.0):
-                return 1                      # портовый район (рейд, подход)
+                return 2                      # портовый район (рейд, подход)
             if ours(row):
-                return 2                      # идёт к нам по Destination
-            return 3 if in_area(row) else 4   # остальной трафик района
+                return 3                      # числится к нам, но без хода
+            if in_area(row) and underway(row):
+                return 4                      # живой трафик района
+            return 5 if in_area(row) else 6   # стоящие в районе и всё остальное
 
         ordered.sort(key=rank)
         # Общий объём на все соединения: 190 на каждое, дальше делим по кругу —
