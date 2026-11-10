@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.16"
+APP_VERSION = "2026.12.17"
 
 import ais_feed
 import cargo
@@ -1351,7 +1351,9 @@ class App:
             f"Визитов в базе: {counts['visits']}, из них открыто сейчас: {open_visits}. "
             f"Источники: «наблюдение» — геозона порта по живому AIS (считается с момента "
             f"входа, время идёт по часам); «история» — трек за сутки и свои позиции "
-            f"за {self.config.get('history_days', 7)} дн."
+            f"за {self.config.get('history_days', 7)} дн. Стоянки по своим позициям "
+            f"собираются автоматически за последние "
+            f"{self.config.get('visits_backfill_days', 4)} дн."
             + self.hidden_stale_note(hidden_stale))
 
     def load_history_stays(self):
@@ -1362,6 +1364,17 @@ class App:
         threading.Thread(target=self._load_history_worker, daemon=True).start()
 
     def _load_history_worker(self):
+        backfill_days = self.config.get("visits_backfill_days", 4)
+        self.log(f"История стоянок: собираю стоянки по своим позициям за {backfill_days} дн.…")
+        try:
+            local = self.core.backfill_visits()
+        except Exception as error:
+            self.log(f"История стоянок: ошибка — {error}")
+        else:
+            self.log(f"История стоянок: по своим позициям за {local['days']:g} дн. "
+                     f"проверено судов {local['vessels']} "
+                     f"(точек {local['points']}), новых визитов {local['imported']}"
+                     + (f", закрыто ушедших {local['closed']}" if local.get("closed") else "") + ".")
         self.log("История стоянок: запрашиваю треки судов из базы…")
         try:
             result = self.core.import_history_stays(limit=25, pause=0.5)

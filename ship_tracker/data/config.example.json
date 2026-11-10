@@ -126,6 +126,7 @@
   "approach_confirm_hits": 2,
   "approach_confirm_minutes": 10,
   "history_days": 7.0,
+  "visits_backfill_days": 4,
   "forget_vessels_hours": 24,
   "telegram_token": "",
   "telegram_chat_id": "",

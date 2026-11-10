@@ -275,6 +275,21 @@ class Store:
                 (mmsi, since)).fetchall()
         return [dict(row) for row in rows]
 
+    def positions_bbox(self, south, west, north, east, hours=96):
+        """Точки трека в прямоугольнике за последние часы: история визитов.
+
+        Выбираются только позиции у наших портов, а не весь трек района:
+        так сборка стоянок за 4 дня занимает секунды.
+        """
+        since = iso(datetime.now() - timedelta(hours=float(hours)))
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT mmsi, ts, lat, lon FROM positions WHERE ts >= ?"
+                " AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+                " ORDER BY mmsi, ts",
+                (since, float(south), float(north), float(west), float(east))).fetchall()
+        return [(str(row["mmsi"]), row["ts"], row["lat"], row["lon"]) for row in rows]
+
     def track_between(self, mmsi: str, start, end):
         """Позиции судна за конкретный промежуток — например, перед входом в порт."""
         with self._lock:
@@ -305,6 +320,14 @@ class Store:
                 "SELECT * FROM port_visits WHERE left_at IS NULL").fetchall()
         return [dict(row) for row in rows]
 
+    def close_visit_by_id(self, visit_id, when):
+        """Закрывает открытую стоянку временем ухода из трека."""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE port_visits SET left_at = ? WHERE id = ? AND left_at IS NULL",
+                (iso(when), int(visit_id)))
+            return cur.rowcount
+
     def start_visit(self, mmsi: str, port: str, lat, lon, when=None, draft=None,
                     cargo_kind=None, source="live"):
         now = iso(when)
@@ -322,15 +345,17 @@ class Store:
         entered = iso(entered_at)
         left = iso(left_at) if left_at else None
         with self._lock, self.conn:
+            # тот же визит мог быть записан по живому AIS с точностью до минут
             exists = self.conn.execute(
-                "SELECT 1 FROM port_visits WHERE mmsi = ? AND port = ? AND entered_at = ?",
-                (mmsi, port, entered)).fetchone()
+                "SELECT id, left_at FROM port_visits WHERE mmsi = ? AND UPPER(port) = ?"
+                " AND ABS(julianday(entered_at) - julianday(?)) <= ?"
+                " ORDER BY ABS(julianday(entered_at) - julianday(?)) LIMIT 1",
+                (mmsi, str(port).upper(), entered, 2.0 / 24, entered)).fetchone()
             if exists:
                 if left:
                     self.conn.execute(
                         "UPDATE port_visits SET left_at = COALESCE(left_at, ?) "
-                        "WHERE mmsi = ? AND port = ? AND entered_at = ?",
-                        (left, mmsi, port, entered))
+                        "WHERE id = ?", (left, exists["id"]))
                 return False
             self.conn.execute(
                 "INSERT INTO port_visits (mmsi, port, entered_at, left_at, draft_in, draft_out, "

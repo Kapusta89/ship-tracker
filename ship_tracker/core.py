@@ -151,6 +151,9 @@ DEFAULT_CONFIG = {
     "approach_confirm_hits": 2,
     "approach_confirm_minutes": 10,
     "history_days": 7,
+    # Окно сборки стоянок по своим позициям: все суда, которые были в наших
+    # портах за эти дни, попадают в историю для аналитики.
+    "visits_backfill_days": 4,
     "forget_vessels_hours": 24,
     "telegram_token": "",
     "telegram_chat_id": "",
@@ -803,6 +806,8 @@ class RadarCore:
         if config.get("use_history", True):
             threading.Thread(target=self._history_worker, daemon=True,
                              name="history-stays").start()
+            threading.Thread(target=self._visits_worker, daemon=True,
+                             name="visits-backfill").start()
         # устаревшие суда не выбрасываем сразу: сначала ищем их AIS заново
         threading.Thread(target=self._stale_worker, daemon=True,
                          name="stale-revival").start()
@@ -982,6 +987,25 @@ class RadarCore:
                          f"(проверено судов {result['checked']}).")
             # повторяем регулярно: судно могло зайти в порт уже после запуска
             if self.stop_event.wait(20 * 60):
+                break
+
+    def _visits_worker(self):
+        """Собирает стоянки по своим позициям: все суда у портов за 4 дня."""
+        if self.stop_event.wait(15):
+            return
+        while not self.stop_event.is_set():
+            try:
+                result = self.backfill_visits()
+            except Exception as error:
+                self.log(f"История стоянок: {error}")
+                break
+            if result.get("imported") or result.get("closed"):
+                self.log(f"История стоянок: за {result['days']:g} дн. добавлено "
+                         f"визитов {result['imported']}"
+                         + (f", закрыто ушедших {result['closed']}" if result.get("closed") else "")
+                         + f" (судов {result['vessels']}, точек трека {result['points']}).")
+            # повторяем регулярно: суда заходят в порты постоянно
+            if self.stop_event.wait(3 * 3600):
                 break
 
     def _stale_worker(self):
@@ -2609,6 +2633,128 @@ class RadarCore:
                 continue
             points.append({"lat": row["lat"], "lon": row["lon"], "at": moment})
         return ais_feed.stays_from_track(points, self.config.get("ports") or [])
+
+    def port_bbox(self, margin=0.25):
+        """Прямоугольник вокруг всех портов: выборка точек трека из базы."""
+        ports = self.config.get("ports") or []
+        lats = [float(port["lat"]) for port in ports if port.get("lat") is not None]
+        lons = [float(port["lon"]) for port in ports if port.get("lon") is not None]
+        if not lats or not lons:
+            return None
+        return (min(lats) - margin, min(lons) - margin,
+                max(lats) + margin, max(lons) + margin)
+
+    def backfill_visits(self, days=None) -> dict:
+        """Собирает стоянки в наших портах по своим позициям за последние дни.
+
+        Так в историю попадают все суда, которые были у причала или на рейде,
+        даже если программа не видела момент входа: точки остаются в базе
+        `history_days` дней, а окно сборки — `visits_backfill_days` (4 дня).
+        Повторный запуск ничего не дублирует: визит склеивается по времени.
+        """
+        try:
+            span = float(self.config.get("visits_backfill_days") or 4)
+        except (TypeError, ValueError):
+            span = 4.0
+        if days is not None:
+            try:
+                span = float(days)
+            except (TypeError, ValueError):
+                pass
+        try:
+            keep = float(self.config.get("history_days") or 7)
+        except (TypeError, ValueError):
+            keep = 7.0
+        span = max(0.1, min(keep, span))
+        ports = self.config.get("ports") or []
+        box = self.port_bbox()
+        if not ports or not box:
+            return {"points": 0, "vessels": 0, "imported": 0, "days": span}
+        rows = self.store.positions_bbox(*box, hours=span * 24)
+        grouped = {}
+        for mmsi, stamp, lat, lon in rows:
+            moment = parse_iso(stamp)
+            if moment is None:
+                continue
+            grouped.setdefault(mmsi, []).append({"lat": lat, "lon": lon, "at": moment})
+        types = {}
+        latest = {}
+        try:
+            for vessel in self.store.vessels(4000):
+                key = str(vessel.get("mmsi") or "")
+                types[key] = vessel.get("type_code")
+                latest[key] = vessel
+        except Exception:
+            types = {}
+
+        def still_in_port(mmsi):
+            """Последняя позиция судна ещё внутри геозоны: оно не ушло."""
+            vessel = latest.get(mmsi) or {}
+            if vessel.get("lat") is None or vessel.get("lon") is None:
+                return True
+            return bool(geo.port_at(vessel["lat"], vessel["lon"], ports))
+        try:
+            opened = {str(row.get("mmsi")): row for row in self.store.open_visits()}
+        except Exception:
+            opened = {}
+        known = {}
+        try:
+            for row in self.store.visits(100000):
+                key = (str(row.get("mmsi")), str(row.get("port") or "").upper())
+                known.setdefault(key, []).append(
+                    (parse_iso(row.get("entered_at")), parse_iso(row.get("left_at"))))
+        except Exception:
+            known = {}
+
+        def already_recorded(mmsi, port, start, end):
+            """Стоянка уже есть в истории (или перекрывается с ней) — не дублируем."""
+            moment = datetime.now()
+            finish = end or moment
+            for was_start, was_end in known.get((mmsi, str(port).upper()), []):
+                if was_start is None:
+                    continue
+                if was_start <= finish and start <= (was_end or moment):
+                    return True
+            return False
+
+        imported = closed = 0
+        for mmsi, points in grouped.items():
+            try:
+                stays = ais_feed.stays_from_track(points, ports)
+            except Exception:
+                continue
+            kind, _ = cargo.cargo_kind(types.get(mmsi))
+            for stay in stays:
+                current = opened.get(mmsi)
+                same_port = (current is not None
+                             and str(current.get("port") or "").upper()
+                             == str(stay["port"]).upper())
+                # «живой» визит мог остаться открытым, если программа не видела уход:
+                # он и стоянка из трека — один и тот же заход, если интервалы
+                # пересекаются по времени
+                opened_at = parse_iso(current.get("entered_at")) if same_port else None
+                overlaps = bool(opened_at and (stay.get("left_at") is None
+                                               or stay["left_at"] >= opened_at))
+                if overlaps:
+                    # закрываем только если судно действительно вышло из геозоны:
+                    # иначе это разрыв в данных, а не уход из порта
+                    if (stay.get("left_at") and not still_in_port(mmsi)
+                            and self.store.close_visit_by_id(
+                                current.get("id"), stay["left_at"])):
+                        closed += 1
+                        opened.pop(mmsi, None)
+                    continue
+                if already_recorded(mmsi, stay["port"], stay["entered_at"],
+                                    stay.get("left_at")):
+                    continue
+                if self.store.import_visit(mmsi, stay["port"], stay["entered_at"],
+                                           stay["left_at"], cargo_kind=kind,
+                                           source="track"):
+                    imported += 1
+                    known.setdefault((mmsi, str(stay["port"]).upper()), []).append(
+                        (stay["entered_at"], stay.get("left_at")))
+        return {"points": len(rows), "vessels": len(grouped), "imported": imported,
+                "closed": closed, "days": span}
 
     def import_history_stays(self, limit=25, pause=0.4) -> dict:
         """Подтягивает стоянки из истории трека для судов в базе.
