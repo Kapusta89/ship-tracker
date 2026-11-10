@@ -531,6 +531,26 @@ SOURCES = [
     # Это официальная статистика (квартальные оценки), а не позиции судов:
     # открытого API с координатами у неё нет, поэтому только проверка
     # доступности и ссылка — в поток позиций такая страница не годится.
+    # СКАНЭКС: коммерческий АИС-мониторинг судов и данные АИС по договору.
+    # Публичного API с координатами нет, есть trial по заявке.
+    {"key": "scanex_data", "title": "СКАНЭКС: данные АИС", "kind": "page",
+     "url": "https://www.scanex.ru/data/ais/",
+     "how": "по договору: архив и поток АИС, есть trial по заявке; открытого API нет"},
+    {"key": "scanex_service", "title": "СКАНЭКС: АИС-мониторинг судов", "kind": "page",
+     "url": "https://www.scanex.ru/geo-service/AIS-vessels/",
+     "how": "только глазами: геосервис мониторинга, доступ по договору"},
+    # Маринэк (seacomm.ru): оборудование, а не данные — путь к своему приёмнику.
+    {"key": "seacomm", "title": "Marinec / seacomm.ru: оборудование AIS", "kind": "page",
+     "url": "https://seacomm.ru/catalog/navigatsionnoe-oborudovanie/ais/",
+     "how": "только глазами: магазин AIS-приёмников и транспондеров — для своего приёмника"},
+    # Global Fishing Watch: открытые API и код. Сам фид по ключу уже работает
+    # в канале GFW, здесь — ссылки на данные и исходники (страница, не позиции).
+    {"key": "gfw_api", "title": "Global Fishing Watch: API и данные", "kind": "page",
+     "url": "https://globalfishingwatch.org/our-apis/",
+     "how": "API по бесплатному токену — уже в канале GFW; здесь документация и датасеты"},
+    {"key": "gfw_code", "title": "Global Fishing Watch: код на GitHub", "kind": "page",
+     "url": "https://github.com/GlobalFishingWatch",
+     "how": "только глазами: открытые библиотеки и примеры работы с API и данными"},
     {"key": "cros", "title": "Eurostat CROS: статистика судов по AIS (EMSA)", "kind": "page",
      "url": ("https://cros.ec.europa.eu/book-page/"
              "estimation-maritime-vessel-traffic-using-automatic-identification-system-ais-data"),
