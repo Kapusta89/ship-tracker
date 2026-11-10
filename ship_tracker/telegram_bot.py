@@ -71,7 +71,8 @@ MENU_BUTTONS: List[str] = [
 STARTED_AT = datetime.now()
 
 DEFAULT_PORT_NAMES: List[str] = [
-    "RENI", "IZMAIL", "VYLKOVE", "CHORNOMORSK", "ODESSA", "YUZHNY",
+    "IZMAIL", "VYLKOVE", "ZATOKA", "CHORNOMORSK", "ODESSA", "YUZHNY",
+    "OCHAKIV",
 ]
 
 log = logging.getLogger("telegram_bot")
@@ -854,7 +855,8 @@ async def cmd_port(message: Message):
     lines = ["⚓ <b>Суда в портах и на рейде</b>",
              f"Всего: <b>{len(vessels)}</b> — у причала {at_berth}, "
              f"на рейде (ждут лоцмана или очереди) {len(vessels) - at_berth}.",
-             "Порты: RENI, IZMAIL, VYLKOVE, CHORNOMORSK, ODESSA, YUZHNY."]
+             "Порты: IZMAIL, VYLKOVE, ZATOKA, CHORNOMORSK, ODESSA, YUZHNY, "
+             "OCHAKIV."]
     if not vessels:
         lines.append("Сейчас в портах и на рейдах наших портов судов нет.")
     else:
@@ -1020,11 +1022,14 @@ async def cmd_plan(message: Message):
 
 
 def _fresh_limit_hours(config: dict) -> float:
-    """Порог устаревания — тот же, что у карты и вкладок приложения."""
+    """Жёсткий порог устаревания — тот же, что во вкладках приложения."""
     try:
-        return max(0.25, float(config.get("sea_fresh_hours") or 12))
+        minutes = float(config.get("stale_minutes") or 15)
     except (TypeError, ValueError):
-        return 12.0
+        minutes = 15.0
+    if minutes <= 0:
+        minutes = 15.0
+    return max(0.05, minutes / 60.0)
 
 
 def _underway(vessel: dict) -> bool:

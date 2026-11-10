@@ -2,23 +2,31 @@
 
 import math
 
-# Порты наблюдения: Дунай и северо-западное Причерноморье (включая Южный).
+# Порты наблюдения: Дунай (Измаил, Вилково), Днестровско-Днепровский лиман
+# (Затока, Очаков) и северо-западное Причерноморье (Черноморск, Одесса, Южный).
+# Порта Рени в списке больше нет: вместе с ним не считаются его стоянки,
+# лоцман, ожидаемые прибытия и цели.
 # radius_km — радиус геозоны вокруг точки: вход в неё = судно в порту.
 # locode — код UN/LOCODE: по нему порт запрашивается во внешних API
 # (VesselFinder ожидаемые прибытия), поэтому код должен быть настоящим.
 DEFAULT_PORTS = [
-    {"name": "RENI", "label": "Рени", "lat": 45.4528, "lon": 28.2822,
-     "radius_km": 5.0, "locode": "UARNI"},
     {"name": "IZMAIL", "label": "Измаил", "lat": 45.3517, "lon": 28.8367,
      "radius_km": 5.0, "locode": "UAIZM"},
     {"name": "VYLKOVE", "label": "Вилково", "lat": 45.3975, "lon": 29.5853,
      "radius_km": 4.0, "locode": "UAVYL"},
+    # Затока: причал Бугаз у выхода из Днестровского лимана, в составе
+    # Белгород-Днестровского порта (его и код UABGD)
+    {"name": "ZATOKA", "label": "Затока", "lat": 46.0672, "lon": 30.4569,
+     "radius_km": 4.0, "locode": "UABGD"},
     {"name": "CHORNOMORSK", "label": "Черноморск", "lat": 46.3000, "lon": 30.6667,
      "radius_km": 8.0, "locode": "UAILK"},
     {"name": "ODESSA", "label": "Одесса", "lat": 46.4825, "lon": 30.7233,
      "radius_km": 8.0, "locode": "UAODS"},
     {"name": "YUZHNY", "label": "Южный", "lat": 46.6233, "lon": 31.0167,
      "radius_km": 8.0, "locode": "UAYUZ"},
+    # Очаков: порт у выхода из Днепровско-Бугского лимана
+    {"name": "OCHAKIV", "label": "Очаков", "lat": 46.6216, "lon": 31.5725,
+     "radius_km": 6.0, "locode": "UAOCH"},
 ]
 
 # Район подписки по умолчанию: [[юг/запад], [север/восток]] в формате AISStream.
@@ -69,9 +77,11 @@ def port_at(lat, lon, ports):
 # написания. Нужно, чтобы судно, идущее в наш порт, не считалось чужим.
 PORT_ALIASES = {
     # настоящие UN/LOCODE Украины + старые написания, которые ещё встречаются
-    "RENI": ("UARNI", "UDREN", "RENY"),
     "IZMAIL": ("UAIZM", "UDIZM", "IZMAIL."),
     "VYLKOVE": ("UAVYL", "UDVYL", "VILKOVO", "UST-DUNAISK"),
+    # Затока идёт в AIS как место причала Бугаз или как Белгород-Днестровский
+    "ZATOKA": ("UABGD", "BUHAZ", "BUGAS", "BELGOROD", "BILHOROD"),
+    "OCHAKIV": ("UAOCH", "OCHAKOV", "OCHAKIV UA"),
     "CHORNOMORSK": ("UAILK", "CHERNOMORSK", "ILLICHIVSK", "ILICHEVSK"),
     "ODESSA": ("UAODS", "UDODS", "ODESA"),
     "YUZHNY": ("UAYUZ", "PIVDENNYI", "PIVDENNY", "YUZHNYY", "YUZHNYI"),

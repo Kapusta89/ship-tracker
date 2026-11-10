@@ -3,9 +3,10 @@
 Логика целиком повторяет условие задания, но уже на реальных данных:
 
     тип = танкер (AIS Type 80–89)
-    назначение (AIS Destination) содержит IZMAIL или RENI
+    назначение (AIS Destination) содержит наш порт (Измаил, Вилково, Затока,
+        Черноморск, Одесса, Южный, Очаков)
     отправление (последний порт, из которого судно вышло по нашим данным)
-        содержит ODESSA или CHORNOMORSK
+        содержит один из портов отправления из настроек
 
 Порт отправления AIS не передаёт, поэтому программа определяет его сама:
 входит судно в геозону порта — открывается визит, выходит — визит
@@ -123,12 +124,12 @@ DEFAULT_CONFIG = {
                       "StandardClassBPositionReport", "ShipStaticData",
                       "StaticDataReport"],
     "ports": geo.DEFAULT_PORTS,
-    "filter_destinations": ["IZMAIL", "RENI"],
-    "filter_origins": ["ODESSA", "CHORNOMORSK"],
+    "filter_destinations": ["IZMAIL", "VYLKOVE", "ZATOKA", "CHORNOMORSK",
+                           "ODESSA", "YUZHNY", "OCHAKIV"],
+    "filter_origins": ["ODESSA", "CHORNOMORSK", "YUZHNY", "OCHAKIV"],
     "trip_window_hours": 96,
     "min_speed_knots": 2.0,
     "alert_cooldown_hours": 6,
-    "position_interval_seconds": 60,
     "stale_minutes": 15,
     "history_days": 7,
     "forget_vessels_hours": 24,
@@ -265,7 +266,7 @@ _WORD_SPLIT = re.compile(r"[^0-9A-Z]+")
 
 
 def port_matches(value, targets) -> bool:
-    """Ищет название порта внутри строки: «IZMAIL», «IZMAIL, UA», «IZMAIL>RENI».
+    """Ищет название порта внутри строки: «IZMAIL», «IZMAIL, UA», «IZMAIL>ODESSA».
 
     Проверка по готовым словам, а не регуляркой на каждое название: срабатывает
     на каждом сообщении AIS для каждого судна, и старая версия съедала
@@ -1776,6 +1777,7 @@ class RadarCore:
             "lat": vessel.get("lat"),
             "lon": vessel.get("lon"),
             "updated_at": vessel.get("updated_at"),
+            "position_at": vessel.get("position_at"),
             "key": f"{mmsi}|{departure['port']}|{dest_hit}",
         }
 
@@ -2243,8 +2245,13 @@ class RadarCore:
                               type_code=vessel.get("type_code"))
 
     def targets(self) -> list:
+        """Цели: танкеры, идущие из наших портов в наши порты — без лимита района.
+
+        Расстояние не важно: цель может идти через всё Чёрное море или из
+        Средиземного, поэтому просматриваем всю базу, а не первые 1000 строк.
+        """
         result = []
-        for vessel in self.store.vessels(1000):
+        for vessel in self.store.vessels(20000):
             target = self.evaluate(vessel["mmsi"])
             if target:
                 result.append(target)
@@ -2382,6 +2389,16 @@ def claim_telegram_lock(store: Store):
 def claim_feed_lock(store: Store):
     """Занимает data/feed.lock: AIS-поток должен принимать один процесс."""
     return _claim_lock(Path(store.path).parent / "feed.lock")
+
+
+def claim_app_lock(store: Store):
+    """Занимает data/app.lock: второе окно программы не открывается.
+
+    Два окна на одну базу — это две копии AIS-потока: одно окно замирает,
+    а виноватым выглядит приём данных. Поэтому второе окно сразу выходит
+    с понятным сообщением.
+    """
+    return _claim_lock(Path(store.path).parent / "app.lock")
 
 
 class BotCommander(threading.Thread):

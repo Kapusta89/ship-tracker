@@ -3,7 +3,7 @@
   "openwaters_token": "",
   "use_openwaters": true,
   "use_snapshot": true,
-  "snapshot_minutes": 10.0,
+  "snapshot_minutes": 1,
   "snapshot_max_age_hours": 6,
   "port_watch_km": 100.0,
   "use_history": true,
@@ -38,16 +38,8 @@
   ],
   "ports": [
     {
-      "name": "RENI",
-      "label": "RENI",
-      "lat": 45.4528,
-      "lon": 28.2822,
-      "radius_km": 5.0,
-      "locode": "UARNI"
-    },
-    {
       "name": "IZMAIL",
-      "label": "IZMAIL",
+      "label": "Измаил",
       "lat": 45.3517,
       "lon": 28.8367,
       "radius_km": 5.0,
@@ -55,15 +47,23 @@
     },
     {
       "name": "VYLKOVE",
-      "label": "VYLKOVE",
+      "label": "Вилково",
       "lat": 45.3975,
       "lon": 29.5853,
       "radius_km": 4.0,
       "locode": "UAVYL"
     },
     {
+      "name": "ZATOKA",
+      "label": "Затока",
+      "lat": 46.0672,
+      "lon": 30.4569,
+      "radius_km": 4.0,
+      "locode": "UABGD"
+    },
+    {
       "name": "CHORNOMORSK",
-      "label": "CHORNOMORSK",
+      "label": "Черноморск",
       "lat": 46.3,
       "lon": 30.6667,
       "radius_km": 8.0,
@@ -71,7 +71,7 @@
     },
     {
       "name": "ODESSA",
-      "label": "ODESSA",
+      "label": "Одесса",
       "lat": 46.4825,
       "lon": 30.7233,
       "radius_km": 8.0,
@@ -79,33 +79,40 @@
     },
     {
       "name": "YUZHNY",
-      "label": "YUZHNY",
+      "label": "Южный",
       "lat": 46.6233,
       "lon": 31.0167,
       "radius_km": 8.0,
       "locode": "UAYUZ"
+    },
+    {
+      "name": "OCHAKIV",
+      "label": "Очаков",
+      "lat": 46.6216,
+      "lon": 31.5725,
+      "radius_km": 6.0,
+      "locode": "UAOCH"
     }
   ],
   "filter_destinations": [
-    "RENI",
     "IZMAIL",
     "VYLKOVE",
+    "ZATOKA",
     "CHORNOMORSK",
     "ODESSA",
-    "YUZHNY"
+    "YUZHNY",
+    "OCHAKIV"
   ],
   "filter_origins": [
-    "RENI",
-    "IZMAIL",
-    "VYLKOVE",
-    "CHORNOMORSK",
     "ODESSA",
-    "YUZHNY"
+    "CHORNOMORSK",
+    "YUZHNY",
+    "OCHAKIV"
   ],
   "trip_window_hours": 96.0,
   "min_speed_knots": 2.0,
   "alert_cooldown_hours": 6.0,
-  "position_interval_seconds": 60.0,
+  "position_interval_seconds": 15,
   "stale_minutes": 15.0,
   "history_days": 7.0,
   "forget_vessels_hours": 24,
