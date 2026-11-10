@@ -131,6 +131,13 @@ DEFAULT_CONFIG = {
     "min_speed_knots": 2.0,
     "alert_cooldown_hours": 6,
     "stale_minutes": 15,
+    # Бесплатный ключ VesselAPI (150 вызовов в месяц): перед тем как убрать
+    # устаревшее судно со всех вкладок, им проверяется его AIS-позиция.
+    "vesselapi_key": "",
+    "stale_lookup_limit": 6,
+    # Стоящее в порту или на рейде судно не двигается: его позиция остаётся
+    # верной дольше, чем у идущего. 0 — не разрешать вовсе.
+    "berth_stale_hours": 12,
     "history_days": 7,
     "forget_vessels_hours": 24,
     "telegram_token": "",
@@ -355,6 +362,95 @@ def position_age_hours(vessel, now=None) -> float:
     if moment > now:
         return 0.0
     return (now - moment).total_seconds() / 3600.0
+
+
+def berth_stale_hours(config) -> float:
+    """Сколько часов позиция стоящего судна остаётся актуальной.
+
+    Судно у причала или на рейде не двигается, поэтому его последняя точка
+    не врёт так быстро, как точка идущего судна. Это важно для наших портов:
+    живых приёмников AIS в украинских водах в открытых сетях нет, сигналы
+    приходят с задержкой в часы, и при пороге в 15 минут радар всегда пуст.
+    Ноль — максимально жёсткий режим, только `stale_minutes`.
+    """
+    try:
+        return max(0.0, float((config or {}).get("berth_stale_hours") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def port_place(vessel, ports) -> dict | None:
+    """Где судно относительно портов: у причала, на рейде или нигде.
+
+    Рейд — это стоянка почти без хода в пределах 12 км от границы геозоны
+    порта: так стоят суда в ожидании лоцмана и очереди на обработку.
+    """
+    if not vessel or not ports:
+        return None
+    lat, lon = vessel.get("lat"), vessel.get("lon")
+    if lat is None or lon is None:
+        return None
+    try:
+        speed = float(vessel.get("sog") or 0)
+    except (TypeError, ValueError):
+        speed = 0.0
+    port = geo.port_at(lat, lon, ports)
+    if port:
+        place = "у причала" if speed < 0.5 else "в порту"
+        return {"port_name": port.get("name"), "place": place, "port_km": 0.0}
+    best = None
+    for candidate in ports:
+        try:
+            km = geo.haversine_km(lat, lon, float(candidate["lat"]), float(candidate["lon"]))
+            radius = float(candidate.get("radius_km") or 5.0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        gap = km - radius
+        if best is None or gap < best[0]:
+            best = (gap, candidate, km)
+    if not best or best[0] > 12 or speed > 1.5:
+        return None
+    place = "рейд: ждёт лоцмана" if speed < 0.5 else "подход к порту"
+    return {"port_name": best[1].get("name"), "place": place, "port_km": best[2]}
+
+
+def in_port_area(vessel, config) -> bool:
+    """Стоит ли судно в порту или на рейде одного из наших портов."""
+    try:
+        return bool(port_place(vessel, (config or {}).get("ports") or []))
+    except Exception:
+        return False
+
+
+def stale_hours(vessel, config) -> float:
+    """Порог устаревания для конкретного судна, в часах.
+
+    Идущие суда — строго `stale_minutes`. Стоящие в порту или на рейде —
+    до `berth_stale_hours`, потому что их позиция не меняется.
+    """
+    try:
+        base = float((config or {}).get("stale_minutes") or 15) / 60.0
+    except (TypeError, ValueError):
+        base = 0.25
+    base = max(0.05, base)
+    limit = berth_stale_hours(config)
+    if limit <= base or not vessel:
+        return base
+    if not in_port_area(vessel, config):
+        return base
+    try:
+        sog = float(vessel.get("sog"))
+    except (TypeError, ValueError):
+        sog = None
+    if sog is None or sog <= 1.0:
+        return limit
+    return base
+
+
+def is_stale(vessel, config) -> bool:
+    """Пора ли прятать судно: позиции нет или она старше его порога."""
+    age = position_age_hours(vessel)
+    return age is None or age > stale_hours(vessel, config)
 
 
 # ------------------------------------------------------------------ телеграм
@@ -660,6 +756,9 @@ class RadarCore:
         if config.get("use_history", True):
             threading.Thread(target=self._history_worker, daemon=True,
                              name="history-stays").start()
+        # устаревшие суда не выбрасываем сразу: сначала ищем их AIS заново
+        threading.Thread(target=self._stale_worker, daemon=True,
+                         name="stale-revival").start()
         self._start_services()
 
     def _start_startup_refresh(self):
@@ -833,6 +932,27 @@ class RadarCore:
                          f"(проверено судов {result['checked']}).")
             # повторяем регулярно: судно могло зайти в порт уже после запуска
             if self.stop_event.wait(20 * 60):
+                break
+
+    def _stale_worker(self):
+        """Каждые три минуты ищет заново AIS у судов с устаревшей позицией.
+
+        Судно не пропадает со вкладок сразу: сначала его пробуют найти по MMSI
+        в Open Waters и VesselAPI. Не нашлось — остаётся скрытым, пока не
+        уйдёт из базы по сроку давности.
+        """
+        if self.stop_event.wait(90):
+            return
+        while not self.stop_event.is_set():
+            try:
+                limit = int(self.config.get("stale_lookup_limit") or 6)
+            except (TypeError, ValueError):
+                limit = 6
+            try:
+                self.revive_stale(limit=max(1, min(20, limit)))
+            except Exception as error:
+                self.log(f"AIS-поиск устаревших: {error}")
+            if self.stop_event.wait(180):
                 break
 
     def _start_consumer(self):
@@ -1281,38 +1401,147 @@ class RadarCore:
                 break
         return result
 
-    def port_place(self, vessel) -> dict | None:
-        """Где судно относительно портов: у причала, на рейде или нигде.
-
-        Рейд — это стоянка почти без хода в пределах 12 км от границы геозоны
-        порта: так стоят суда в ожидании лоцмана и очереди на обработку.
-        """
-        ports = self.config.get("ports") or []
-        lat, lon = vessel.get("lat"), vessel.get("lon")
-        if lat is None or lon is None or not ports:
-            return None
-        try:
-            speed = float(vessel.get("sog") or 0)
-        except (TypeError, ValueError):
-            speed = 0.0
-        port = geo.port_at(lat, lon, ports)
-        if port:
-            place = "у причала" if speed < 0.5 else "в порту"
-            return {"port_name": port.get("name"), "place": place, "port_km": 0.0}
-        best = None
-        for candidate in ports:
+    def stale_hours(self, vessel=None) -> float:
+        """Порог устаревания в часах: общий или для конкретного судна."""
+        if vessel is None:
             try:
-                km = geo.haversine_km(lat, lon, float(candidate["lat"]), float(candidate["lon"]))
-                radius = float(candidate.get("radius_km") or 5.0)
-            except (KeyError, TypeError, ValueError):
-                continue
-            gap = km - radius
-            if best is None or gap < best[0]:
-                best = (gap, candidate, km)
-        if not best or best[0] > 12 or speed > 1.5:
+                return max(0.05, float(self.config.get("stale_minutes") or 15) / 60.0)
+            except (TypeError, ValueError):
+                return 0.25
+        return stale_hours(vessel, self.config)
+
+    def is_stale(self, vessel) -> bool:
+        """Пора ли прятать судно из вкладок: позиции нет или она старая."""
+        return is_stale(vessel, self.config)
+
+    def port_place(self, vessel) -> dict | None:
+        """Где судно относительно портов: у причала, на рейде или нигде."""
+        return port_place(vessel, self.config.get("ports") or [])
+
+    def port_focus(self, vessel) -> str | None:
+        """Почему судно попадает на радар наших портов — или None.
+
+        На радаре только своя обстановка: судно идёт в наш порт, стоит в нём,
+        стоит на рейде (ждёт лоцмана или перевалки) или маневрирует на подходе.
+        Всё остальное — чужой трафик района, рыбаки у своих берегов, суда,
+        просто проходящие мимо — на радар не попадает вовсе.
+        """
+        if not vessel:
             return None
-        place = "рейд: ждёт лоцмана" if speed < 0.5 else "подход к порту"
-        return {"port_name": best[1].get("name"), "place": place, "port_km": best[2]}
+        lat, lon = vessel.get("lat"), vessel.get("lon")
+        if lat is not None and lon is not None:
+            place = self.port_place(vessel)
+            if place:
+                return place.get("place") or "у порта"
+            # судно в геозоне отмечено самим приёмом AIS (поле port)
+            if port_matches(vessel.get("port"), [name for name in self.port_names()]):
+                return "в порту"
+        if self.destination_is_ours(vessel.get("destination")):
+            return "идёт в наш порт"
+        return None
+
+    def port_focus_vessels(self, limit=3000) -> list:
+        """Суда нашей обстановки — то, что рисуется на радаре."""
+        def select():
+            try:
+                rows = self.store.vessels(limit)
+            except Exception:
+                return []
+            return [row for row in rows if self.port_focus(row)]
+
+        return self._cached_selection(("focus", limit), select, seconds=3.0)
+
+    def _accept_position(self, mmsi, lat, lon, sog=None, cog=None, moment=None) -> bool:
+        """Пишет найденную в источнике позицию, если она новее сохранённой."""
+        if lat is None or lon is None or moment is None:
+            return False
+        vessel = self.store.vessel(mmsi) or {}
+        stored = parse_iso(vessel.get("position_at"))
+        if stored is not None and moment <= stored:
+            return False
+        self.store.upsert_position(mmsi, lat, lon, sog=sog, cog=cog, when=moment)
+        self.store.add_position(mmsi, lat, lon, sog, cog, moment)
+        return True
+
+    def revive_vessel(self, mmsi) -> str | None:
+        """Ищет судно заново во всех источниках, прежде чем убрать его.
+
+        Сначала трек Open Waters (без ключа, по MMSI), затем VesselAPI, если
+        в настройках задан его бесплатный ключ. Возвращает название источника,
+        где нашлась более свежая точка, либо None — тогда судно остаётся
+        скрытым во всех вкладках.
+        """
+        vessel = self.store.vessel(mmsi) or {}
+        name = vessel.get("name") or mmsi
+        stored = parse_iso(vessel.get("position_at"))
+        try:
+            points = ais_feed.fetch_track(mmsi, timeout=15)
+        except Exception:
+            points = []
+        if points:
+            last = points[-1]
+            moment = last.get("at")
+            if moment is not None and (stored is None or moment > stored):
+                if self._accept_position(mmsi, last.get("lat"), last.get("lon"),
+                                         last.get("sog"), None, moment):
+                    self.log(f"AIS-поиск: {name} найден заново в треке Open Waters.")
+                    return "Open Waters"
+        key = str(self.config.get("vesselapi_key") or "").strip()
+        if key:
+            try:
+                found = services_feed.vesselapi_position(mmsi, key)
+            except Exception as error:
+                self.log(f"AIS-поиск (VesselAPI): {error}")
+                found = None
+            if found and self._accept_position(mmsi, found.get("lat"), found.get("lon"),
+                                               found.get("sog"), found.get("cog"),
+                                               found.get("at")):
+                self.store.upsert_static(mmsi, draft=found.get("draft"),
+                                         destination=found.get("destination"),
+                                         eta_declared=found.get("eta"))
+                self.log(f"AIS-поиск: {name} найден заново в VesselAPI.")
+                return "VesselAPI"
+        return None
+
+    def stale_focus(self, max_age_hours=48.0, limit=40) -> list:
+        """Суда нашей обстановки с устаревшей позицией — кого искать заново."""
+        result = []
+        for vessel in self.port_focus_vessels(3000):
+            age = position_age_hours(vessel)
+            if age is None or age <= stale_hours(vessel, self.config):
+                continue
+            if age > float(max_age_hours):
+                continue
+            result.append(vessel)
+        result.sort(key=lambda row: position_age_hours(row) or 1e9)
+        return result[:limit]
+
+    def revive_stale(self, limit=6, max_age_hours=48.0) -> dict:
+        """Перепроверяет устаревшие суда по всем источникам.
+
+        Устаревшее судно сначала ищется заново по MMSI. Нашлась свежая точка —
+        оно возвращается на радар и во вкладки; не нашлась — остаётся скрытым
+        и со временем уходит из базы.
+        """
+        found = 0
+        checked = 0
+        sources = {}
+        for vessel in self.stale_focus(max_age_hours=max_age_hours, limit=limit):
+            if self.stop_event.is_set():
+                break
+            checked += 1
+            try:
+                source = self.revive_vessel(str(vessel.get("mmsi")))
+            except Exception as error:
+                self.log(f"AIS-поиск: {error}")
+                source = None
+            if source:
+                found += 1
+                sources[source] = sources.get(source, 0) + 1
+        if found:
+            detail = ", ".join(f"{name}: {count}" for name, count in sources.items())
+            self.log(f"AIS-поиск: проверено {checked}, найдено заново {found} ({detail}).")
+        return {"checked": checked, "found": found, "sources": sources}
 
     def port_vessels(self, limit=600) -> list:
         """Суда у причалов и на рейде — для галочки «в порту» и бота.

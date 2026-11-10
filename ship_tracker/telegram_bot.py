@@ -878,11 +878,11 @@ async def cmd_sea(message: Message):
     except Exception as error:
         await message.answer(f"Список судов в море недоступен: {error}")
         return
-    limit = _fresh_limit_hours(reload_config())
-    # В приложении вкладка «В море» без галочки «устаревшие» показывает только
-    # свежие позиции — в боте то же правило.
-    stale_count = sum(1 for vessel in vessels if _is_stale(vessel, limit))
-    vessels = [vessel for vessel in vessels if not _is_stale(vessel, limit)]
+    config = reload_config()
+    # В приложении вкладка «В море» показывает только актуальные позиции —
+    # в боте то же правило.
+    stale_count = sum(1 for vessel in vessels if _is_stale(vessel, config))
+    vessels = [vessel for vessel in vessels if not _is_stale(vessel, config)]
     moved = sum(1 for vessel in vessels if vessel.get("underway"))
     lines = ["🌊 <b>Суда в море сейчас</b>",
              f"Всего: <b>{len(vessels)}</b> (под ходом {moved}, "
@@ -927,11 +927,11 @@ async def cmd_plan(message: Message):
         except Exception:
             opens = {}
         result = []
-        limit = _fresh_limit_hours(reload_config())
+        config = reload_config()
         for vessel in core.related_vessels(3000):
             # план по устаревшей позиции — фантазия: как и в приложении,
-            # без галочки «устаревшие» такие суда в расчёт не берём
-            if _is_stale(vessel, limit):
+            # такие суда в расчёт не берём
+            if _is_stale(vessel, config):
                 continue
             mmsi = str(vessel.get("mmsi"))
             # только идущие с моря в наши порты: стоящие в порту — /visits,
@@ -1040,11 +1040,10 @@ def _underway(vessel: dict) -> bool:
         return False
 
 
-def _is_stale(vessel: dict, limit_hours: float) -> bool:
-    """Позиция старше порога: такие суда приложение без галочки не показывает."""
+def _is_stale(vessel: dict, config: dict) -> bool:
+    """Позиция старше порога судна: идущим — минуты, стоящим — часы."""
     core_module = _import("core")
-    age = _age_hours(core_module.position_stamp(vessel))
-    return age is None or age > limit_hours
+    return core_module.is_stale(vessel, config)
 
 
 def _age_hours(value) -> Optional[float]:
@@ -1078,7 +1077,7 @@ async def cmd_all(message: Message):
         stale_hours = 0.25
     limit = _fresh_limit_hours(config)
     with_pos = sum(1 for vessel in vessels if vessel.get("lat") is not None)
-    board = [vessel for vessel in vessels if not _is_stale(vessel, limit)]
+    board = [vessel for vessel in vessels if not _is_stale(vessel, config)]
     stale_count = len(vessels) - len(board)
     lines = ["🚢 <b>Все суда</b>",
              f"В базе: <b>{len(vessels)}</b>, с позицией: {with_pos}, "
@@ -1141,10 +1140,10 @@ async def cmd_visits(message: Message):
         return
     current = [visit for visit in visits if not visit.get("left_at")]
     # открытая стоянка судна без свежей позиции — догадка: оно могло уйти незамеченным
-    limit = _fresh_limit_hours(reload_config())
+    config = reload_config()
     kept = []
     for visit in current:
-        if _is_stale(store.vessel(visit.get("mmsi")) or {}, limit):
+        if _is_stale(store.vessel(visit.get("mmsi")) or {}, config):
             continue
         kept.append(visit)
     stale_current = len(current) - len(kept)

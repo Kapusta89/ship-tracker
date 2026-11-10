@@ -24,8 +24,52 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import ais_feed
 import geo
 import portcalls
+
+# VesselAPI — единственный источник без подписки, но с бесплатным тарифом
+# (150 запросов в месяц без карты): отдаёт позицию, ход, курс, осадку,
+# назначение и ETA одним запросом. Ключ задаётся в настройках.
+VESSELAPI_URL = "https://api.vesselapi.com/v1/vessel/{mmsi}/position"
+
+
+def vesselapi_position(mmsi, key, timeout=15) -> dict | None:
+    """Одна точка судна из VesselAPI: координаты, ход, курс, осадка, ETA.
+
+    Нужен бесплатный ключ с vesselapi.com (150 вызовов в месяц). Без ключа
+    функция не вызывается — остальные источники работают без него.
+    """
+    import requests
+
+    mmsi = str(mmsi or "").strip()
+    key = str(key or "").strip()
+    if not mmsi or not key:
+        return None
+    response = requests.get(VESSELAPI_URL.format(mmsi=mmsi),
+                            params={"filter.idType": "mmsi"},
+                            headers={"Authorization": f"Bearer {key}"},
+                            timeout=timeout)
+    if response.status_code in (403, 404, 429):
+        return None
+    response.raise_for_status()
+    data = response.json() or {}
+    position = data.get("vesselPosition") or {}
+    eta = data.get("vesselEta") or {}
+    moment = ais_feed.parse_seen(position.get("timestamp"))
+    if moment is None:
+        return None
+    return {
+        "at": moment,
+        "lat": ais_feed.to_float(position.get("latitude")),
+        "lon": ais_feed.to_float(position.get("longitude")),
+        "sog": ais_feed.to_float(position.get("sog")),
+        "cog": ais_feed.to_float(position.get("cog")),
+        "draft": ais_feed.to_float(eta.get("draught")),
+        "destination": ais_feed.clean_text(eta.get("destination")),
+        "eta": eta.get("eta"),
+        "name": ais_feed.clean_text(position.get("vessel_name")),
+    }
 
 # Названия для журнала и статусов.
 SERVICE_TITLES = {

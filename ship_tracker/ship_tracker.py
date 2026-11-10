@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.10"
+APP_VERSION = "2026.12.11"
 
 import ais_feed
 import cargo
@@ -404,18 +404,17 @@ class RadarCanvas:
             # сегодня, а точка на карте остаться трёхдневной.
             updated = parse_iso(core_module.position_stamp(vessel))
             age = (now - updated).total_seconds() if updated else None
+            # Порог свой у каждого судна: идущему — `stale_minutes`, стоящему
+            # в порту или на рейде — `berth_stale_hours` (оно не двигается).
+            limit = core_module.stale_hours(vessel, self.config) * 3600.0
             fresh = age is not None and age <= self.stale_seconds()
-            # Без свежего сигнала, но ещё в пределах `sea_fresh_hours` — судно
-            # остаётся на карте приглушённым: AIS-каналы отдают район не каждую
-            # минуту, и скрывать такие позиции означало бы терять половину судов.
-            stale = age is None or age > self.max_age_seconds()
+            stale = age is None or age > limit
             if stale:
                 stale_count += 1
-                if not self.show_stale and vessel["mmsi"] != self.selected:
-                    stale_hidden += 1
-                    continue
-                stale_drawn += 1
-            elif not fresh:
+                stale_hidden += 1
+                continue
+            if not fresh:
+                # сигнал старый, но судно стоит — точка приглушённая, с возрастом
                 faded += 1
             x, y = projector.to_screen(lat, lon)
             if not (-20 <= x <= width + 20 and -20 <= y <= height + 20):
@@ -434,9 +433,7 @@ class RadarCanvas:
                 if color == "#ff3b30": color = "#c62828"
                 elif color == "#ffd166": color = "#fb8c00"
                 elif color == "#7fa8bf": color = "#42a5f5"
-            if stale:
-                color = "#4b6472"
-            elif not fresh:
+            if not fresh:
                 color = "#5d7786"
             if vessel["mmsi"] == self.selected:
                 canvas.create_oval(x - 11, y - 11, x + 11, y + 11, outline="#ffffff", width=2)
@@ -450,6 +447,10 @@ class RadarCanvas:
                                    width=1, tags=("vessel",))
             canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                fill=color, outline="", tags=("vessel",))
+            if not fresh and age is not None:
+                canvas.create_text(x + 7, y + 8, anchor="w", fill="#5d7786",
+                                   font=("Consolas", 6),
+                                   text=f"{age / 3600.0:.0f} ч назад")
             if drawn % 7 == 0 and vessel.get("name"):
                 if self.schematic_view:
                     canvas.create_text(x + 7, y - 7, text="", anchor="w",
@@ -664,12 +665,13 @@ class RadarCanvas:
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
                      traffic=0, stale_hidden=0, traffic_hidden=0, faded=0):
         fresh = drawn - stale - faded
+        berth = core_module.berth_stale_hours(self.config)
+        limit = (f"{self._stale_label()}"
+                 + (f", стоящие в порту — {berth:g} ч" if berth else ""))
         text = (f"источник: живой AIS (AISStream, Open Waters)\n"
-                f"судов в базе: {vessels}   целей: {targets}   на экране: {drawn}\n"
-                f"свежих: {fresh}   без свежего сигнала (приглушённые): {faded}\n"
-                f"старше {self._age_label()}: {stale + stale_hidden}\n")
-        if stale_hidden:
-            text += f"из них скрыто на карте: {stale_hidden} (галочка «устаревшие»)\n"
+                f"наших судов: {vessels}   целей: {targets}   на экране: {drawn}\n"
+                f"со свежим сигналом: {fresh}   стоящих со старым (приглушены): {faded}\n"
+                f"скрыто устаревших: {stale + stale_hidden} (порог {limit})\n")
         if without_position:
             text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
         if traffic:
@@ -898,13 +900,13 @@ class App:
                    command=lambda: self.radar.zoom(1 / 1.3)).pack(side="left")
         ttk.Button(toolbar, text="+", width=3,
                    command=lambda: self.radar.zoom(1.3)).pack(side="left", padx=(2, 0))
-        ttk.Button(toolbar, text="Весь район", command=self.radar.fit_all).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="Наши суда",
+                   command=self.fit_focus).pack(side="left", padx=(6, 6))
+        # На радаре только наши суда — те, что идут в наш порт, стоят в нём
+        # или ждут лоцмана/перевалки на рейде. Чужой трафик не рисуется.
         self.var_targets_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="только цели", variable=self.var_targets_only,
                         command=self.toggle_targets_only).pack(side="left", padx=(12, 0))
-        self.var_traffic = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="трафик района", variable=self.var_traffic,
-                        command=self.redraw_map).pack(side="left", padx=(8, 0))
         # Фильтр «в порту»: только суда у причала и на рейде (ждут лоцмана)
         self.var_port_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="в порту / ждёт лоцмана", variable=self.var_port_only,
@@ -915,11 +917,6 @@ class App:
         self.var_forecast = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="прогноз 3 дня", variable=self.var_forecast,
                         command=self.toggle_forecast).pack(side="left", padx=(8, 0))
-        # Устаревшие позиции на карте показывать не обязательно, а в таблицах их
-        # нет никогда: таблицы показывают только свежие суда.
-        self.var_stale = tk.BooleanVar(value=False)
-        ttk.Checkbutton(toolbar, text="устаревшие на карте", variable=self.var_stale,
-                        command=self.toggle_stale).pack(side="left", padx=(8, 0))
         self.var_schematic = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text="схематический вид", variable=self.var_schematic,
                         command=self.toggle_schematic).pack(side="left", padx=(8, 0))
@@ -2294,16 +2291,15 @@ class App:
 
     # -- действия интерфейса
     def toggle_targets_only(self):
-        """«Только цели»: на карте остаются суда, связанные с нашими портами.
+        """«Только цели»: на карте остаются только танкеры-цели (вкладка «Цели»).
 
-        Расстояние не ограничено: цель может быть у Дуная, у Босфора или
-        в Средиземном море. При включении карта сразу отдаляется так, чтобы
-        все такие суда были видны.
+        Цель — судно, которое идёт в наш порт из нашего же порта; расстояние
+        не ограничено. Карта сразу отдаляется, чтобы все цели были видны.
         """
         self.radar.targets_only = bool(self.var_targets_only.get())
         if self.radar.targets_only:
             try:
-                self.radar.fit_vessels(self.core.related_vessels(20000))
+                self.radar.fit_vessels(self.core.port_focus_vessels(3000))
             except Exception as error:
                 self.log(f"Масштаб по целям: {error}")
         self.redraw_map()
@@ -2316,52 +2312,41 @@ class App:
         self.radar.show_forecast = bool(self.var_forecast.get())
         self.redraw_map()
 
-    def toggle_stale(self):
-        """Показать или скрыть устаревшие позиции на карте.
-
-        На таблицы это не влияет: во всех вкладках устаревшие суда скрыты
-        всегда — иначе список показывает вчерашнее место судна.
-        """
-        self.radar.show_stale = bool(self.var_stale.get())
-        self.redraw_map()
-        self.refresh_tab()
-
     def toggle_schematic(self):
         """Переключить схематический вид карты."""
         self.radar.schematic_view = not self.radar.schematic_view
         self.var_schematic.set(int(self.radar.schematic_view))
         self.redraw_map()
 
+    def fit_focus(self):
+        """Показать на карте сразу все наши суда — даже те, что далеко в море."""
+        try:
+            self.radar.fit_vessels(self.core.port_focus_vessels(3000))
+        except Exception as error:
+            self.log(f"Масштаб по нашим судам: {error}")
+
     def redraw_map(self):
+        """Рисует только нашу обстановку: идут к нам, стоят в порту или на рейде.
+
+        Чужой трафик района (суда, идущие мимо, рыбаки у своих берегов) с карты
+        убран полностью, как и устаревшие позиции: радар показывает только
+        свежие суда, связанные с нашими портами.
+        """
         try:
             port_only = bool(getattr(self, "var_port_only", None) is not None
                              and self.var_port_only.get())
             targets_only = bool(getattr(self.radar, "targets_only", False))
+            # устаревшую позицию на радар не пускаем ни при каких настройках
+            self.radar.show_stale = False
             allowed = None
-            if targets_only:
-                # «Только цели»: все суда, связанные с нашими портами, на любом
-                # расстоянии — от Дуная до Средиземного моря.
-                vessels = self.core.related_vessels(20000)
-                traffic = []
-                allowed = {str(vessel.get("mmsi")) for vessel in vessels}
-            elif port_only:
-                # только причал и рейд: чужие точки района и суда в море не нужны
+            if port_only:
+                # только причал и рейд: суда в море и на подходе не нужны
                 vessels = self.core.port_vessels(600)
-                traffic = []
-            elif getattr(self, "var_traffic", None) is not None and self.var_traffic.get():
-                # Галочка «трафик района» включена: вся обстановка — вся база
-                # района плюс внешние точки, которых в базе ещё нет.
-                vessels = self.core.area_vessels(4000)
-                try:
-                    traffic = self.core.traffic_vessels(800)
-                except Exception:
-                    traffic = []
             else:
-                # Галочка снята: остаются только «свои» суда (идут в наш порт,
-                # стояли в нём или рядом). Вся база района не рисуется.
-                vessels = self.core.related_vessels(3000)
-                traffic = []
-            self.radar.draw(vessels, set(self._targets.keys()), traffic,
+                vessels = self.core.port_focus_vessels(3000)
+            if targets_only:
+                allowed = set(self._targets.keys())
+            self.radar.draw(vessels, set(self._targets.keys()), [],
                             allowed_mmsi=allowed)
         except Exception as error:
             self.log(f"Отрисовка радара: {error}")
@@ -2971,17 +2956,24 @@ class App:
         return max(0.05, minutes / 60.0)
 
     def vessel_is_stale(self, vessel) -> bool:
-        """Позиция судна старше порога (или времени позиции нет вовсе)."""
-        age = core_module.position_age_hours(vessel)
-        return age is None or age > self.stale_limit_hours()
+        """Позиция судна старше его порога (или времени позиции нет вовсе).
+
+        Идущим — `stale_minutes`, стоящим в порту или на рейде —
+        `berth_stale_hours`: такая точка не устаревает так быстро.
+        """
+        return core_module.is_stale(vessel, self.config)
 
     def hidden_stale_note(self, count) -> str:
         """Пояснение к скрытым устаревшим строкам."""
         if not count:
             return ""
-        return (f" Скрыто устаревших (позиция старше "
-                f"{self.stale_limit_hours() * 60:.0f} мин): {count} — в таблицах "
-                f"только свежие суда.")
+        berth = core_module.berth_stale_hours(self.config)
+        if berth > 0:
+            limit = (f"у идущих {self.stale_limit_hours() * 60:.0f} мин, "
+                     f"у стоящих в порту — {berth:g} ч")
+        else:
+            limit = f"{self.stale_limit_hours() * 60:.0f} мин"
+        return f" Скрыто устаревших (порог {limit}): {count} — в таблицах только актуальные суда."
 
     def refresh_tab(self, tab=None):
         """Обновляет данные выбранной вкладки — при заходе и по кнопке."""
@@ -3069,7 +3061,7 @@ class App:
         for target in self._targets.values():
             # цель с давно устаревшей позицией — не цель: её место на карте
             # часы назад, и расчёт прибытия по такой точке бессмыслен
-            if self.vessel_is_stale({"position_at": target.get("position_at")}):
+            if self.vessel_is_stale(target):
                 hidden += 1
                 continue
             tree.insert("", "end", tags=(target["mmsi"],), values=(
