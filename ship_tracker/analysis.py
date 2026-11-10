@@ -16,6 +16,7 @@
 а здесь только признаки поведения, которые можно перепроверить.
 """
 
+import math
 from datetime import datetime, timedelta
 
 import flags
@@ -257,3 +258,73 @@ def signals(vessel, track_rows, visits, ports, history_days=7) -> list:
             f"{moment_text(change['left_at'])}")
 
     return result
+
+
+# Стороны света для подписи смещения за сутки.
+COMPASS = ("север", "северо-восток", "восток", "юго-восток",
+           "юг", "юго-запад", "запад", "северо-запад")
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """Начальный пеленг между точками, градусы от севера по часовой."""
+    phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
+    delta = math.radians(float(lon2) - float(lon1))
+    x = math.sin(delta) * math.cos(phi2)
+    y = (math.cos(phi1) * math.sin(phi2)
+         - math.sin(phi1) * math.cos(phi2) * math.cos(delta))
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def compass_word(bearing):
+    """Пеленг в стороны света: 8 румбов."""
+    index = int((float(bearing) % 360.0) / 45.0 + 0.5) % 8
+    return COMPASS[index]
+
+
+def track_path(rows, gap_minutes=720.0):
+    """Сводка пройденного пути по точкам трека — «откуда и куда идёт».
+
+    Считается по своим позициям: расстояние по сегментам между соседними
+    точками (пропуски больше `gap_minutes` не соединяем — это разрыв AIS,
+    а не ход судна; отрезки без смещения — стоянка — в путь не входят),
+    время в пути и средняя скорость на ходу.
+
+    Возвращает словарь: сколько точек, откуда стартовало, сколько прошло
+    километров, за сколько часов и с какой средней скоростью, а также
+    «прямое» расстояние между первой и последней точкой (насколько путь
+    отличается от прямой).
+    """
+    points = [row for row in (rows or []) if row.get("lat") is not None and row.get("lon") is not None]
+    if len(points) < 2:
+        return {"points": len(points), "km": 0.0, "straight_km": 0.0,
+                "hours": 0.0, "avg_kn": None, "first_at": None}
+    km = 0.0
+    moving_hours = 0.0
+    moving_km = 0.0
+    for prev, cur in zip(points, points[1:]):
+        start, finish = _parse(prev.get("ts")), _parse(cur.get("ts"))
+        if not start or not finish:
+            continue
+        gap = (finish - start).total_seconds() / 60.0
+        if gap <= 0 or gap > gap_minutes:
+            continue
+        leg = geo.haversine_km(float(prev["lat"]), float(prev["lon"]),
+                               float(cur["lat"]), float(cur["lon"]))
+        if leg < 0.01:
+            # Стоит на месте: те же координаты в нескольких сообщениях.
+            continue
+        km += leg
+        moving_km += leg
+        moving_hours += gap / 60.0
+    first, last = points[0], points[-1]
+    straight = geo.haversine_km(float(first["lat"]), float(first["lon"]),
+                                float(last["lat"]), float(last["lon"]))
+    start, finish = _parse(first.get("ts")), _parse(last.get("ts"))
+    hours = (finish - start).total_seconds() / 3600.0 if start and finish else 0.0
+    avg_kn = moving_km / moving_hours / 1.852 if moving_hours > 0.05 and moving_km > 0.2 else None
+    bearing = bearing_deg(first["lat"], first["lon"], last["lat"], last["lon"])
+    return {"points": len(points), "km": km, "straight_km": straight,
+            "hours": hours, "avg_kn": avg_kn, "first_at": start,
+            "first_lat": float(first["lat"]), "first_lon": float(first["lon"]),
+            "last_at": finish, "bearing": bearing,
+            "compass": compass_word(bearing)}

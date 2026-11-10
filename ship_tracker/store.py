@@ -290,6 +290,19 @@ class Store:
                 (since, float(south), float(north), float(west), float(east))).fetchall()
         return [(str(row["mmsi"]), row["ts"], row["lat"], row["lon"]) for row in rows]
 
+    def vessels_in_bbox(self, south, west, north, east, limit=3000):
+        """Все суда, чья последняя позиция попала в прямоугольник.
+
+        Без фильтров по типу и назначению: так видно всё, что плавает в районе,
+        а не только суда, связанные с нашими портами.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM vessels WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+                " ORDER BY COALESCE(position_at, updated_at) DESC LIMIT ?",
+                (float(south), float(north), float(west), float(east), int(limit))).fetchall()
+        return [dict(row) for row in rows]
+
     def track_between(self, mmsi: str, start, end):
         """Позиции судна за конкретный промежуток — например, перед входом в порт."""
         with self._lock:

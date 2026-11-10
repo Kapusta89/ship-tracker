@@ -39,9 +39,10 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.21"
+APP_VERSION = "2026.12.22"
 
 import ais_feed
+import analysis
 import cargo
 import core as core_module
 import flags
@@ -848,6 +849,7 @@ class App:
         self.tab_radar = ttk.Frame(notebook)
         self.tab_vessels = ttk.Frame(notebook)
         self.tab_sea = ttk.Frame(notebook)
+        self.tab_traffic = ttk.Frame(notebook)
         self.tab_forecast = ttk.Frame(notebook)
         self.tab_alerts = ttk.Frame(notebook)
         self.tab_visits = ttk.Frame(notebook)
@@ -860,6 +862,7 @@ class App:
         self.tab_log = ttk.Frame(notebook)
         for tab, title in ((self.tab_radar, "Радар"),
                            (self.tab_vessels, "Все суда"), (self.tab_sea, "В море"),
+                           (self.tab_traffic, "Трафик района"),
                            (self.tab_forecast, "Прогноз 4 дня"),
                            (self.tab_visits, "Стоянки"),
                            (self.tab_visit_history, "История стоянок"),
@@ -875,6 +878,7 @@ class App:
         self.build_radar()
         self.build_vessels()
         self.build_sea()
+        self.build_traffic()
         self.build_forecast()
         self.build_visits()
         self.build_visit_history()
@@ -1044,6 +1048,146 @@ class App:
             button.configure(relief="sunken" if active else "groove",
                              background="#d7e6f5" if active else "#f0f0f0")
         self.refresh_sea_table()
+
+    def build_traffic(self):
+        """Вкладка «Трафик района»: всё, что плавает в Дунае и Чёрном море.
+
+        Здесь нет отбора «только танкеры и баржи» и нет привязки к нашим
+        портам: в список попадает любое судно с позицией в рабочем
+        прямоугольнике — сухогруз, буксир, катер, лоцман, рыбак. Рядом с
+        каждым — разбор пути по своим позициям за 24 часа: сколько прошло,
+        с какой средней скоростью на ходу и откуда начало путь.
+        """
+        tk, ttk = self.tk, self.ttk
+        frame = self.tab_traffic
+        ttk.Label(
+            frame,
+            text="Всё, что плавает в рабочем районе — Дунай и Чёрное море: без отбора "
+                 "по типу и без привязки к нашим портам. Грузовые, танкеры, баржи, "
+                 "буксиры, катера, лоцманы, рыбаки — всё, у чего есть позиция AIS. "
+                 "«Путь 24 ч» — сумма отрезков между нашими позициями за сутки "
+                 "(пропуски больше 12 ч не соединяются, это разрыв AIS, а не ход). "
+                 "«Средний ход» — только время на ходу. «Откуда» — первая позиция "
+                 "за сутки: по ней видно, откуда судно пришло в район. Двойной "
+                 "щелчок открывает карточку судна с полным треком.",
+            foreground="#555", wraplength=1150, justify="left").pack(
+            anchor="w", padx=8, pady=(8, 4))
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=8, pady=(0, 4))
+        self.traffic_info = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.traffic_info, foreground="#333",
+                  wraplength=980, justify="left").pack(side="left", fill="x", expand=True)
+        ttk.Button(bar, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_traffic)).pack(side="right")
+        self.traffic_tree = self.make_tree(
+            frame, (("name", "Судно", 170), ("type", "Тип", 120),
+                    ("dest", "Назначение", 145), ("sog", "Узлы", 55),
+                    ("course", "Курс", 55), ("near", "Ближайший порт", 145),
+                    ("path", "Путь 24 ч", 95), ("avg", "Средний ход", 95),
+                    ("from", "Откуда", 175), ("updated", "Позиция", 95),
+                    ("mmsi", "MMSI", 85)))
+
+    def refresh_traffic(self):
+        """Обновляет «Трафик района»: все свежие суда района с путём за сутки."""
+        if not hasattr(self, "traffic_tree"):
+            return
+        tree = self.traffic_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        # Прямоугольники в конфиге заданы парой углов: [[юг, запад], [север, восток]].
+        boxes = self.config.get("bounding_boxes") or [[[45.0, 28.0], [47.0, 31.0]]]
+        corners = [((box[0][0], box[0][1]), (box[1][0], box[1][1])) for box in boxes]
+        south = min(corner[0][0] for corner in corners)
+        west = min(corner[0][1] for corner in corners)
+        north = max(corner[1][0] for corner in corners)
+        east = max(corner[1][1] for corner in corners)
+        try:
+            rows = self.store.vessels_in_bbox(south, west, north, east, limit=3000)
+        except Exception as error:
+            self.log(f"Трафик района: {error}")
+            rows = []
+        ports = self.config.get("ports") or []
+        limit_hours = core_module.MAX_VIEW_AGE_HOURS
+        now = datetime.now()
+        shown = 0
+        moving = 0
+        skipped_stale = 0
+        fresh = []
+        for row in rows:
+            mmsi = str(row.get("mmsi") or "")
+            if not mmsi:
+                continue
+            moment = parse_iso(row.get("position_at") or row.get("updated_at"))
+            if not moment:
+                continue
+            age_hours = (now - moment).total_seconds() / 3600.0
+            if age_hours > limit_hours:
+                skipped_stale += 1
+                continue
+            try:
+                lat, lon = float(row.get("lat")), float(row.get("lon"))
+            except (TypeError, ValueError):
+                continue
+            best_km = None
+            near_text = ""
+            for port in ports:
+                try:
+                    km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if best_km is None or km < best_km:
+                    best_km = km
+                    near_text = f"{port.get('label') or port.get('name')} · {km:.0f} км"
+            fresh.append((best_km if best_km is not None else 1e9, moment, near_text, row))
+        # Сначала то, что ближе к нашим портам (Дунай, подходы), потом дальше:
+        # так вход в Дунай и рейд Измаила видны в начале списка, а не утопают
+        # среди сотен судов у Босфора.
+        fresh.sort(key=lambda item: (item[0], -item[1].timestamp()))
+        total_fresh = len(fresh)
+        for best_km, moment, near_text, row in fresh:
+            if shown >= 600:
+                break
+            mmsi = str(row.get("mmsi") or "")
+            track = []
+            try:
+                track = self.store.track_between(mmsi, now - timedelta(hours=24), now)
+            except Exception as error:
+                self.log(f"Трек {mmsi}: {error}")
+            path = analysis.track_path(track)
+            sog = row.get("sog")
+            try:
+                if float(sog) >= 0.5:
+                    moving += 1
+            except (TypeError, ValueError):
+                pass
+            km_text = f"{path['km']:.0f} км" if path.get("points", 0) > 1 else "—"
+            avg_kn = path.get("avg_kn")
+            avg_text = f"{avg_kn:.1f} уз" if avg_kn else "—"
+            first_at = path.get("first_at")
+            if first_at and path.get("points", 0) > 1:
+                from_text = (f"{self.coord_text(path['first_lat'], path['first_lon'])}"
+                             f" · {first_at:%d.%m %H:%M}")
+            else:
+                from_text = "нет истории"
+            tree.insert("", "end", tags=(mmsi,), values=(
+                row.get("name") or mmsi, row.get("type_label") or "не указан",
+                str(row.get("destination") or "").strip() or "—",
+                fmt_number(sog), fmt_number(row.get("cog")),
+                near_text or "—", km_text, avg_text, from_text,
+                f"{moment:%H:%M}" if moment.date() == now.date() else f"{moment:%d.%m %H:%M}",
+                mmsi))
+            shown += 1
+        self.traffic_info.set(
+            f"В прямоугольнике {south:.1f}–{north:.1f}° с.ш., {west:.1f}–{east:.1f}° в.д.: "
+            f"свежих судов {total_fresh}, на ходу {moving}, показано {shown} (сначала ближние "
+            f"к нашим портам). Скрыто устаревших (позиция старше {limit_hours:g} ч): "
+            f"{skipped_stale}. Путь считается по своим позициям AIS за 24 ч.")
+
+    @staticmethod
+    def coord_text(lat, lon):
+        """Координаты коротко: 45.23N 29.71E."""
+        return (f"{abs(float(lat)):.2f}{'N' if float(lat) >= 0 else 'S'} "
+                f"{abs(float(lon)):.2f}{'E' if float(lon) >= 0 else 'W'}")
 
     def build_forecast(self):
         """Вкладка «Прогноз 4 дня»: путь до порта, стоянка и выход в море."""
@@ -2407,6 +2551,8 @@ class App:
             allowed.append(self.targets_tree)
         if hasattr(self, "forecast_tree"):
             allowed.append(self.forecast_tree)
+        if hasattr(self, "traffic_tree"):
+            allowed.append(self.traffic_tree)
         if tree not in allowed:
             return
         selection = tree.selection()
@@ -2517,6 +2663,32 @@ class App:
         self._photo_image = None
         self.photo_label.configure(image="", text="фото судна", height=9)
         self.photo_note.configure(text=note)
+
+    def vessel_path_lines(self, mmsi):
+        """Разбор пути судна за сутки для карточки: откуда, сколько прошло, куда идёт.
+
+        Считается по нашим позициям AIS, поэтому у судна, которое программа
+        видит впервые, путь будет коротким — это видно по числу точек.
+        """
+        now = datetime.now()
+        try:
+            track = self.store.track_between(mmsi, now - timedelta(hours=24), now)
+        except Exception:
+            return []
+        path = analysis.track_path(track)
+        if path.get("points", 0) < 2:
+            return ["позиций за сутки мало: путь пока не считается"]
+        lines = []
+        parts = [f"точек: {path['points']}", f"прошло {path['km']:.0f} км"]
+        if path.get("avg_kn"):
+            parts.append(f"средний ход на ходу {path['avg_kn']:.1f} уз")
+        lines.append(", ".join(parts))
+        start = path.get("first_at")
+        lines.append(f"откуда: {self.coord_text(path['first_lat'], path['first_lon'])}"
+                     + (f" в {start:%d.%m %H:%M}" if start else "")
+                     + f", оттуда смещение {path['straight_km']:.0f} км "
+                       f"на {path['compass']}")
+        return lines
 
     def detail_report(self, mmsi):
         if not mmsi:
@@ -2653,6 +2825,10 @@ class App:
         if kind:
             lines.append(f"Что везёт: {kind} — {kind_detail}")
             lines.append("  (название груза AIS не передаёт: подпись по типу судна)")
+        path_lines = self.vessel_path_lines(mmsi)
+        if path_lines:
+            lines.append("Путь за сутки (по своим позициям AIS):")
+            lines += [f"  • {line}" for line in path_lines]
         signals = self.core.vessel_signals(vessel)
         if signals:
             lines.append("Признаки (по наблюдениям программы):")
@@ -2926,6 +3102,16 @@ class App:
             self.refresh_vessels_table()
             self._vessels_drawn_at = now
         self.refresh_sea_table()
+        # «Трафик района» пересобирается только когда он открыт: на каждое судно
+        # идёт запрос трека за сутки, и в фоне это лишняя нагрузка на базу.
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            current = None
+        if current is getattr(self, "tab_traffic", None) and \
+                now - getattr(self, "_traffic_drawn_at", 0.0) >= 30.0:
+            self.refresh_traffic()
+            self._traffic_drawn_at = now
         if now - getattr(self, "_forecast_drawn_at", 0.0) >= 8.0:
             self.refresh_forecast()
             self._forecast_drawn_at = now
@@ -3037,6 +3223,8 @@ class App:
                 self.refresh_vessels_table()
             elif tab is getattr(self, "tab_sea", None):
                 self.refresh_sea_table()
+            elif tab is getattr(self, "tab_traffic", None):
+                self.refresh_traffic()
             elif tab is getattr(self, "tab_forecast", None):
                 self.refresh_forecast()
             elif tab is getattr(self, "tab_alerts", None):
