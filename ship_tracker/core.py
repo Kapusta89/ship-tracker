@@ -517,10 +517,24 @@ class RadarCore:
         self.feed_elsewhere = False
 
     # ------------------------------------------------------------ запуск
-    def start(self):
+    def start(self, feed=True):
+        """Поднимает приём AIS и разбор событий.
+
+        `feed=False` — режим бота, поднятого окном: AIS принимает само окно,
+        а бот только читает общую базу. Иначе зависший бот уносит с собой
+        поток AIS, и окно навсегда показывает старые данные.
+        """
         if self.feed and self.feed.is_alive():
             return
         if self.feed_elsewhere and any(feed.is_alive() for feed in self.feeds):
+            return
+        if not feed:
+            self.feed_elsewhere = True
+            self.stop_event = threading.Event()
+            self.events = queue.Queue(maxsize=20000)
+            self._start_consumer()
+            self._start_services()
+            self._start_startup_refresh()
             return
         # AIS принимает только один процесс: второй читает уже готовую базу
         lock = claim_feed_lock(self.store)
@@ -854,6 +868,57 @@ class RadarCore:
         if self.feed and self.feed.is_alive():
             return True
         return any(feed.is_alive() for feed in self.ais_feeds())
+
+    def feed_silence_minutes(self) -> float:
+        """Сколько минут в общей базе нет новых позиций.
+
+        Показываем 0.0, если позиций нет вовсе или время не разобрать: тогда
+        решать, встал ли чужой поток, нельзя.
+        """
+        try:
+            last = self.store.conn.execute(
+                "SELECT MAX(position_at) FROM vessels").fetchone()[0]
+        except Exception:
+            return 0.0
+        if not last:
+            return 0.0
+        try:
+            moment = datetime.fromisoformat(str(last)[:19])
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, (datetime.now() - moment).total_seconds() / 60.0)
+
+    def takeover_feed(self, silence_minutes=2.0) -> bool:
+        """Забирает AIS себе, если чужой процесс его больше не принимает.
+
+        Второе окно (или бот) AIS не принимает — данные берёт из общей базы.
+        Но если тот процесс завис или был убит, база перестаёт пополняться,
+        а окно навсегда показывает старые данные: в шапке «принимает другой
+        процесс», в базе тишина. Здесь мы это замечаем и поднимаем поток сами.
+        """
+        if not self.feed_elsewhere:
+            return False
+        if self.feed_silence_minutes() < silence_minutes:
+            return False
+        lock = claim_feed_lock(self.store)
+        if lock is None:
+            # чужой процесс жив и держит блокировку: ждём дальше
+            return False
+        self._feed_lock = lock
+        self.feed_elsewhere = False
+        old_event = getattr(self, "stop_event", None)
+        if old_event is not None:
+            # старый потребитель событий должен выйти: он смотрит в прежнюю очередь
+            old_event.set()
+        self.stop_event = threading.Event()
+        self.events = queue.Queue(maxsize=20000)
+        self.stats["started_at"] = datetime.now()
+        if not (self.alert_worker and self.alert_worker.is_alive()):
+            self._start_alert_worker()
+        self._start_consumer()
+        self._start_feed()
+        self.log("Поток AIS прежнего процесса замолчал — принимаю данные сам.")
+        return True
 
     def feed_state(self) -> dict:
         """Сводное состояние AIS: на связи, если отвечает хотя бы один канал."""

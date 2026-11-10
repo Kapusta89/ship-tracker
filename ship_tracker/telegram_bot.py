@@ -22,6 +22,9 @@ import json
 import logging
 import os
 import re
+import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -1732,12 +1735,14 @@ def start_ingest() -> bool:
     if core.running():
         return True
     try:
-        core.start()
+        # бот, поднятый окном, AIS не принимает: это делает окно. Иначе
+        # зависший бот останавливает данные для карты
+        core.start(feed=not parent_pid())
     except Exception as error:
         logging.warning("Поток AIS не запущен: %s", error)
         return False
     if getattr(core, "feed_elsewhere", False):
-        logging.info("AIS уже принимает другой процесс — бот читает общую базу.")
+        logging.info("AIS принимает окно приложения — бот читает общую базу.")
         return False
     logging.info("Бот принимает AIS сам: данные в базе обновляются.")
     logging.info("Поток AIS: %s", core.feed_state())
@@ -1768,6 +1773,57 @@ async def run_bot():
             _store.close()
 
 
+def parent_pid() -> Optional[int]:
+    """PID окна, которое запустило бота: приложение передаёт его в --parent-pid."""
+    args = sys.argv[1:]
+    for index, arg in enumerate(args):
+        if arg == "--parent-pid" and index + 1 < len(args):
+            value = args[index + 1]
+        elif arg.startswith("--parent-pid="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def pid_alive(pid: int) -> bool:
+    """Жив ли процесс: без сигналов, только проверка существования."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+        except Exception:
+            return True  # не смогли проверить — лучше не трогать бота
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def watch_parent(pid: int):
+    """Бот, поднятый приложением, выходит вместе с ним — иначе он остаётся
+    сиротой и держит data/feed.lock и data/bot.lock: новое окно не может
+    принимать AIS и получает замороженные данные."""
+    while True:
+        time.sleep(20)
+        if not pid_alive(pid):
+            logging.info("Окно приложения закрыто — бот выходит и освобождает "
+                         "блокировки data/*.lock.")
+            try:
+                logging.shutdown()
+            finally:
+                os._exit(0)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -1775,6 +1831,10 @@ def main():
         print("Бот уже запущен — отдельным окном или приложением. "
               "Закройте тот процесс и запустите снова.")
         return
+    pid = parent_pid()
+    if pid:
+        threading.Thread(target=watch_parent, args=(pid,), daemon=True,
+                         name="parent-watch").start()
     try:
         asyncio.run(run_bot())
     except KeyboardInterrupt:

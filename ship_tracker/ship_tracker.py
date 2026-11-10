@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.6"
+APP_VERSION = "2026.12.7"
 
 import ais_feed
 import cargo
@@ -2792,6 +2792,27 @@ class App:
         self.update_detail()
         self.update_track()
         self.redraw_map()
+        self.watch_foreign_feed()
+
+    def watch_foreign_feed(self):
+        """Если AIS принимал другой процесс и замолчал — забираем поток себе.
+
+        Бот или прошлое окно держат data/feed.lock; когда тот процесс зависает
+        или его убивают, база перестаёт пополняться, а окно продолжает читать
+        старые строки. Проверяем раз в полминуты и поднимаем поток сами.
+        """
+        if not getattr(self.core, "feed_elsewhere", False):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_feed_check_at", 0.0) < 30.0:
+            return
+        self._feed_check_at = now
+        try:
+            if self.core.takeover_feed():
+                self.log("AIS: поток прежнего процесса встал — принимаю данные "
+                         "в этом окне.")
+        except Exception as error:
+            self.log(f"AIS: не удалось забрать поток: {error}")
 
     def on_tab_changed(self, event=None):
         """При переключении вкладки сразу читаем данные, а не ждём такта."""
@@ -3625,8 +3646,11 @@ class App:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             handle = open(log_path, "a", encoding="utf-8", errors="replace")
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            # PID окна в аргументах: бот сам выйдет, если окно закроют, и не
+            # останется сиротой с занятыми data/bot.lock и data/feed.lock
             self.bot_process = subprocess.Popen(
-                [sys.executable, "-X", "utf8", str(APP_DIR / "telegram_bot.py")],
+                [sys.executable, "-X", "utf8", str(APP_DIR / "telegram_bot.py"),
+                 "--parent-pid", str(os.getpid())],
                 cwd=str(APP_DIR), stdout=handle, stderr=subprocess.STDOUT,
                 creationflags=flags)
             # у дочернего процесса свой дескриптор — родителю файл больше не нужен
