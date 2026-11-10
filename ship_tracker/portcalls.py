@@ -527,6 +527,15 @@ SOURCES = [
     {"key": "rynda", "title": "Rynda.io", "kind": "page",
      "url": "https://rynda.io/",
      "how": "только глазами: биржа фрахта, публичного API нет"},
+    # Eurostat CROS: проект статистики судозаходов на данных AIS агентства EMSA.
+    # Это официальная статистика (квартальные оценки), а не позиции судов:
+    # открытого API с координатами у неё нет, поэтому только проверка
+    # доступности и ссылка — в поток позиций такая страница не годится.
+    {"key": "cros", "title": "Eurostat CROS: статистика судов по AIS (EMSA)", "kind": "page",
+     "url": ("https://cros.ec.europa.eu/book-page/"
+             "estimation-maritime-vessel-traffic-using-automatic-identification-system-ais-data"),
+     "how": "только глазами: официальная статистика порт-заходов Eurostat/EMSA, "
+            "не позиции судов; API с координатами нет"},
 ]
 
 SOURCES_BY_KEY = {source["key"]: source for source in SOURCES}
@@ -610,13 +619,18 @@ def check_sources(keys=None, timeout=25, pause=0.5, log=None) -> list[dict]:
     Результат кладётся в data/sources.json, чтобы окно показало его сразу
     после запуска, без повторного обхода сайтов.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     wanted = set(keys or [])
-    results = []
-    for source in SOURCES:
-        if wanted and source["key"] not in wanted:
-            continue
-        results.append(check_source(source, timeout=timeout, log=log))
-        time.sleep(max(0.0, pause))
+    chosen = [source for source in SOURCES
+              if not wanted or source["key"] in wanted]
+    if not chosen:
+        return []
+    # все сайты проверяются одновременно: обход не ждёт самый медленный
+    workers = max(1, min(8, len(chosen)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda source: check_source(source, timeout=timeout,
+                                                            log=log), chosen))
     save_sources(results)
     return results
 

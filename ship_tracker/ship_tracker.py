@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.12"
+APP_VERSION = "2026.12.13"
 
 import ais_feed
 import cargo
@@ -3717,6 +3717,14 @@ class App:
         else:
             self.log(f"Ключ не принят: {error or 'сервер закрыл соединение'}.")
         self._key_checking = False
+        # Проверка останавливала основной поток — возвращаем его на место,
+        # иначе после проверки живой AIS остаётся выключенным
+        if was_running:
+            try:
+                self.core.start()
+                self.log("Основной поток AIS снова запущен.")
+            except Exception as error2:
+                self.log(f"Не удалось снова запустить поток AIS: {error2}")
         if was_running:
             self.core.start()
             self.log("Основной поток снова запущен.")
@@ -4011,18 +4019,24 @@ class App:
         threading.Thread(target=self._check_all_sources_worker, daemon=True).start()
 
     def _check_all_sources_worker(self):
-        self.log(f"Проверяю источники без ключа ({len(portcalls.SOURCES)} сайтов)…")
+        """Проверяет все источники без ключа одновременно, а не по очереди."""
+        self.log(f"Проверяю источники без ключа ({len(portcalls.SOURCES)} сайтов) — все сразу…")
         try:
-            for source in portcalls.SOURCES:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def check(source):
                 try:
-                    result = portcalls.check_source(source, log=self.log)
+                    return portcalls.check_source(source, log=self.log)
                 except Exception as error:
-                    result = {"key": source["key"], "title": source["title"],
-                              "ok": False, "warn": False,
-                              "detail": str(error)[:120],
-                              "checked": datetime.now().isoformat(timespec="seconds")}
-                self._store_source_result(result)
-                time.sleep(0.5)
+                    return {"key": source["key"], "title": source["title"],
+                            "ok": False, "warn": False,
+                            "detail": str(error)[:120],
+                            "checked": datetime.now().isoformat(timespec="seconds")}
+
+            workers = max(1, min(8, len(portcalls.SOURCES)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for result in pool.map(check, portcalls.SOURCES):
+                    self._store_source_result(result)
         finally:
             self._sources_busy = False
         self.log("Проверка источников завершена.")
