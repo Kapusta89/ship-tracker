@@ -274,6 +274,15 @@ def load_config(path=None) -> dict:
     # идущие к нам из Средиземного моря, вообще не видны
     if not config.get("far_boxes"):
         config["far_boxes"] = [list(box) for box in DEFAULT_CONFIG["far_boxes"]]
+    # Типы AIS-сообщений: старые сохранённые настройки не должны отключать
+    # позиции Class B и статические данные — иначе поток «молчит» по части судов
+    types = [str(item) for item in (config.get("message_types") or [])]
+    for name in ("PositionReport", "ExtendedClassBPositionReport",
+                 "StandardClassBPositionReport", "ShipStaticData",
+                 "StaticDataReport", "LongRangeAisBroadcastMessage"):
+        if name not in types:
+            types.append(name)
+    config["message_types"] = types
     return config
 
 
@@ -949,14 +958,12 @@ class RadarCore:
             return []
         return [str(row.get("mmsi") or "") for row in rows if row.get("mmsi")]
 
-    def watch_mmsis(self, limit=40):
+    def watch_mmsis(self, limit=190):
         """Суда для глобального слежения по MMSI.
 
-        AISStream держит подписку с десятками MMSI, а на сотни рвёт соединение
-        сразу после отправки (проверено: 260 MMSI — тишина и переподключение
-        каждые 5 секунд, 20 MMSI — стабильный поток). После подключения карт
-        района в базе оказались сотни судов у портов, поэтому в подписку идут
-        только суда с нашим портом в назначении и самые свежие из базы.
+        AISStream принимает до 200 MMSI в одной подписке (`FiltersShipMMSI`),
+        поэтому в список идут все суда базы, связанные с нашими портами: так они
+        остаются на связи, даже когда ушли далеко за пределы прямоугольников.
         """
         try:
             rows = self.store.vessels(2000)

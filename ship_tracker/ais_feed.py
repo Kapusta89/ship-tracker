@@ -367,6 +367,9 @@ class AISStreamFeed(threading.Thread):
     """Живой фид AISStream с переподключением и экспоненциальной паузой."""
 
     feed_title = "AISStream (основной поток)"
+    # соединение может «зависнуть» без ошибки: если кадров нет столько
+    # времени, сокет пересоздаём — иначе поток просто спит и данные не идут
+    idle_reconnect_seconds = 600.0
 
     def __init__(self, api_key, bboxes, message_types, on_event, log, stop_event,
                  stream_url=None, name="ais-feed"):
@@ -443,9 +446,18 @@ class AISStreamFeed(threading.Thread):
                     self.connected = True
                     self.connected_since = datetime.now()
                     self.last_error = ""
-                    for frame in socket:
-                        if self.stop_event.is_set():
-                            break
+                    self.last_frame_at = time.monotonic()
+                    while not self.stop_event.is_set():
+                        try:
+                            frame = socket.recv(timeout=30)
+                        except TimeoutError:
+                            quiet = time.monotonic() - self.last_frame_at
+                            if quiet >= self.idle_reconnect_seconds:
+                                self.log(f"{self.feed_title}: сообщений нет "
+                                         f"{quiet / 60:.0f} мин — переподключаюсь.")
+                                break
+                            continue
+                        self.last_frame_at = time.monotonic()
                         self.handle_frame(frame)
             except Exception as error:  # сеть, ключ, лимиты — всё лечится переподключением
                 text, status = describe_error(error)

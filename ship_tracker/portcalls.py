@@ -464,98 +464,15 @@ def registry_links(imo=None, mmsi=None) -> list[tuple[str, str]]:
 
 # ------------------------------------------------- источники без ключа API
 #
-# Эти сервисы не требуют ключа, но и не все годятся для автоматического
-# чтения: у части таблицы рисует браузерный скрипт, у APDM — скан PDF.
-# kind: ais — разбираем HTML-таблицу; pdf — проверяем файл; page — только
-# доступность сайта (данные открываются глазами).
+# Здесь только те сайты, которые отдают данные машинно: таблица разбирается,
+# файл скачивается. Ссылки «открывается глазами в браузере» из списка убраны —
+# они не приносят ни одной позиции и только шумели в проверке источников.
+# kind: ais — разбираем HTML-таблицу; pdf — проверяем файл.
 
 SOURCES = [
     {"key": "aci", "title": "AIS-catcher: ожидаемые прибытия", "kind": "ais",
      "url": EXPECTED_URL.format(locode="UAIZM"),
      "how": "читается автоматически: HTML-таблица Expected, ключ не нужен"},
-    {"key": "uspa", "title": "USPA: суда на рейде и судозаходы", "kind": "page",
-     "url": "https://www.uspa.gov.ua/en/project/list-of-ships-on-a-roadstead",
-     "how": "только глазами: таблицы грузятся браузерным скриптом, API нет"},
-    {"key": "apdm", "title": "APDM Galați: сводка по судам", "kind": "pdf",
-     "url": "https://apdmgalati.ro/actualizare/ccmnmfgalati.pdf",
-     "how": "только глазами: PDF-скан без текстового слоя"},
-    {"key": "apm", "title": "APM Terminals: расписание судов", "kind": "page",
-     "url": "https://www.apmterminals.com/track-and-trace/vessel-schedule",
-     "how": "только глазами: интерактивное расписание, API нет"},
-    {"key": "equasis", "title": "Equasis: владелец, флаг, история", "kind": "page",
-     "url": "https://www.equasis.org/EquasisWeb/public/HomePage",
-     "how": "только глазами: вход по логину и капче"},
-    {"key": "gisis", "title": "IMO GISIS: карточка судна", "kind": "page",
-     "url": "https://gisis.imo.org/Public/Default.aspx",
-     "how": "только глазами: форма поиска, API нет"},
-    {"key": "itu", "title": "ITU MARS: MMSI и позывной", "kind": "page",
-     "url": "https://www.itu.int/mars/",
-     "how": "только глазами: форма поиска, API нет"},
-    # Публичные карты судов из списка пользователя. У Goradar и MarineTraffic.live
-    # есть машинный JSON — они уже читаются потоками (см. services_feed) и суда
-    # ставятся на карту; здесь только те сайты, у которых данных для чтения нет.
-    {"key": "oceanook", "title": "Oceanook: отслеживание судов", "kind": "page",
-     "url": "https://oceanook.com/",
-     "how": "только глазами: защита от роботов, данные в браузере по токену страницы"},
-    {"key": "sputnik", "title": "СпутникСервис (sputnik-flot.ru)", "kind": "page",
-     "url": "https://sputnik-flot.ru/",
-     "how": "только глазами: сайт услуги, открытой выдачи позиций нет"},
-    {"key": "shiptracking", "title": "Ship-Tracking.net", "kind": "page",
-     "url": "https://ship-tracking.net/",
-     "how": "только глазами: показывает карту MarineTraffic во встроенном окне"},
-    {"key": "fleetmon", "title": "FleetMon", "kind": "page",
-     "url": "https://www.fleetmon.com/",
-     "how": "нужен платный ключ API; сайт с этого компьютера не открывается (DNS)"},
-    {"key": "shipais", "title": "ShipAIS.uk", "kind": "page",
-     "url": "https://shipais.uk/",
-     "how": "только глазами: карты и история только по водам Великобритании"},
-    {"key": "shipexplorer", "title": "ShippingExplorer", "kind": "page",
-     "url": "https://www.shippingexplorer.net/ru/map",
-     "how": "только глазами: карта отдаёт позиции только с antiforgery-токеном браузера"},
-    {"key": "liveshipsmap", "title": "LiveShipsMap", "kind": "page",
-     "url": "https://liveshipsmap.com/",
-     "how": "недоступен: домен не резолвится с этого компьютера"},
-    {"key": "portmaps", "title": "Portmaps", "kind": "page",
-     "url": "https://portmaps.com/",
-     "how": "недоступен: сайт не отвечает на запросы"},
-    {"key": "shipsua", "title": "Ships.com.ua", "kind": "page",
-     "url": "https://www.ships.com.ua/",
-     "how": "только глазами: показывает карту VesselFinder во встроенном окне"},
-    {"key": "radar24", "title": "Radar24.ru", "kind": "page",
-     "url": "https://radar-24.ru/",
-     "how": "только глазами: витрина сервиса, карты судов на странице нет"},
-    {"key": "rynda", "title": "Rynda.io", "kind": "page",
-     "url": "https://rynda.io/",
-     "how": "только глазами: биржа фрахта, публичного API нет"},
-    # Eurostat CROS: проект статистики судозаходов на данных AIS агентства EMSA.
-    # Это официальная статистика (квартальные оценки), а не позиции судов:
-    # открытого API с координатами у неё нет, поэтому только проверка
-    # доступности и ссылка — в поток позиций такая страница не годится.
-    # СКАНЭКС: коммерческий АИС-мониторинг судов и данные АИС по договору.
-    # Публичного API с координатами нет, есть trial по заявке.
-    {"key": "scanex_data", "title": "СКАНЭКС: данные АИС", "kind": "page",
-     "url": "https://www.scanex.ru/data/ais/",
-     "how": "по договору: архив и поток АИС, есть trial по заявке; открытого API нет"},
-    {"key": "scanex_service", "title": "СКАНЭКС: АИС-мониторинг судов", "kind": "page",
-     "url": "https://www.scanex.ru/geo-service/AIS-vessels/",
-     "how": "только глазами: геосервис мониторинга, доступ по договору"},
-    # Маринэк (seacomm.ru): оборудование, а не данные — путь к своему приёмнику.
-    {"key": "seacomm", "title": "Marinec / seacomm.ru: оборудование AIS", "kind": "page",
-     "url": "https://seacomm.ru/catalog/navigatsionnoe-oborudovanie/ais/",
-     "how": "только глазами: магазин AIS-приёмников и транспондеров — для своего приёмника"},
-    # Global Fishing Watch: открытые API и код. Сам фид по ключу уже работает
-    # в канале GFW, здесь — ссылки на данные и исходники (страница, не позиции).
-    {"key": "gfw_api", "title": "Global Fishing Watch: API и данные", "kind": "page",
-     "url": "https://globalfishingwatch.org/our-apis/",
-     "how": "API по бесплатному токену — уже в канале GFW; здесь документация и датасеты"},
-    {"key": "gfw_code", "title": "Global Fishing Watch: код на GitHub", "kind": "page",
-     "url": "https://github.com/GlobalFishingWatch",
-     "how": "только глазами: открытые библиотеки и примеры работы с API и данными"},
-    {"key": "cros", "title": "Eurostat CROS: статистика судов по AIS (EMSA)", "kind": "page",
-     "url": ("https://cros.ec.europa.eu/book-page/"
-             "estimation-maritime-vessel-traffic-using-automatic-identification-system-ais-data"),
-     "how": "только глазами: официальная статистика порт-заходов Eurostat/EMSA, "
-            "не позиции судов; API с координатами нет"},
 ]
 
 SOURCES_BY_KEY = {source["key"]: source for source in SOURCES}
