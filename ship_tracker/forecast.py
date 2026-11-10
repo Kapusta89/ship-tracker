@@ -118,9 +118,31 @@ def estimates(vessel, track=None):
                              float(last["lat"]), float(last["lon"]))
         source += ", курс по треку"
     if speed is None or not (MIN_SPEED_KNOTS <= float(speed) <= 40):
-        # ход в AIS отсутствует или мусорный: расчёт пойдёт по резервной скорости
-        speed = None
-        source = "AIS ход не передаёт" + (", курс по треку" if "курс по треку" in source else "")
+        # хода в AIS нет — считаем его сами по треку: расстояние между
+        # соседними точками делим на время между ними
+        derived = []
+        stamped = [point for point in points if point.get("ts")][-8:]
+        for first, second in zip(stamped, stamped[1:]):
+            try:
+                t1 = datetime.fromisoformat(str(first["ts"])[:19])
+                t2 = datetime.fromisoformat(str(second["ts"])[:19])
+                km = geo.haversine_km(float(first["lat"]), float(first["lon"]),
+                                      float(second["lat"]), float(second["lon"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+            hours = (t2 - t1).total_seconds() / 3600.0
+            if hours <= 0 or km <= 0:
+                continue
+            knots = km / hours / KNOT_KMH
+            if MIN_SPEED_KNOTS <= knots <= 40:
+                derived.append(knots)
+        if len(derived) >= 2:
+            derived.sort()
+            speed = derived[len(derived) // 2]
+            source = f"по треку (расчёт: {len(derived)} отрезков)"
+        else:
+            speed = None
+            source = "AIS ход не передаёт" + (", курс по треку" if "курс по треку" in source else "")
     return speed, course, source
 
 
@@ -226,7 +248,8 @@ def duration_text(hours):
     return f"{days} д {rest} ч"
 
 
-def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=None):
+def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=None,
+         fallback_speed=None, fallback_count=0):
     """План судна на 4 дня: путь до порта, стоянка в нём и выход в море.
 
     AIS не знает ни времени стоянки, ни дальнейшего рейса, поэтому план
@@ -256,6 +279,14 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=N
         return None
 
     speed, course, source = estimates(vessel, track)
+    # Ход нигде не нашёлся — берём средний по судам района: это тоже расчёт,
+    # а не выдуманное число, и в разборе видно, сколько судов дали среднее.
+    if not speed and fallback_speed:
+        speed = float(fallback_speed)
+        source = (f"нет в AIS — средний ход по району {speed:.1f} уз "
+                  f"({fallback_count} судов)")
+    # измерен ли ход прямо в AIS или посчитан математически
+    speed_computed = bool(speed) and not str(source).startswith(("AIS", "средняя по треку"))
     in_port = stay.get("current_hours") is not None
     position_age = None
     stamp = vessel.get("position_at") or vessel.get("updated_at")
@@ -366,7 +397,7 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=N
         if speed:
             evidence.append(f"Ход: {speed:.1f} уз — {source}")
         else:
-            evidence.append(f"Ход: AIS не передаёт — в расчёте резервные "
+            evidence.append(f"Ход: данных нет — в расчёте резервные "
                             f"{DEFAULT_SEA_KNOTS:.1f} уз (оценка)")
         if approach_km:
             evidence.append(
@@ -386,13 +417,23 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=N
             evidence.append(
                 f"Лоцман: своих наблюдений за {port.get('name')} нет — "
                 "в сумму не входит (не выдумываем)")
+        elif pilot.get("scope") == "все порты":
+            evidence.append(
+                f"Лоцман: {duration_text(pilot_hours)} — расчёт по всем портам "
+                f"({pilot.get('samples')} визитов за {pilot.get('window_days')} дн., "
+                f"разброс {duration_text(pilot.get('min_hours'))}…"
+                f"{duration_text(pilot.get('max_hours'))})")
         else:
             evidence.append(
                 f"Лоцман: {duration_text(pilot_hours)} — медиана по {pilot.get('samples')} "
                 f"визитам порта за {pilot.get('window_days')} дн. "
                 f"(разброс {duration_text(pilot.get('min_hours'))}…"
                 f"{duration_text(pilot.get('max_hours'))})")
-        if stay_scope == "оценка":
+        if stay_scope in ("тип", "все порты", "норматив"):
+            evidence.append(
+                f"Стоянка: {duration_text(stay_hours)} — расчёт по «{stay_scope}» "
+                f"({stay.get('visits') or 0} визитов): своей истории у судна и порта нет")
+        elif stay_scope == "оценка":
             evidence.append(f"Стоянка: {duration_text(stay_hours)} — истории визитов нет, "
                             "значение по умолчанию")
         else:
@@ -407,6 +448,7 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=N
         "speed": speed,
         "course": course,
         "source": source,
+        "speed_computed": speed_computed,
         "arrival_hours": arrival_hours,
         "arrival_at": arrival_at,
         "arrival_text": arrival and arrival.get("label"),

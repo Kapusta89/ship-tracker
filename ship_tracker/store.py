@@ -185,16 +185,33 @@ class Store:
 
     def upsert_position(self, mmsi: str, lat: float, lon: float, sog=None, cog=None,
                         heading=None, port=None, when=None):
+        """Сохраняет позицию, но не затирает более свежую более старой.
+
+        Часть источников («карты судов», снимки, кэш сервисов) отдаёт позиции
+        с опозданием на часы. Без этой проверки они перебивали живой AIS: в базе
+        оставалась отметка десятичасовой давности, и радар показывал старое
+        место судна. Старшая по времени отметка всегда побеждает.
+        """
         ts = iso(when)
+        fresh = ("COALESCE(vessels.position_at, '') <= excluded.position_at")
         with self._lock, self.conn:
             self.conn.execute(
-                """INSERT INTO vessels (mmsi, lat, lon, sog, cog, heading, port, updated_at,
+                f"""INSERT INTO vessels (mmsi, lat, lon, sog, cog, heading, port, updated_at,
                                         position_at, first_seen)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(mmsi) DO UPDATE SET
-                       lat = excluded.lat, lon = excluded.lon, sog = excluded.sog,
-                       cog = excluded.cog, heading = excluded.heading, port = excluded.port,
-                       updated_at = excluded.updated_at, position_at = excluded.position_at""",
+                       lat = CASE WHEN {fresh} THEN excluded.lat ELSE vessels.lat END,
+                       lon = CASE WHEN {fresh} THEN excluded.lon ELSE vessels.lon END,
+                       sog = CASE WHEN {fresh} THEN COALESCE(excluded.sog, vessels.sog)
+                                  ELSE vessels.sog END,
+                       cog = CASE WHEN {fresh} THEN COALESCE(excluded.cog, vessels.cog)
+                                  ELSE vessels.cog END,
+                       heading = CASE WHEN {fresh} THEN COALESCE(excluded.heading, vessels.heading)
+                                      ELSE vessels.heading END,
+                       port = CASE WHEN {fresh} THEN excluded.port ELSE vessels.port END,
+                       position_at = CASE WHEN {fresh} THEN excluded.position_at
+                                          ELSE vessels.position_at END,
+                       updated_at = excluded.updated_at""",
                 (mmsi, lat, lon, sog, cog, heading, port, ts, ts, ts),
             )
 
@@ -429,6 +446,21 @@ class Store:
         params.append(limit)
         with self._lock:
             rows = self.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def stays_by_type(self, limit=800):
+        """Завершённые стоянки с типом судна — для расчётной оценки стоянки.
+
+        Нужны, когда у судна и у порта ещё нет своей истории: берём медиану
+        по судам того же типа во всех наших портах.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT v.type_label AS type_label, p.entered_at AS entered_at, "
+                "p.left_at AS left_at FROM port_visits p "
+                "LEFT JOIN vessels v ON v.mmsi = p.mmsi "
+                "WHERE p.left_at IS NOT NULL ORDER BY p.id DESC LIMIT ?",
+                (int(limit),)).fetchall()
         return [dict(row) for row in rows]
 
     def draft_reference(self, length_m, band=0.3):

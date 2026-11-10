@@ -945,18 +945,10 @@ async def cmd_plan(message: Message):
                     continue
             except Exception:
                 pass
-            if not _underway(vessel):
-                # без хода AIS время в пути не подтвердить — показываем только
-                # расстояние и причину, без выдуманных часов
-                try:
-                    km = geo.haversine_km(float(lat), float(lon),
-                                          float(port["lat"]), float(port["lon"]))
-                except (KeyError, TypeError, ValueError):
-                    km = None
-                result.append((vessel, {"port": port.get("name"),
-                                        "port_label": port.get("label") or port.get("name"),
-                                        "no_speed": True, "approach_km": km}))
-                continue
+            try:
+                fallback_speed, fallback_count = core.median_speed()
+            except Exception:
+                fallback_speed, fallback_count = None, 0
             try:
                 stay = core.port_stay(vessel, port=port)
             except Exception:
@@ -966,9 +958,16 @@ async def cmd_plan(message: Message):
             except Exception:
                 pilot = None
             plan = forecast.plan(vessel, ports, stay=stay, track=store.track(mmsi, 24),
-                                 pilot=pilot)
+                                 pilot=pilot, fallback_speed=fallback_speed,
+                                 fallback_count=fallback_count)
             if plan and (plan.get("arrival_at") is not None or plan.get("in_port")):
                 result.append((vessel, plan))
+            elif plan:
+                # хватает только расстояния — показываем его и причину
+                result.append((vessel, {"port": port.get("name"),
+                                        "port_label": port.get("label") or port.get("name"),
+                                        "no_speed": True,
+                                        "approach_km": plan.get("approach_km")}))
         result.sort(key=lambda pair: (bool(pair[1].get("no_speed")),
                                       pair[1].get("total_hours") or 0.0))
         return result

@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.8"
+APP_VERSION = "2026.12.9"
 
 import ais_feed
 import cargo
@@ -1091,11 +1091,14 @@ class App:
         rows = []
         stopped_rows = []
         late = 0
+        # ход неизвестен — считаем его сами: по треку судна, а если трека
+        # нет — по среднему ходу судов района. Прочерков в таблице не остаётся
+        try:
+            fallback_speed, fallback_count = self.core.median_speed()
+        except Exception:
+            fallback_speed, fallback_count = None, 0
         for vessel, port in self.forecast_candidates():
             mmsi = str(vessel.get("mmsi"))
-            if not self.vessel_underway(vessel):
-                stopped_rows.append((vessel, port))
-                continue
             try:
                 stay = self.core.port_stay(vessel, port=port)
             except Exception:
@@ -1108,7 +1111,9 @@ class App:
                 track = self.store.track(mmsi, 24)
             except Exception:
                 track = None
-            result = forecast.plan(vessel, ports, stay=stay, track=track, pilot=pilot)
+            result = forecast.plan(vessel, ports, stay=stay, track=track, pilot=pilot,
+                                    fallback_speed=fallback_speed,
+                                    fallback_count=fallback_count)
             if not result:
                 continue
             # план без прихода — не «сколько до выхода»: судно за 4 сут не дойдёт
@@ -1126,7 +1131,11 @@ class App:
             estimated = bool(result.get("arrival_estimate"))
             mark = "≈" if estimated else ""
             speed = result.get("speed")
-            speed_text = f"{speed:.1f} уз" if speed else "—"
+            # ход из расчёта (трек или средний по району) помечаем «≈»:
+            # цифра верная, но это не прямое измерение AIS
+            computed_speed = bool(speed) and bool(result.get("speed_computed"))
+            speed_text = (f"{'≈' if computed_speed else ''}{speed:.1f} уз"
+                          if speed else "—")
             distance = result.get("approach_km")
             pilot = result.get("pilot_hours")
             if pilot is None:
@@ -1170,27 +1179,24 @@ class App:
         self._forecast_plans = plans
         self._forecast_stopped_count = len(stopped_rows)
         if hasattr(self, "forecast_info"):
-            text = (f"Идут с моря в наши порты: {len(rows) + len(stopped_rows)}"
-                    f" (с подтверждённым ходом AIS: {len(rows)}).")
+            text = f"Идут с моря в наши порты: {len(rows) + len(stopped_rows)}."
             in_port = getattr(self, "_forecast_in_port", 0)
             no_position = getattr(self, "_forecast_no_position", 0)
             if in_port:
                 text += f" Уже в порту: {in_port} — они во вкладке «Стоянки»."
             if no_position:
                 text += f" Без позиции AIS: {no_position}."
-            stopped = getattr(self, "_forecast_stopped", []) or []
-            if stopped:
-                names = ", ".join(str(vessel.get("name") or vessel.get("mmsi"))
-                                  for vessel, _ in stopped[:3])
-                if len(stopped) > 3:
-                    names += "…"
-                text += (f" Без хода AIS: {len(stopped)} ({names}) — показаны без "
-                         "часов: время в пути не подтверждено.")
+            computed = sum(1 for _, plan in rows if plan.get("speed_computed"))
+            if computed:
+                text += (f" Ход в AIS: {len(rows) - computed}, посчитан математически "
+                         f"у {computed} (по треку, а без трека — по среднему ходу "
+                         f"судов района).")
             if late:
                 text += f" За 4 сут не доходят: {late}."
-            text += (" Всего до выхода = путь + лоцман + стоянка. Ход и курс — AIS, "
-                     "стоянка — наши визиты, лоцман — медиана по визитам порта; "
-                     "источники каждого числа — в разборе под таблицей, ≈ — оценка.")
+            text += (" Всего до выхода = путь + лоцман + стоянка. Ход и курс — AIS или расчёт "
+                     "по треку, стоянка — наши визиты (или медиана по типу судна/портам), "
+                     "лоцман — медиана по визитам (или по всем портам); источники каждого "
+                     "числа — в разборе под таблицей, ≈ — расчёт.")
             text += self.hidden_stale_note(getattr(self, "_forecast_hidden_stale", 0))
             self.forecast_info.set(text)
         if keep and keep in plans:

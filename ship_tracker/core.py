@@ -27,6 +27,7 @@ import ais_feed
 import analysis
 import cargo
 import flags
+import forecast
 import geo
 import metrics
 import portcalls
@@ -50,7 +51,12 @@ DEFAULT_CONFIG = {
     "openwaters_token": "",
     "use_openwaters": True,
     "use_snapshot": True,
-    "snapshot_minutes": 5,
+    # снимок района опрашивается раз в минуту: это самый частый бесплатный
+    # источник, который отдаёт свежие позиции тысяч судов (медиана 2-3 мин)
+    "snapshot_minutes": 1,
+    # как часто писать трек судна в базу: живой AIS приходит чаще, но история
+    # нужна для расчёта хода и стоянок — 15 с хватает, запись дешевле минуты
+    "position_interval_seconds": 15,
     "snapshot_max_age_hours": 6,
     # слежение за нашими судами по MMSI по всему миру (AISStream FiltersShipMMSI):
     # единственный бесплатный способ увидеть судно, ушедшее за пределы района
@@ -589,9 +595,14 @@ class RadarCore:
         else:
             self.log("API-ключ AISStream не задан — основной поток не запущен.")
         # Дополнительный поток Open Waters AIS (совместим с протоколом)
-        if config.get("use_openwaters", True):
-            ow_token = (config.get("openwaters_token") or "").strip() or "public"
-            self.log(f"Запуск Open Waters AIS (токен {'задан' if (config.get('openwaters_token') or '').strip() else 'публичный'}, боксы: {len(config.get('bounding_boxes') or [])})")
+        # Поток Open Waters без своего токена сервер закрывает сразу
+        # (1008: Api Key Is Not Valid), поэтому без токена его не запускаем:
+        # иначе поток только жрёт соединения и пишет ошибки в журнал.
+        ow_token = (config.get("openwaters_token") or "").strip()
+        if config.get("use_openwaters", True) and not ow_token:
+            self.log("Open Waters AIS: личный токен не задан — поток пропущен, "
+                     "позиции берём из снимка Open Waters и AISStream.")
+        elif config.get("use_openwaters", True):
             url = getattr(ais_feed, "OPENWATERS_URL", None)
             if url:
                 try:
@@ -631,12 +642,15 @@ class RadarCore:
                     boxes = ais_feed.tile_boxes([[[south, west], [north, east]]])
             if boxes:
                 try:
+                    minutes = float(config.get("snapshot_minutes") or 1)
                     feed3 = ais_feed.SnapshotFeed(
                         boxes, self._receive, self.log, self.stop_event,
-                        interval_minutes=config.get("snapshot_minutes") or 10,
+                        interval_minutes=minutes,
                         max_age_hours=config.get("snapshot_max_age_hours") or 6)
                     feed3.start()
                     self.feeds.append(feed3)
+                    self.log(f"Снимок района: клеток {len(boxes)}, обновление "
+                             f"каждые {minutes:g} мин.")
                 except Exception as error:
                     self.log(f"Снимок района: не удалось запустить ({error})")
             else:
@@ -1600,10 +1614,23 @@ class RadarCore:
             self.store.upsert_static(mmsi, destination=event["destination"])
 
         last_stored = self._last_stored.get(mmsi)
-        interval = float(self.config.get("position_interval_seconds") or 60)
+        interval = float(self.config.get("position_interval_seconds") or 15)
         now_mono = time.monotonic()
-        if last_stored is None or now_mono - last_stored >= interval:
-            self._last_stored[mmsi] = now_mono
+        # Трек пишется часто только для идущих судов: точка нужна, чтобы считать
+        # ход по расстоянию. Стоящее судно даёт точку раз в 5 минут — иначе
+        # снимок раз в минуту раздувает базу миллионами одинаковых строк.
+        due = True
+        if last_stored is not None:
+            moments, last_lat, last_lon = last_stored
+            try:
+                moved_km = geo.haversine_km(float(last_lat), float(last_lon),
+                                            float(lat), float(lon))
+            except (TypeError, ValueError):
+                moved_km = 1.0
+            age = now_mono - moments
+            due = (age >= interval and moved_km >= 0.15) or age >= 300.0
+        if due:
+            self._last_stored[mmsi] = (now_mono, lat, lon)
             self.store.add_position(mmsi, lat, lon, event.get("sog"), event.get("cog"),
                                     event.get("at"))
             self.stats["positions"] += 1
@@ -1804,6 +1831,83 @@ class RadarCore:
             "in_port": in_port,
         }
 
+    def median_speed(self, minutes=30, limit=3000):
+        """Средний ход судов района за последние минуты — для расчёта пути.
+
+        Нужен, когда судно не передаёт SOG: берём медиану ходов соседей
+        по тем же водам, а не «8 узлов из головы». Возвращаем (узлы, число
+        судов); если данных меньше трёх — (None, 0).
+        """
+        moment = time.monotonic()
+        hit = getattr(self, "_speed_cache", None)
+        if hit and moment - hit[0] < 60.0:
+            return hit[1]
+        try:
+            rows = self.store.vessels(limit)
+        except Exception:
+            return None, 0
+        speeds = []
+        for row in rows:
+            age = position_age_hours(row)
+            try:
+                value = float(row.get("sog"))
+            except (TypeError, ValueError):
+                continue
+            if age is None or age > minutes / 60.0 or not (0.5 <= value <= 40):
+                continue
+            speeds.append(value)
+            if len(speeds) >= 300:
+                break
+        if len(speeds) < 3:
+            result = (None, 0)
+        else:
+            speeds.sort()
+            result = (round(speeds[len(speeds) // 2], 2), len(speeds))
+        self._speed_cache = (moment, result)
+        return result
+
+    def typical_stay(self, type_label=None):
+        """Медианная стоянка: сначала по типу судна, потом по всем портам.
+
+        Нужна там, где у судна и у порта ещё нет своей истории. Считается
+        по нашим же завершённым визитам — это расчёт по фактам, а не цифра
+        с потолка.
+        """
+        moment = time.monotonic()
+        hit = getattr(self, "_stay_cache", None)
+        if hit and moment - hit[0] < 900.0:
+            table = hit[1]
+        else:
+            table = {}
+            try:
+                rows = self.store.stays_by_type()
+            except Exception:
+                rows = []
+            for row in rows:
+                started = parse_iso(row.get("entered_at"))
+                ended = parse_iso(row.get("left_at"))
+                if not started or not ended or ended <= started:
+                    continue
+                hours = (ended - started).total_seconds() / 3600.0
+                if not 0.2 <= hours <= 24 * 14:
+                    continue
+                label = str(row.get("type_label") or "").strip() or "все"
+                table.setdefault(label, []).append(hours)
+                table.setdefault("все", []).append(hours)
+            self._stay_cache = (moment, table)
+        if not table:
+            return forecast.DEFAULT_STAY_HOURS, 0, "норматив"
+        label = str(type_label or "").strip()
+        lengths = table.get(label) or []
+        if len(lengths) >= 3:
+            scope = "тип"
+        else:
+            lengths, scope = table.get("все") or [], "все порты"
+        if not lengths:
+            return forecast.DEFAULT_STAY_HOURS, 0, "норматив"
+        lengths = sorted(lengths)
+        return lengths[len(lengths) // 2], len(lengths), scope
+
     def port_stay(self, vessel, port=None):
         """Сколько судно стоит (и будет стоять) в своём порту назначения.
 
@@ -1846,8 +1950,12 @@ class RadarCore:
         port_average, port_count = average(self.store.ended_visits(port_name))
         if own_count:
             typical, visits, scope = own_average, own_count, "судно"
-        else:
+        elif port_count:
             typical, visits, scope = port_average, port_count, "порт"
+        else:
+            # ни у судна, ни у порта нет своей истории — считаем по судам
+            # того же типа во всех наших портах, а если и их нет — по всем
+            typical, visits, scope = self.typical_stay(vessel.get("type_label"))
 
         remaining = None
         if current_hours is not None and typical:
@@ -1897,8 +2005,33 @@ class RadarCore:
             window_days = int(self.config.get("history_days") or 7)
         except (TypeError, ValueError):
             window_days = 7
-        cutoff = datetime.now() - timedelta(days=window_days)
 
+        samples = self._pilot_samples(name, lat, lon, window_days, hours_before)
+        scope = name
+        if len(samples) < 2:
+            # у порта своих наблюдений мало — считаем по всем портам сразу:
+            # ожидание лоцмана в Дунае и в Одессе устроено одинаково, и это
+            # подтверждённый расчёт по сотням своих визитов, а не догадка
+            shared = self._pilot_samples_all(window_days, hours_before)
+            if len(shared) >= 2:
+                samples, scope = shared, "все порты"
+
+        samples.sort()
+        if len(samples) >= 2:
+            result = {"port": name, "hours": round(samples[len(samples) // 2], 2),
+                      "samples": len(samples), "window_days": window_days,
+                      "scope": scope,
+                      "min_hours": round(samples[0], 2),
+                      "max_hours": round(samples[-1], 2)}
+        else:
+            result = {"port": name, "hours": None, "samples": len(samples),
+                      "window_days": window_days, "scope": scope}
+        cache[name] = (moment, result)
+        return result
+
+    def _pilot_samples(self, name, lat, lon, window_days, hours_before=12.0) -> list:
+        """Часы ожидания лоцмана у одного порта — по его визитам."""
+        cutoff = datetime.now() - timedelta(days=window_days)
         try:
             visits = self.store.visits(600, port=name)
         except Exception:
@@ -1932,18 +2065,26 @@ class RadarCore:
                 samples.append(hours)
             if len(samples) >= 40:
                 break
+        return samples
 
+    def _pilot_samples_all(self, window_days, hours_before=12.0) -> list:
+        """Те же наблюдения, но по всем нашим портам — запасной расчёт."""
+        cache = getattr(self, "_pilot_shared", None)
+        moment = time.monotonic()
+        if (cache and moment - cache[0] < 900.0
+                and cache[1].get("window") == window_days):
+            return cache[1]["samples"]
+        samples = []
+        for port in self.config.get("ports") or []:
+            try:
+                samples += self._pilot_samples(str(port["name"]), float(port["lat"]),
+                                               float(port["lon"]), window_days,
+                                               hours_before)
+            except (KeyError, TypeError, ValueError):
+                continue
         samples.sort()
-        if len(samples) >= 2:
-            result = {"port": name, "hours": round(samples[len(samples) // 2], 2),
-                      "samples": len(samples), "window_days": window_days,
-                      "min_hours": round(samples[0], 2),
-                      "max_hours": round(samples[-1], 2)}
-        else:
-            result = {"port": name, "hours": None, "samples": len(samples),
-                      "window_days": window_days}
-        cache[name] = (moment, result)
-        return result
+        self._pilot_shared = (moment, {"window": window_days, "samples": samples})
+        return samples
 
     def history_stays(self, mmsi) -> list:
         """Стоянки в наших портах из всех доступных источников за прошлое.
