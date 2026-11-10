@@ -163,6 +163,55 @@ def target_port(vessel, ports):
     return None
 
 
+# Насколько далеко искать порт по курсу, если Destination молчит.
+GUESS_MAX_KM = 700.0
+# Допустимое отклонение судна от линии на порт: больше — это уже не «идёт туда».
+GUESS_MAX_OFFSET = 35.0
+
+
+def guess_target(vessel, ports, track=None, max_km=GUESS_MAX_KM,
+                 max_offset=GUESS_MAX_OFFSET, hours=24.0 * PLAN_DAYS):
+    """Порт, к которому судно идёт по курсу, если Destination не передан.
+
+    Вместо догадок — расчёт: для каждого нашего порта берётся расстояние и
+    отклонение от линии текущего курса. Принимается ближайший порт, который
+    лежит впереди (отклонение не больше `max_offset` градусов), не дальше
+    `max_km` и до которого судно реально успевает дойти за `hours`: иначе
+    тихоходное судно у Босфора «шло бы» в Измаил. Курс и ход, если AIS их
+    не передал, считаются по треку.
+    """
+    vessel = vessel or {}
+    try:
+        lat = float(vessel.get("lat"))
+        lon = float(vessel.get("lon"))
+    except (TypeError, ValueError):
+        return None
+    speed, course, source = estimates(vessel, track)
+    if course is None or not speed:
+        return None
+    # Дальность за срок прогноза: порт дальше судно просто не успеет увидеть.
+    reach_km = float(speed) * KNOT_KMH * float(hours)
+    limit_km = min(float(max_km), reach_km)
+    best = None
+    for port in ports or []:
+        try:
+            port_lat, port_lon = float(port["lat"]), float(port["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        km = geo.haversine_km(lat, lon, port_lat, port_lon)
+        if km > limit_km or km < 0.5:
+            continue
+        desired = bearing_deg(lat, lon, port_lat, port_lon)
+        offset = abs(((desired - course + 540.0) % 360.0) - 180.0)
+        if offset > max_offset:
+            continue
+        candidate = {"port": port, "km": km, "offset": offset,
+                     "speed": speed, "course": course, "source": source}
+        if best is None or (offset, km) < (best["offset"], best["km"]):
+            best = candidate
+    return best
+
+
 def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
     """Точки прогноза: [{'hours', 'at', 'lat', 'lon', 'label', 'course', ...}].
 
@@ -608,6 +657,42 @@ def daily_points(points):
     if points and points[-1] not in result:
         result.append(points[-1])
     return result
+
+
+def _coord_text(lat, lon):
+    """Координаты коротко: 45.23N 29.71E."""
+    return (f"{abs(float(lat)):.2f}{'N' if float(lat) >= 0 else 'S'} "
+            f"{abs(float(lon)):.2f}{'E' if float(lon) >= 0 else 'W'}")
+
+
+def endpoint_text(points, port_name=None):
+    """Куда судно придёт за срок прогноза — одной строкой для таблицы.
+
+    Для судна с нашим портом в Destination — время прибытия, для остальных —
+    точка через четыре дня и пройденное расстояние: это и есть ответ «где оно
+    будет», когда порт неизвестен.
+    """
+    if not points:
+        return "—"
+    last = points[-1]
+    if last.get("arrived"):
+        return (f"прибудет в {port_name or last.get('port') or 'порт'} "
+                f"через {duration_text(last.get('hours'))}")
+    hours = last.get("hours") or 0.0
+    text = (f"через {duration_text(hours)}: "
+            f"{_coord_text(last['lat'], last['lon'])}")
+    first = points[0]
+    try:
+        km = geo.haversine_km(float(first["lat"]), float(first["lon"]),
+                              float(last["lat"]), float(last["lon"]))
+    except (KeyError, TypeError, ValueError):
+        km = 0.0
+    if km >= 1:
+        text += f", {km:.0f} км от сейчас"
+        course = last.get("course")
+        if course is not None:
+            text += f", курс {float(course):.0f}°"
+    return text
 
 
 def summary(points, port_name=None):

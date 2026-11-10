@@ -890,6 +890,11 @@ class RadarCore:
         threading.Thread(target=self._approach_worker, daemon=True,
                          name="approach-scan").start()
         self._start_services()
+        # Все каналы стартуют здесь же, каждый в своём потоке: ни один не ждёт
+        # ответа другого, поэтому подключения работают одновременно.
+        live = [feed for feed in self.feeds if not getattr(feed, "service", False)]
+        self.log(f"Подключения запущены одновременно: живых потоков {len(live)}, "
+                 f"сервисов {len(self.feeds) - len(live)} — каждый в своём потоке.")
 
     def _start_startup_refresh(self):
         """Обновление данных при открытии: ждёт первый ответ от всех источников.
@@ -1120,6 +1125,44 @@ class RadarCore:
         if parts > 1:
             return result[part::parts]
         return result
+
+    def request_enrich(self, mmsi, name=""):
+        """Разово дочитать паспорт судна из внешних сервисов.
+
+        Работает и когда источник отключён галочкой: это один запрос по
+        конкретному судну, а не постоянный опрос. Результат идёт обычным
+        событием `static` и ложится в базу, поэтому имя и тип сразу видны
+        в таблицах и карточке. Повторно по тому же судну — не чаще раза в 12 ч.
+        """
+        mmsi = str(mmsi or "").strip()
+        if not mmsi:
+            return False
+        now = time.monotonic()
+        asked = getattr(self, "_enrich_asked", None)
+        if asked is None:
+            asked = self._enrich_asked = {}
+        if now - asked.get(mmsi, -1e9) < 12 * 3600:
+            return False
+        asked[mmsi] = now
+
+        def worker():
+            try:
+                feed = services_feed.build(
+                    "srd", self._receive, self.log, self.stop_event,
+                    vessels=lambda: [{"mmsi": mmsi, "name": name}])
+                if feed is None:
+                    return
+                # Карточка читается, только если известно имя: без него адрес
+                # на сайте не собрать. Имя уже есть — просим тип, размеры, осадку.
+                if not str(name or "").strip():
+                    return
+                feed.poll_once()
+                self.log(f"Паспорт {mmsi}: запрос в Ship Radar 24 отправлен.")
+            except Exception as error:
+                self.log(f"Паспорт {mmsi}: сервис не ответил ({error})")
+
+        threading.Thread(target=worker, daemon=True, name=f"enrich-{mmsi}").start()
+        return True
 
     def _history_worker(self):
         """Подтягивает стоянки из трека Open Waters после старта потока."""
@@ -1598,25 +1641,33 @@ class RadarCore:
                 break
         return result
 
-    def enrich_candidates(self, limit=200) -> list:
+    def enrich_candidates(self, limit=400) -> list:
         """Суда, у которых не хватает паспортных данных для нашего стандарта.
 
-        Отдаёт записи из базы, у которых нет типа, осадки или размеров —
-        их карточки дочитывает поток Ship Radar 24.
+        Отдаёт записи из базы, у которых нет имени, типа, осадки или размеров —
+        их карточки дочитывает поток Ship Radar 24. Сначала идут суда со
+        свежей позицией: неопознанное судно в районе важнее старой записи
+        где-то в Средиземном море.
         """
         try:
             rows = self.store.vessels(2000)
         except Exception:
             return []
+        rows.sort(key=lambda row: str(row.get("position_at") or row.get("updated_at") or ""),
+                  reverse=True)
         result = []
         for row in rows:
             if self.is_station_mmsi(row.get("mmsi")):
                 continue
             if row.get("lat") is None and not row.get("destination"):
                 continue
+            # Без имени карточку на сайте не открыть, поэтому такие суда в
+            # список не идут — их паспорт ждёт имени из AIS.
             missing = (row.get("type_code") is None or row.get("draft") is None
                        or row.get("length_m") is None or row.get("beam_m") is None
                        or not row.get("imo"))
+            if not str(row.get("name") or "").strip():
+                continue
             if not missing:
                 continue
             result.append(dict(row))
