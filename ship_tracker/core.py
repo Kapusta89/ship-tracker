@@ -69,6 +69,14 @@ DEFAULT_CONFIG = {
     # слежение за нашими судами по MMSI по всему миру (AISStream FiltersShipMMSI):
     # единственный бесплатный способ увидеть судно, ушедшее за пределы района
     "use_mmsi_watch": True,
+    # AISStream: 3 подписки на аккаунт и 200 MMSI в одной подписке. Слежение
+    # по MMSI идёт отдельными соединениями (до `mmsi_watch_connections`),
+    # а всего их не больше `ais_connection_limit` — районный поток тоже ест слот.
+    "mmsi_watch_connections": 3,
+    "ais_connection_limit": 3,
+    # районный поток AISStream (живые позиции всего трафика в прямоугольниках).
+    # Если освободить его слот, MMSI-слежение получит третье соединение.
+    "use_area_feed": True,
     # сколько часов позиция считается «сейчас в море», а не историей
     "sea_fresh_hours": 12,
     "port_watch_km": 30,
@@ -747,7 +755,16 @@ class RadarCore:
         self.feeds = []
         # Основной поток AISStream
         api_key = (config.get("api_key") or "").strip()
-        if api_key:
+        # Слотов на AISStream всего три на аккаунт (и на IP): каждый поток —
+        # отдельное соединение, четвёртое сервер отклоняет. Поэтому сначала
+        # считаем, сколько слотов занято районом и Open Waters, а оставшиеся
+        # раздаём MMSI-слежению.
+        try:
+            slots_total = max(1, int(config.get("ais_connection_limit") or 3))
+        except (TypeError, ValueError):
+            slots_total = 3
+        slots_used = 0
+        if api_key and config.get("use_area_feed", True):
             feed1 = ais_feed.AISStreamFeed(
                 api_key, config.get("bounding_boxes"),
                 config.get("message_types"), self._receive, self.log, self.stop_event,
@@ -755,8 +772,12 @@ class RadarCore:
             feed1.start()
             self.feed = feed1
             self.feeds.append(feed1)
-        else:
+            slots_used += 1
+        elif not api_key:
             self.log("API-ключ AISStream не задан — основной поток не запущен.")
+        else:
+            self.log("Районный поток AISStream отключён (use_area_feed: false) — "
+                     "трафик района берём из снимка, а слот отдан MMSI-слежению.")
         # Дополнительный поток Open Waters AIS (совместим с протоколом)
         # Поток Open Waters без своего токена сервер закрывает сразу
         # (1008: Api Key Is Not Valid), поэтому без токена его не запускаем:
@@ -779,19 +800,46 @@ class RadarCore:
                     self.feeds.append(feed2)
                 except Exception as error:
                     self.log(f"Open Waters AIS: не удалось запустить ({error})")
-        # Слежение по MMSI: наши суда в любой точке мира, где есть приём AIS
+        # Слежение по MMSI: суда района и наши суда в любой точке мира, где есть
+        # приём AIS. Одна подписка AISStream принимает не больше 200 MMSI, поэтому
+        # список делится на несколько соединений — на каждое своя доля (`part`).
         if config.get("use_mmsi_watch", True) and api_key:
             try:
-                watch = ais_feed.MmsiWatchFeed(
-                    api_key, self.watch_mmsis, config.get("message_types"),
-                    self._receive, self.log, self.stop_event,
-                    stream_url=ais_feed.STREAM_URL, name="ais-feed-mmsi")
-                watch.start()
-                self.feeds.append(watch)
-                if not self.feed:
-                    self.feed = watch
-            except Exception as error:
-                self.log(f"Слежение по MMSI: не удалось запустить ({error})")
+                wanted = int(config.get("mmsi_watch_connections") or 1)
+            except (TypeError, ValueError):
+                wanted = 1
+            wanted = max(1, wanted)
+            count = max(0, min(wanted, slots_total - slots_used))
+            started = 0
+            if not count:
+                self.log("Слежение по MMSI: свободных соединений AISStream нет "
+                         f"(лимит {slots_total}) — все слоты заняты районным потоком.")
+            for index in range(count):
+                try:
+                    watch = ais_feed.MmsiWatchFeed(
+                        api_key,
+                        (lambda slot=index, slots=count:
+                         self.watch_mmsis(190, slot, slots)),
+                        config.get("message_types"),
+                        self._receive, self.log, self.stop_event,
+                        stream_url=ais_feed.STREAM_URL,
+                        name=f"ais-feed-mmsi-{index + 1}", part=index, parts=count)
+                    watch.start()
+                    self.feeds.append(watch)
+                    started += 1
+                    if not self.feed:
+                        self.feed = watch
+                except Exception as error:
+                    self.log(f"Слежение по MMSI, соединение {index + 1}: "
+                             f"не удалось запустить ({error})")
+            if started:
+                self.log(f"Слежение по MMSI: соединений {started}, по 190 MMSI — "
+                         f"до {started * 190} судов (AISStream занято "
+                         f"{slots_used + started} из {slots_total}).")
+            if count < wanted:
+                self.log("Для следующего MMSI-соединения нужен свободный слот: "
+                         "отключите районный поток (use_area_feed: false) — тогда "
+                         "слежение возьмёт все три и до 570 судов.")
         # Снимок района: последние известные позиции всех судов вокруг портов
         # плюс дальние районы (Средиземное море) — чтобы видеть суда, которые
         # идут к нам за сотни километров, а не только у самого порта
@@ -962,12 +1010,15 @@ class RadarCore:
             return []
         return [str(row.get("mmsi") or "") for row in rows if row.get("mmsi")]
 
-    def watch_mmsis(self, limit=190):
-        """Суда для глобального слежения по MMSI.
+    def watch_mmsis(self, limit=190, part=0, parts=1):
+        """Суда для глобального слежения по MMSI — одна доля списка.
 
         AISStream принимает до 200 MMSI в одной подписке (`FiltersShipMMSI`),
-        поэтому в список идут все суда базы, связанные с нашими портами: так они
-        остаются на связи, даже когда ушли далеко за пределы прямоугольников.
+        поэтому список делится на несколько соединений: каждое берёт свою
+        долю `part` из `parts` (без пересечений), и три подписки по 190
+        покрывают до 570 судов. В список входят и суда, связанные с нашими
+        портами (они остаются на связи за пределами прямоугольников), и весь
+        трафик района — чтобы в слежении был не только узкий круг.
         """
         try:
             rows = self.store.vessels(2000)
@@ -1011,21 +1062,38 @@ class RadarCore:
         ordered = sorted(rows, key=lambda row: str(row.get("updated_at") or ""),
                          reverse=True)
 
+        boxes = self.config.get("bounding_boxes") or []
+
+        def in_area(row):
+            try:
+                return geo.in_bbox(float(row.get("lat")), float(row.get("lon")), boxes)
+            except (TypeError, ValueError):
+                return False
+
         def rank(row):
             if near_port(row):
                 return 0                      # стоит в порту — самое важное
             if near_port(row, 50.0):
                 return 1                      # портовый район (рейд, подход)
-            return 2 if ours(row) else 3      # идёт к нам по Destination
+            if ours(row):
+                return 2                      # идёт к нам по Destination
+            return 3 if in_area(row) else 4   # остальной трафик района
 
         ordered.sort(key=rank)
+        # Общий объём на все соединения: 190 на каждое, дальше делим по кругу —
+        # так при потере одного соединения пропадает только его доля.
+        capacity = max(1, limit) * max(1, parts)
         result = []
+        seen = set()
         for row in ordered:
-            mmsi = str(row.get("mmsi") or "")
-            if mmsi and mmsi not in result:
-                result.append(mmsi)
-            if len(result) >= limit:
+            if len(result) >= capacity:
                 break
+            mmsi = str(row.get("mmsi") or "")
+            if mmsi and mmsi not in seen:
+                seen.add(mmsi)
+                result.append(mmsi)
+        if parts > 1:
+            return result[part::parts]
         return result
 
     def _history_worker(self):

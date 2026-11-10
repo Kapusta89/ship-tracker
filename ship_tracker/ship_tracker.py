@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.22"
+APP_VERSION = "2026.12.23"
 
 import ais_feed
 import analysis
@@ -1901,6 +1901,7 @@ class App:
         # Все каналы, с которыми работает программа
         self.var_use_ow = tk.BooleanVar(value=bool(self.config.get("use_openwaters", True)))
         self.var_ow_token = tk.StringVar(value=self.config.get("openwaters_token", ""))
+        self.var_use_area = tk.BooleanVar(value=bool(self.config.get("use_area_feed", True)))
         self.var_use_snapshot = tk.BooleanVar(value=bool(self.config.get("use_snapshot", True)))
         self.var_snapshot_minutes = tk.StringVar(value=str(self.config.get("snapshot_minutes", 10)))
         # Additional service toggles
@@ -1956,6 +1957,10 @@ class App:
                    ).pack(side="left", padx=(8, 0))
         ttk.Button(ais_row, text="Открыть aisstream.io",
                    command=lambda: webbrowser.open(AIRSTREAM_SITE)).pack(side="left", padx=(6, 0))
+        # Районный поток занимает один из трёх слотов AISStream. Если его снять,
+        # освободившийся слот забирает MMSI-слежение (три соединения по 190 судов).
+        ttk.Checkbutton(ais_row, text="районный поток (слот можно отдать MMSI)",
+                        variable=self.var_use_area).pack(side="left", padx=(12, 0))
 
         # 2. Open Waters — второй живой поток
         ttk.Checkbutton(links, text="Open Waters AIS — второй живой поток (совместим с AISStream)",
@@ -3039,17 +3044,21 @@ class App:
         if not labels:
             return
         states = {}
+        mmsi_states = []
         try:
             for state in self.core.feeds_state():
                 name = state.get("name") or ""
-                if name.startswith("AISStream"):
+                if "слежение по MMSI" in name:
+                    # соединений слежения несколько: показываем их сводкой
+                    mmsi_states.append(state)
+                elif name.startswith("AISStream"):
                     states["ais"] = state
                 elif name.startswith("Open Waters"):
                     states["ow"] = state
                 elif name.startswith("Снимок"):
                     states["snap"] = state
         except Exception:
-            states = {}
+            states, mmsi_states = {}, []
         running = self.core.running()
         elsewhere = bool(getattr(self.core, "feed_elsewhere", False))
         service_state = getattr(self.core, "service_status", {}) or {}
@@ -3074,6 +3083,11 @@ class App:
                 text = f"переподключение: {self.short_error(state.get('error'))}".strip()
             else:
                 text = "переподключение"
+            if key == "ais" and mmsi_states:
+                live = sum(1 for row in mmsi_states if row.get("connected"))
+                total_events = sum(int(row.get("events") or 0) for row in mmsi_states)
+                text += (f" · MMSI-слежение: {live} из {len(mmsi_states)} на связи, "
+                         f"сообщений {total_events}")
             if var.get() != text:
                 var.set(text)
 
@@ -3715,6 +3729,7 @@ class App:
             "openwaters_token": getattr(self, "var_ow_token", None).get().strip() if getattr(self, "var_ow_token", None) else self.config.get("openwaters_token", ""),
             "use_openwaters": bool(getattr(self, "var_use_ow", None).get()) if getattr(self, "var_use_ow", None) else bool(self.config.get("use_openwaters", True)),
             "use_snapshot": bool(getattr(self, "var_use_snapshot", None).get()) if getattr(self, "var_use_snapshot", None) else bool(self.config.get("use_snapshot", True)),
+            "use_area_feed": bool(getattr(self, "var_use_area", None).get()) if getattr(self, "var_use_area", None) else bool(self.config.get("use_area_feed", True)),
             "snapshot_minutes": max(1.0, snapshot_minutes),
             "bounding_boxes": boxes,
             "ports": ports,

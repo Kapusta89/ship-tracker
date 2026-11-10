@@ -510,20 +510,28 @@ class MmsiWatchFeed(AISStreamFeed):
     feed_title = "AISStream — слежение по MMSI (весь мир)"
 
     def __init__(self, api_key, mmsis, message_types, on_event, log, stop_event,
-                 stream_url=None, name="ais-feed-mmsi"):
+                 stream_url=None, name="ais-feed-mmsi", part=0, parts=1):
         super().__init__(api_key, [], message_types, on_event, log, stop_event,
                          stream_url=stream_url, name=name)
         self.mmsi_source = mmsis if callable(mmsis) else (lambda: list(mmsis or []))
+        # В подписке AISStream не больше 200 MMSI, а соединений на аккаунт — три.
+        # Поэтому список один, а каждое соединение берёт свою долю: part из parts.
+        self.part = max(0, int(part))
+        self.parts = max(1, int(parts))
+        if self.parts > 1:
+            self.feed_title = (f"AISStream — слежение по MMSI, соединение "
+                               f"{self.part + 1} из {self.parts}")
 
     def mmsis(self) -> list:
         try:
             values = self.mmsi_source() or []
         except Exception:
             return []
-        result = []
+        result, seen = [], set()
         for value in values:
             text = str(value or "").strip()
-            if text.isdigit():
+            if text.isdigit() and text not in seen:
+                seen.add(text)
                 result.append(text)
         return result
 
