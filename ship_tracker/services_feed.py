@@ -21,7 +21,7 @@ import json
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import ais_feed
@@ -167,19 +167,38 @@ def _heading(value):
     return value if 0 <= value <= 359 else None
 
 
-def _time(value):
-    """Время из ISO-строки сервиса в локальное время без часового пояса."""
+def _time(value, utc=False):
+    """Время из ISO-строки сервиса в локальное время без часового пояса.
+
+    `utc=True` — когда источник подписывает время как UTC (карты Goradar и
+    MarineTraffic.live, Datalastic, MyShipTracking, VesselFinder): без этого
+    метка читалась как местная и получалась на 3 часа старше, чем есть, —
+    судно зря считалось устаревшим.
+    """
     if not value:
         return None
     text = str(value).strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    try:
-        moment = datetime.fromisoformat(text)
-    except ValueError:
-        return None
+    if text.isdigit() and len(text) >= 10:
+        # UNIX-время в секундах
+        try:
+            moment = datetime.fromtimestamp(int(text), timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            return None
+    else:
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if moment.tzinfo is None and utc:
+        moment = moment.replace(tzinfo=timezone.utc)
     if moment.tzinfo is not None:
         moment = moment.astimezone().replace(tzinfo=None)
+    now = datetime.now()
+    if moment > now:
+        # часы источника вперёд: не выдаём сигнал из будущего за свежий
+        moment = now
     return moment
 
 
@@ -500,7 +519,7 @@ class MyShipTrackingFeed(ServiceFeed):
         if not mmsi:
             return False
         name = str(row.get("vessel_name") or "").strip()
-        at = _time(row.get("received"))
+        at = _time(row.get("received"), utc=True)
         position = _position(mmsi, row.get("lat"), row.get("lng"),
                              sog=row.get("speed"), cog=row.get("course"),
                              name=name, source="myshiptracking", at=at)
@@ -722,7 +741,7 @@ class VesselFinderArrivals(ServiceFeed):
         mmsi = _mmsi(ais.get("MMSI"))
         if not mmsi:
             return False
-        at = _time(ais.get("TIMESTAMP"))
+        at = _time(ais.get("TIMESTAMP"), utc=True)
         position = _position(mmsi, ais.get("LATITUDE"), ais.get("LONGITUDE"),
                              sog=ais.get("SPEED"), cog=ais.get("COURSE"),
                              heading=_heading(ais.get("HEADING")),
@@ -1050,7 +1069,7 @@ class DatalasticFeed(ServiceFeed):
                                 heading=_heading(row.get("heading")),
                                 name=name, source="datalastic",
                                 at=_time(row.get("last_position_utc")
-                                         or row.get("last_position_UTC"))))
+                                         or row.get("last_position_UTC"), utc=True)))
             self.emit(_static(vessel_mmsi, name=name, imo=row.get("imo"),
                               type_code=_type_code(row.get("type_code")),
                               destination=row.get("destination"),
@@ -1196,12 +1215,7 @@ class GoradarFeed(ServiceFeed):
                 heading = _heading(row[6]) if len(row) > 6 else None
                 speed = _number(row[7]) if len(row) > 7 else None
                 label = str(row[8] or "").strip() if len(row) > 8 else ""
-                when = None
-                if len(row) > 5 and row[5]:
-                    try:
-                        when = datetime.strptime(str(row[5]).strip(), "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        when = None
+                when = _time(row[5], utc=True) if len(row) > 5 and row[5] else None
                 seen[mmsi] = _position(mmsi, lat, lon, sog=speed, cog=course,
                                        heading=heading, source="goradar",
                                        at=when, type_label=label)
@@ -1300,7 +1314,7 @@ class MarineTrafficLiveFeed(ServiceFeed):
                                   sog=row.get("speed_kn"), cog=row.get("course_deg"),
                                   name=name,
                                   type_label=str(row.get("type") or "").strip() or None,
-                                  source="mlive", at=_time(row.get("updated")))
+                                  source="mlive", at=_time(row.get("updated"), utc=True))
                 if event:
                     seen[mmsi] = event
             self.stop_event.wait(0.4)

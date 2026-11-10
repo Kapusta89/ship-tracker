@@ -485,10 +485,13 @@ class RadarCanvas:
                                    fill=color, outline="", tags=("traffic",))
                 shown_traffic += 1
         targets_count = len(allowed_mmsi) if allowed_mmsi is not None else len(target_mmsi)
+        ages = [core_module.position_age_hours(v) for v in vessels if v.get("lat") is not None]
+        ages = [age for age in ages if age is not None]
         self._draw_legend(width, height, len(vessels), targets_count, drawn, stale_drawn,
                           len([v for v in vessels if v.get("lat") is None]),
                           traffic=shown_traffic, stale_hidden=stale_hidden,
-                          traffic_hidden=traffic_hidden, faded=faded)
+                          traffic_hidden=traffic_hidden, faded=faded,
+                          newest=min(ages) if ages else None)
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -663,7 +666,7 @@ class RadarCanvas:
         return minutes * 60
 
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
-                     traffic=0, stale_hidden=0, traffic_hidden=0, faded=0):
+                     traffic=0, stale_hidden=0, traffic_hidden=0, faded=0, newest=None):
         fresh = drawn - stale - faded
         berth = core_module.berth_stale_hours(self.config)
         limit = (f"{self._stale_label()}"
@@ -672,6 +675,12 @@ class RadarCanvas:
                 f"наших судов: {vessels}   целей: {targets}   на экране: {drawn}\n"
                 f"со свежим сигналом: {fresh}   стоящих со старым (приглушены): {faded}\n"
                 f"скрыто устаревших: {stale + stale_hidden} (порог {limit})\n")
+        if newest is not None:
+            if newest < 1.0:
+                text += f"последний сигнал AIS в районе: {newest * 60:.0f} мин назад\n"
+            else:
+                text += (f"последний сигнал AIS в районе: {newest:.1f} ч назад — "
+                         f"живых приёмников у наших портов в открытых сетях нет\n")
         if without_position:
             text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
         if traffic:
