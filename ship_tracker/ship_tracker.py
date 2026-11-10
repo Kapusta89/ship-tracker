@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.18"
+APP_VERSION = "2026.12.19"
 
 import ais_feed
 import cargo
@@ -1315,23 +1315,19 @@ class App:
         for item in tree.get_children():
             tree.delete(item)
         open_visits = 0
-        hidden_stale = 0
-        show_stale = self.stale_visible()
+        stale_open = 0
         for visit in self.store.visits(300):
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
             left = parse_iso(visit.get("left_at"))
-            # Открытая стоянка судна, которое давно молчит, — не факт, а догадка:
-            # оно могло уйти незамеченным. Без галочки «устаревшие» не показываем.
-            if left is None and not show_stale and self.vessel_is_stale(vessel):
-                hidden_stale += 1
-                open_visits += 1
+            # Здесь только те, кто стоит сейчас: ушедшие суда — в «Истории стоянок»
+            if left is not None:
                 continue
-            if left and entered:
-                stay = span_text((left - entered).total_seconds() / 3600)
-            elif entered:
+            open_visits += 1
+            if self.vessel_is_stale(vessel):
+                stale_open += 1
+            if entered:
                 stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
-                open_visits += 1
             else:
                 stay = "—"
             draft_in = visit.get("draft_in")
@@ -1344,7 +1340,7 @@ class App:
                 vessel.get("name") or f"MMSI {visit.get('mmsi')}",
                 visit.get("port"),
                 self.fmt_time(visit.get("entered_at")),
-                self.fmt_time(visit.get("left_at")) if left else "на месте",
+                "на месте",
                 stay,
                 draft,
                 visit.get("cargo_kind") or self.cargo_kind_text(vessel),
@@ -1352,13 +1348,15 @@ class App:
             ))
         counts = self.store.counts()
         self.visits_info.set(
-            f"Визитов в базе: {counts['visits']}, из них открыто сейчас: {open_visits}. "
+            f"Стоят сейчас: {open_visits} (ушли — во вкладке «История стоянок»; "
+            f"всего визитов в базе {counts['visits']}). "
             f"Источники: «наблюдение» — геозона порта по живому AIS (считается с момента "
             f"входа, время идёт по часам); «история» — трек за сутки и свои позиции "
             f"за {self.config.get('history_days', 7)} дн. Стоянки по своим позициям "
             f"собираются автоматически за последние "
             f"{self.config.get('visits_backfill_days', 4)} дн."
-            + self.hidden_stale_note(hidden_stale))
+            + ((f" У {stale_open} из них давно нет свежих позиций: судно могло "
+                f"уйти, но приёмник его больше не слышал.") if stale_open else ""))
 
     def load_history_stays(self):
         if getattr(self, "_history_loading", False):
@@ -1397,9 +1395,10 @@ class App:
         frame = self.tab_visit_history
         top = ttk.Frame(frame)
         top.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Label(top, text="Кто и сколько стоял в наших портах: приход, уход, время "
-                            "стоянки, осадка и груз. Кнопка порта оставляет только его "
-                            "стоянки; в скобках — сколько их в базе.",
+        ttk.Label(top, text="Ушедшие суда: кто и сколько стоял в наших портах — приход, "
+                            "уход, время стоянки, осадка и груз. Те, кто стоит сейчас, — "
+                            "во вкладке «Стоянки». Кнопка порта оставляет только его стоянки; "
+                            "в скобках — сколько ушедших в базе.",
                   foreground="#555").pack(side="left")
         ttk.Button(top, text="Обновить",
                    command=lambda: self.refresh_now(self.tab_visit_history)
@@ -1443,7 +1442,7 @@ class App:
             tree.delete(item)
         try:
             rows = self.store.visits(500, port=port or None)
-            counts = self.store.visit_counts()
+            counts = self.store.visit_counts(closed_only=True)
         except Exception as error:
             self.log(f"История стоянок: {error}")
             return
@@ -1456,21 +1455,15 @@ class App:
                 button.configure(text=f"Все порты ({total})")
             else:
                 button.configure(text=f"{label} ({counts.get(name, {}).get('visits', 0)})")
-        open_visits = 0
-        stale_open = 0
         for visit in rows:
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
             left = parse_iso(visit.get("left_at"))
-            # История — это аналитика: показываем все записи, даже если у
-            # открытой стоянки давно нет свежих позиций
-            if left is None and self.vessel_is_stale(vessel):
-                stale_open += 1
-            if left and entered:
+            # История — только ушедшие суда: те, что стоят сейчас, — во «Стоянках»
+            if left is None:
+                continue
+            if entered:
                 stay = span_text((left - entered).total_seconds() / 3600)
-            elif entered:
-                stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
-                open_visits += 1
             else:
                 stay = "—"
             draft_in = visit.get("draft_in")
@@ -1483,21 +1476,19 @@ class App:
                 vessel.get("name") or f"MMSI {visit.get('mmsi')}",
                 visit.get("port"),
                 self.fmt_time(visit.get("entered_at")),
-                self.fmt_time(visit.get("left_at")) if left else "на месте",
+                self.fmt_time(visit.get("left_at")),
                 stay, draft,
                 visit.get("cargo_kind") or self.cargo_kind_text(vessel),
                 "история" if visit.get("source") == "track" else "наблюдение",
             ))
-        left_count = len(rows) - open_visits
+        shown = len(tree.get_children())
         where = f"в порту {port}" if port else "во всех наших портах"
         self.visit_history_info.set(
-            f"Стоянок {where}: {len(rows)} (завершённых {left_count}, идут сейчас "
-            f"{open_visits}). Портов в базе: {len(counts)}. Стоянки считаются по "
-            f"геозоне порта; история из трека добавляется кнопкой «Загрузить из "
-            f"истории» во вкладке «Стоянки»."
-            + ((f" У {stale_open} открытых стоянок давно нет свежих позиций:"
-                f" судно могло уйти, но приёмник его больше не слышал.")
-               if stale_open else ""))
+            f"Ушедших стоянок {where}: {shown} (вход и уход известны). "
+            f"Те, кто стоит сейчас, — во вкладке «Стоянки». "
+            f"Всего визитов в базе: {sum(entry['visits'] for entry in counts.values())}. "
+            f"История из трека добавляется кнопкой «Загрузить из истории» "
+            f"во вкладке «Стоянки».")
 
     def build_expected(self):
         tk, ttk = self.tk, self.ttk

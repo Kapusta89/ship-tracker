@@ -390,13 +390,18 @@ class Store:
             result.setdefault(str(row["mmsi"]), set()).add(row["port"])
         return result
 
-    def visit_counts(self) -> dict:
-        """Сколько визитов и сколько судов было в каждом нашем порту."""
+    def visit_counts(self, closed_only=False) -> dict:
+        """Сколько визитов и сколько судов было в каждом нашем порту.
+
+        `closed_only` — считать только завершённые (судно уже ушло): так
+        подписываются кнопки портов на вкладке «История стоянок».
+        """
+        where = " WHERE left_at IS NOT NULL" if closed_only else ""
         with self._lock:
             rows = self.conn.execute(
                 "SELECT UPPER(port) AS port, COUNT(*) AS visits,"
                 " COUNT(DISTINCT mmsi) AS vessels, MAX(entered_at) AS last"
-                " FROM port_visits GROUP BY UPPER(port)").fetchall()
+                " FROM port_visits" + where + " GROUP BY UPPER(port)").fetchall()
         return {row["port"]: {"visits": int(row["visits"]),
                               "vessels": int(row["vessels"]),
                               "last": row["last"]} for row in rows}
