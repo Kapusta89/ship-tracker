@@ -1863,6 +1863,88 @@ class RadarCore:
             "remaining_hours": remaining,
         }
 
+    def pilot_wait(self, port, hours_before=12.0) -> dict:
+        """Сколько суда обычно ждут лоцмана у этого порта — по нашим визитам.
+
+        AIS не передаёт ни лоцманское время, ни очередь на причал, поэтому
+        оцениваем косвенно: берём визиты порта за хранимую историю, смотрим
+        трек за `hours_before` часов до входа в геозону и измеряем последний
+        отрезок с ходом меньше 1.5 уз в пределах 25 км от порта — именно так
+        суда стоят на рейде в ожидании лоцмана. Возвращаем медиану и число
+        наблюдений; если наблюдений мало — hours=None, без выдумок.
+        """
+        if isinstance(port, dict):
+            name = port.get("name")
+        else:
+            name = port
+        if not name:
+            return None
+        cache = getattr(self, "_pilot_cache", None)
+        if cache is None:
+            cache = self._pilot_cache = {}
+        moment = time.monotonic()
+        hit = cache.get(name)
+        if hit and moment - hit[0] < 600.0:
+            return hit[1]
+
+        try:
+            port = port if isinstance(port, dict) else geo.port_by_name(
+                name, self.config.get("ports") or [])
+            lat, lon = float(port["lat"]), float(port["lon"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            window_days = int(self.config.get("history_days") or 7)
+        except (TypeError, ValueError):
+            window_days = 7
+        cutoff = datetime.now() - timedelta(days=window_days)
+
+        try:
+            visits = self.store.visits(600, port=name)
+        except Exception:
+            visits = []
+        samples = []
+        for visit in visits:
+            entered = parse_iso(visit.get("entered_at"))
+            if not entered or entered < cutoff:
+                continue
+            try:
+                points = self.store.track_between(
+                    str(visit.get("mmsi")), entered - timedelta(hours=hours_before), entered)
+            except Exception:
+                continue
+            wait_start = None
+            for point in reversed(points):
+                try:
+                    near = geo.haversine_km(float(point["lat"]), float(point["lon"]),
+                                            lat, lon) <= 25.0
+                    speed = float(point.get("sog") or 0)
+                except (TypeError, ValueError, KeyError):
+                    break
+                if near and speed < 1.5:
+                    wait_start = parse_iso(point.get("ts"))
+                    continue
+                break
+            if not wait_start:
+                continue
+            hours = (entered - wait_start).total_seconds() / 3600.0
+            if 0.1 <= hours <= 24.0:
+                samples.append(hours)
+            if len(samples) >= 40:
+                break
+
+        samples.sort()
+        if len(samples) >= 2:
+            result = {"port": name, "hours": round(samples[len(samples) // 2], 2),
+                      "samples": len(samples), "window_days": window_days,
+                      "min_hours": round(samples[0], 2),
+                      "max_hours": round(samples[-1], 2)}
+        else:
+            result = {"port": name, "hours": None, "samples": len(samples),
+                      "window_days": window_days}
+        cache[name] = (moment, result)
+        return result
+
     def history_stays(self, mmsi) -> list:
         """Стоянки в наших портах из всех доступных источников за прошлое.
 

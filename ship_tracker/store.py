@@ -258,6 +258,15 @@ class Store:
                 (mmsi, since)).fetchall()
         return [dict(row) for row in rows]
 
+    def track_between(self, mmsi: str, start, end):
+        """Позиции судна за конкретный промежуток — например, перед входом в порт."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT ts, lat, lon, sog, cog FROM positions WHERE mmsi = ? "
+                "AND ts >= ? AND ts <= ? ORDER BY ts",
+                (mmsi, iso(start), iso(end))).fetchall()
+        return [dict(row) for row in rows]
+
     def last_position_time(self, mmsi: str):
         with self._lock:
             row = self.conn.execute(

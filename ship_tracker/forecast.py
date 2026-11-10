@@ -117,6 +117,10 @@ def estimates(vessel, track=None):
         course = bearing_deg(float(first["lat"]), float(first["lon"]),
                              float(last["lat"]), float(last["lon"]))
         source += ", курс по треку"
+    if speed is None or not (MIN_SPEED_KNOTS <= float(speed) <= 40):
+        # ход в AIS отсутствует или мусорный: расчёт пойдёт по резервной скорости
+        speed = None
+        source = "AIS ход не передаёт" + (", курс по треку" if "курс по треку" in source else "")
     return speed, course, source
 
 
@@ -222,7 +226,7 @@ def duration_text(hours):
     return f"{days} д {rest} ч"
 
 
-def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
+def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None, pilot=None):
     """План судна на 4 дня: путь до порта, стоянка в нём и выход в море.
 
     AIS не знает ни времени стоянки, ни дальнейшего рейса, поэтому план
@@ -234,6 +238,11 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
     (сколько обычно стоит) и remaining_hours (сколько осталось). Если стоянка
     займёт сутки, на море в четырёхдневном плане остаётся три дня; если двое —
     два дня, и так далее.
+
+    `pilot` — ответ `core.pilot_wait`: сколько у этого порта обычно ждут
+    лоцмана и по скольким визитам это видно. Время до выхода из порта =
+    путь + ожидание лоцмана + стоянка; каждое слагаемое возвращается вместе
+    с источником, чтобы цифры можно было проверить.
     """
     vessel = vessel or {}
     stay = stay or {}
@@ -248,6 +257,14 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
 
     speed, course, source = estimates(vessel, track)
     in_port = stay.get("current_hours") is not None
+    position_age = None
+    stamp = vessel.get("position_at") or vessel.get("updated_at")
+    if stamp:
+        try:
+            position_age = max(0.0, (now - datetime.fromisoformat(
+                str(stamp)[:19])).total_seconds() / 3600.0)
+        except (TypeError, ValueError):
+            position_age = None
     horizon_end = now + timedelta(days=days)
 
     points = []
@@ -289,6 +306,12 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
     else:
         stay_hours, stay_scope = DEFAULT_STAY_HOURS, "оценка"
 
+    # Ожидание лоцмана берём только для тех, кто ещё в море: у стоящего
+    # в порту это ожидание уже позади, и второй раз его считать нельзя.
+    pilot = pilot or {}
+    observed_pilot = pilot.get("hours")
+    pilot_hours = float(observed_pilot) if (observed_pilot is not None and not in_port) else 0.0
+
     arrival_hours = arrival_at = departure_at = None
     if in_port:
         arrival_hours, arrival_at = 0.0, now
@@ -297,7 +320,7 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
                           "label": "в порту", "phase": "port", "port": port.get("name")})
     elif arrival:
         arrival_hours, arrival_at = float(arrival["hours"]), arrival["at"]
-        departure_at = arrival_at + timedelta(hours=stay_hours)
+        departure_at = arrival_at + timedelta(hours=pilot_hours + stay_hours)
         points[-1] = dict(arrival, phase="port", label=f"стоянка {duration_text(stay_hours)}")
 
     # Курс выхода: обратно туда, откуда судно пришло. Для стоящего в порту —
@@ -324,11 +347,58 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
             step = min(STEP_HOURS, sea_hours - hours)
             lat, lon = destination_point(lat, lon, out_course, kmh * step)
             hours += step
-            points.append({"hours": arrival_hours + stay_hours + hours if arrival_hours is not None else hours,
+            points.append({"hours": (arrival_hours + pilot_hours + stay_hours + hours
+                                          if arrival_hours is not None else hours),
                            "at": departure_at + timedelta(hours=hours),
                            "lat": lat, "lon": lon, "phase": "sea",
                            "label": f"море {duration_text(hours)}",
                            "course": out_course, "port": port.get("name")})
+
+    # Сколько осталось идти — по самому маршруту, а не по прямой «на глаз».
+    approach_km = distance_text([point for point in points
+                                 if point.get("phase") != "sea"])
+
+    evidence = []
+    if in_port:
+        evidence.append("Стоянка: открытый визит в порту — время считается "
+                        "с входа в геозону по нашим наблюдениям")
+    else:
+        if speed:
+            evidence.append(f"Ход: {speed:.1f} уз — {source}")
+        else:
+            evidence.append(f"Ход: AIS не передаёт — в расчёте резервные "
+                            f"{DEFAULT_SEA_KNOTS:.1f} уз (оценка)")
+        if approach_km:
+            evidence.append(
+                f"Остаток пути: {approach_km:.0f} км — "
+                + ("по прямой до порта (курс/ход не годятся для маршрута)"
+                   if estimate else "маршрут по курсу AIS, шаг 2 ч"))
+        if arrival_at:
+            evidence.append(
+                f"Приход: {arrival_at:%d.%m %H:%M} — "
+                + ("оценка по расстоянию" if estimate else "расчёт по курсу и ходу AIS"))
+        if position_age is not None and position_age > 1.0:
+            evidence.append(f"Позиция: {duration_text(position_age)} назад — путь считается от неё")
+    if arrival_at or in_port:
+        if in_port:
+            evidence.append("Лоцман: судно уже в порту — ожидание в сумму не входит")
+        elif observed_pilot is None:
+            evidence.append(
+                f"Лоцман: своих наблюдений за {port.get('name')} нет — "
+                "в сумму не входит (не выдумываем)")
+        else:
+            evidence.append(
+                f"Лоцман: {duration_text(pilot_hours)} — медиана по {pilot.get('samples')} "
+                f"визитам порта за {pilot.get('window_days')} дн. "
+                f"(разброс {duration_text(pilot.get('min_hours'))}…"
+                f"{duration_text(pilot.get('max_hours'))})")
+        if stay_scope == "оценка":
+            evidence.append(f"Стоянка: {duration_text(stay_hours)} — истории визитов нет, "
+                            "значение по умолчанию")
+        else:
+            evidence.append(f"Стоянка: {duration_text(stay_hours)} — по истории «{stay_scope}», "
+                            f"визитов {stay.get('visits') or 0}")
+        evidence.append("Всего до выхода: путь + лоцман + стоянка")
 
     return {
         "port": port.get("name"),
@@ -342,6 +412,18 @@ def plan(vessel, ports, stay=None, days=PLAN_DAYS, track=None, now=None):
         "arrival_text": arrival and arrival.get("label"),
         "stay_hours": stay_hours,
         "stay_scope": stay_scope,
+        "stay_visits": (stay or {}).get("visits"),
+        "pilot_hours": observed_pilot if not in_port else None,
+        "pilot_samples": pilot.get("samples"),
+        "pilot_window_days": pilot.get("window_days"),
+        "pilot_min_hours": pilot.get("min_hours"),
+        "pilot_max_hours": pilot.get("max_hours"),
+        "pilot_used": pilot_hours,
+        "approach_km": approach_km,
+        "position_age_hours": position_age,
+        "total_hours": ((departure_at - now).total_seconds() / 3600.0
+                        if departure_at else None),
+        "evidence": evidence,
         "departure_at": departure_at,
         "sea_hours": sea_hours,
         "sea_knots": knots if sea_hours > 0.01 else None,
@@ -381,7 +463,11 @@ def plan_route_text(result):
         parts.append(f"в порту, выход через {duration_text(result.get('stay_hours'))}")
     elif result.get("arrival_at"):
         parts.append(f"в пути {duration_text(result.get('arrival_hours'))}")
+        if result.get("pilot_hours") is not None:
+            parts.append(f"лоцман {duration_text(result.get('pilot_hours'))}")
         parts.append(f"стоянка {duration_text(result.get('stay_hours'))}")
+        if result.get("total_hours") is not None:
+            parts.append(f"всего до выхода {duration_text(result.get('total_hours'))}")
     else:
         parts.append(f"за {int(result.get('days') or PLAN_DAYS)} сут не доходит")
     if result.get("sea_hours"):
@@ -405,10 +491,25 @@ def plan_detail(result):
         lines.append("Приход: нет позиции AIS — судно только в списке AIS-catcher")
     else:
         lines.append(f"Приход: за {int(result.get('days') or PLAN_DAYS)} сут не доходит")
+    if result.get("approach_km"):
+        lines.append(f"Остаток пути: {result['approach_km']:.0f} км")
     if result.get("departure_at"):
+        pilot = result.get("pilot_hours")
+        if pilot is None:
+            lines.append("Лоцман: своих наблюдений за этот порт нет — в сумму не входит")
+        else:
+            lines.append(
+                f"Лоцман: {duration_text(pilot)} — медиана по {result.get('pilot_samples')} "
+                f"визитам за {result.get('pilot_window_days')} дн. "
+                f"(разброс {duration_text(result.get('pilot_min_hours'))}…"
+                f"{duration_text(result.get('pilot_max_hours'))})")
         lines.append(f"Стоянка: {duration_text(result.get('stay_hours'))} "
-                     f"(оценка: {result.get('stay_scope')})")
+                     f"(по истории: {result.get('stay_scope')}, визитов "
+                     f"{result.get('stay_visits') or 0})")
         lines.append(f"Выход: {result['departure_at']:%d.%m %H:%M}")
+        if result.get("total_hours") is not None:
+            lines.append(f"Всего до выхода: {duration_text(result.get('total_hours'))} — "
+                         "путь + лоцман + стоянка")
         if result.get("sea_hours"):
             knots = result.get("sea_knots")
             speed_text = f" при {knots:.1f} уз" if knots else ""
@@ -417,6 +518,9 @@ def plan_detail(result):
             lines.append(f"Курс выхода: {course_text(result.get('out_course'))}")
     if result.get("speed"):
         lines.append(f"Ход по AIS: {result['speed']:.1f} уз ({result.get('source')})")
+    if result.get("evidence"):
+        lines.append("Чем подтверждено:")
+        lines.extend(f"  · {item}" for item in result["evidence"])
     sea = [point for point in result.get("points") or [] if point.get("phase") == "sea"]
     if sea:
         marks = []

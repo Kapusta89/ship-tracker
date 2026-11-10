@@ -932,23 +932,45 @@ async def cmd_plan(message: Message):
             if _is_stale(vessel, limit):
                 continue
             mmsi = str(vessel.get("mmsi"))
+            # только идущие с моря в наши порты: стоящие в порту — /visits,
+            # без позиции AIS план не построить
             port = core.destination_port(vessel)
             if not port:
-                visit = opens.get(mmsi)
-                if not visit:
+                continue
+            lat, lon = vessel.get("lat"), vessel.get("lon")
+            if lat is None or lon is None:
+                continue
+            try:
+                if geo.port_at(lat, lon, ports):
                     continue
-                port = geo.port_by_name(visit.get("port"), ports)
-            if not port:
+            except Exception:
+                pass
+            if not _underway(vessel):
+                # без хода AIS время в пути не подтвердить — показываем только
+                # расстояние и причину, без выдуманных часов
+                try:
+                    km = geo.haversine_km(float(lat), float(lon),
+                                          float(port["lat"]), float(port["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    km = None
+                result.append((vessel, {"port": port.get("name"),
+                                        "port_label": port.get("label") or port.get("name"),
+                                        "no_speed": True, "approach_km": km}))
                 continue
             try:
                 stay = core.port_stay(vessel, port=port)
             except Exception:
                 stay = None
-            plan = forecast.plan(vessel, ports, stay=stay, track=store.track(mmsi, 24))
-            if plan:
+            try:
+                pilot = core.pilot_wait(port)
+            except Exception:
+                pilot = None
+            plan = forecast.plan(vessel, ports, stay=stay, track=store.track(mmsi, 24),
+                                 pilot=pilot)
+            if plan and (plan.get("arrival_at") is not None or plan.get("in_port")):
                 result.append((vessel, plan))
-        result.sort(key=lambda pair: (pair[1].get("arrival_hours") is None,
-                                      pair[1].get("arrival_hours") or 0.0))
+        result.sort(key=lambda pair: (bool(pair[1].get("no_speed")),
+                                      pair[1].get("total_hours") or 0.0))
         return result
 
     try:
@@ -957,30 +979,36 @@ async def cmd_plan(message: Message):
         await message.answer(f"Прогноз недоступен: {error}")
         return
 
-    in_port = sum(1 for _, plan in rows if plan.get("in_port"))
-    missing = sum(1 for _, plan in rows
-                  if plan.get("no_position") and not plan.get("in_port"))
+    ready = sum(1 for _, plan in rows if not plan.get("no_speed"))
     lines = ["📅 <b>Прогноз на 4 дня</b>",
-             f"Судов в плане: <b>{len(rows)}</b> — в порту {in_port}, "
-             f"в пути {len(rows) - in_port - missing}."
-             + (f" Без позиции: {missing}." if missing else ""),
-             "Путь до порта — по курсу и скорости AIS, стоянка — по истории визитов, "
-             "выход и маршрут в море — оценка на остаток четырёх дней.", ""]
+             f"Идут с моря в наши порты: <b>{len(rows)}</b> "
+             f"(с подтверждённым ходом AIS: {ready}).",
+             "Всего до выхода = путь + лоцман + стоянка. Ход и курс — AIS, "
+             "стоянка — наши визиты, лоцман — медиана по визитам порта "
+             "(в скобках — сколько наблюдений); если наблюдений нет, лоцман не учтён.", ""]
     for vessel, plan in rows[:25]:
         name = html.escape(str(vessel.get("name") or f"MMSI {vessel.get('mmsi')}"))
+        mark = "≈" if plan.get("arrival_estimate") else ""
         parts = [html.escape(str(plan.get("port_label") or plan.get("port") or "—"))]
-        if plan.get("in_port"):
-            parts.append("в порту")
-        elif plan.get("arrival_at"):
-            mark = "≈" if plan.get("arrival_estimate") else ""
-            parts.append(f"приход {mark}{plan['arrival_at']:%d.%m %H:%M}")
+        if plan.get("no_speed"):
+            km = plan.get("approach_km")
+            parts.append(f"{km:.0f} км по прямой" if km else "нет позиции")
+            parts.append("нет хода AIS — время в пути не подтверждено")
+            lines.append(f"• <b>{name}</b> — " + " · ".join(parts))
+            continue
+        if plan.get("arrival_at"):
+            parts.append(f"в пути {forecast.duration_text(plan.get('arrival_hours'))}"
+                         f" ({mark}приход {plan['arrival_at']:%d.%m %H:%M})")
+        if plan.get("pilot_hours") is not None:
+            parts.append(f"лоцман {forecast.duration_text(plan.get('pilot_hours'))}"
+                         f" ({plan.get('pilot_samples')} набл.)")
         else:
-            parts.append("нет позиции")
+            parts.append("лоцман: нет наблюдений")
+        parts.append(f"стоянка {forecast.duration_text(plan.get('stay_hours'))}")
+        if plan.get("total_hours") is not None:
+            parts.append(f"<b>всего до выхода {forecast.duration_text(plan.get('total_hours'))}</b>")
         if plan.get("departure_at"):
-            parts.append(f"стоянка {forecast.duration_text(plan.get('stay_hours'))}")
             parts.append(f"выход {plan['departure_at']:%d.%m %H:%M}")
-        if plan.get("sea_hours"):
-            parts.append(f"море {forecast.duration_text(plan.get('sea_hours'))}")
         lines.append(f"• <b>{name}</b> — " + " · ".join(parts))
     if len(rows) > 25:
         lines.append(f"…и ещё {len(rows) - 25}")
@@ -998,6 +1026,14 @@ def _fresh_limit_hours(config: dict) -> float:
         return max(0.25, float(config.get("sea_fresh_hours") or 12))
     except (TypeError, ValueError):
         return 12.0
+
+
+def _underway(vessel: dict) -> bool:
+    """Есть ли подтверждённый ход по AIS — без него время в пути не посчитать."""
+    try:
+        return float(vessel.get("sog")) >= 0.5
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_stale(vessel: dict, limit_hours: float) -> bool:

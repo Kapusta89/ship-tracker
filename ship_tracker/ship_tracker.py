@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.7"
+APP_VERSION = "2026.12.8"
 
 import ais_feed
 import cargo
@@ -998,13 +998,14 @@ class App:
         frame = self.tab_forecast
         ttk.Label(
             frame,
-            text="План на 4 дня по каждому судну, которое идёт в наш порт или уже стоит в нём: "
-                 "путь до порта, сколько простоит и маршрут в море на оставшийся срок "
-                 "(стоянка сутки — море три дня, стоянка двое — два дня). Стоянка оценивается "
-                 "по прежним визитам этого судна, иначе по среднему в порту; если наблюдений "
-                 "нет — сутки. Скорость и курс берутся из AIS. «Ит. путь» — сколько всего "
-                 "времени от текущего момента до выхода из порта, включая стоянку. "
-                 "Двойной щелчок открывает карточку.",
+            text="Только суда, которые идут с моря в наши порты (уже стоящие в порту — "
+                 "во вкладке «Стоянки»). Для каждого — остаток пути, время в пути, ожидание "
+                 "лоцмана и стоянка, а в «Всего до выхода» сумма: путь + лоцман + стоянка. "
+                 "Каждое слагаемое берётся из данных: ход и курс — из AIS (ход — медиана "
+                 "по треку), стоянка — из наших визитов судна или порта, ожидание лоцмана — "
+                 "медиана по визитам порта (время с ходом до 1.5 уз у входа за хранимую "
+                 "историю); если наблюдений нет, лоцман не учитывается. Что откуда взято — "
+                 "в разборе под таблицей у выбранного судна; ≈ означает оценку по расстоянию.",
             foreground="#555", wraplength=1150, justify="left").pack(
             anchor="w", padx=8, pady=(8, 4))
         bar = ttk.Frame(frame)
@@ -1014,11 +1015,12 @@ class App:
                   wraplength=980, justify="left").pack(side="left", fill="x", expand=True)
         ttk.Button(bar, text="Обновить", command=self.refresh_forecast).pack(side="right")
         self.forecast_tree = self.make_tree(
-            frame, (("name", "Судно", 170), ("port", "Порт", 110),
-                    ("arrival", "Приход", 145), ("stay", "Стоянка", 110),
-                    ("departure", "Выход", 145), ("total", "Ит. путь", 175),
-                    ("sea", "Море", 100),
-                    ("route", "Маршрут", 320), ("mmsi", "MMSI", 95)))
+            frame, (("name", "Судно", 160), ("port", "Порт", 100),
+                    ("distance", "Осталось", 95), ("speed", "Ход", 95),
+                    ("travel", "В пути", 90), ("pilot", "Лоцман", 90),
+                    ("stay", "Стоянка", 90), ("departure", "Выход", 120),
+                    ("total", "Всего до выхода", 150), ("route", "Маршрут", 250),
+                    ("mmsi", "MMSI", 90)))
         self.forecast_tree.bind("<<TreeviewSelect>>", self.show_forecast_detail)
         self.forecast_tree.tag_configure("in_port", foreground="#1f7a52")
         self.forecast_tree.tag_configure("late", foreground="#8c8c8c")
@@ -1031,36 +1033,48 @@ class App:
         self.refresh_forecast()
 
     def forecast_candidates(self):
-        """Суда для плана: идут в наш порт или уже стоят в нём."""
+        """Суда для плана: идут с моря в наши порты и ещё не пришли.
+
+        Стоящие в порту сюда не попадают — их время в «Стоянках»; без позиции
+        AIS план не построить, а без нашего порта в Destination это не рейс
+        к нам. Всё отброшенное пересчитывается и пишется в строку сведений,
+        чтобы было видно, что именно не вошло в таблицу.
+        """
         ports = self.config.get("ports") or []
-        names = {(port.get("name") or "").upper() for port in ports}
-        opens = {}
-        try:
-            for visit in self.store.open_visits():
-                if (visit.get("port") or "").upper() in names:
-                    opens[str(visit.get("mmsi"))] = visit
-        except Exception as error:
-            self.log(f"Стоянки для прогноза: {error}")
         result = []
         hidden_stale = 0
+        in_port = 0
+        no_position = 0
+        stopped = []
         show_stale = self.stale_visible()
         for vessel in self.core.related_vessels(3000):
+            port = self.core.destination_port(vessel)
+            if not port:
+                continue
             # план по трёхдневной позиции — уже фантазия: без галочки «устаревшие»
-            # такие суда в расчёт не берём
+            # такие суда в расчёт не берём (считаем только тех, кто идёт к нам)
             if not show_stale and self.vessel_is_stale(vessel):
                 hidden_stale += 1
                 continue
-            mmsi = str(vessel.get("mmsi"))
-            port = self.core.destination_port(vessel)
-            visit = opens.get(mmsi)
-            if not port:
-                if not visit:
-                    continue
-                port = geo.port_by_name(visit.get("port"), ports)
-            if not port:
+            lat, lon = vessel.get("lat"), vessel.get("lon")
+            if lat is None or lon is None:
+                no_position += 1
                 continue
+            try:
+                if geo.port_at(lat, lon, ports):
+                    in_port += 1
+                    continue
+            except Exception:
+                pass
+            # Без хода AIS время в пути не подтвердить: такое судно тоже
+            # показываем, но без часов — причиной пустых клеток
+            if not self.vessel_underway(vessel):
+                stopped.append((vessel, port))
             result.append((vessel, port))
         self._forecast_hidden_stale = hidden_stale
+        self._forecast_in_port = in_port
+        self._forecast_no_position = no_position
+        self._forecast_stopped = stopped
         return result
 
     def refresh_forecast(self):
@@ -1075,71 +1089,108 @@ class App:
             tree.delete(item)
         plans = {}
         rows = []
+        stopped_rows = []
+        late = 0
         for vessel, port in self.forecast_candidates():
             mmsi = str(vessel.get("mmsi"))
+            if not self.vessel_underway(vessel):
+                stopped_rows.append((vessel, port))
+                continue
             try:
                 stay = self.core.port_stay(vessel, port=port)
             except Exception:
                 stay = None
             try:
+                pilot = self.core.pilot_wait(port)
+            except Exception:
+                pilot = None
+            try:
                 track = self.store.track(mmsi, 24)
             except Exception:
                 track = None
-            result = forecast.plan(vessel, ports, stay=stay, track=track)
+            result = forecast.plan(vessel, ports, stay=stay, track=track, pilot=pilot)
             if not result:
+                continue
+            # план без прихода — не «сколько до выхода»: судно за 4 сут не дойдёт
+            if not result.get("arrival_at") and not result.get("in_port"):
+                late += 1
                 continue
             plans[mmsi] = (vessel, result)
             rows.append((vessel, result))
 
-        rows.sort(key=lambda pair: (pair[1].get("arrival_hours") is None,
-                                    pair[1].get("arrival_hours") or 0.0,
+        rows.sort(key=lambda pair: (pair[1].get("total_hours") is None,
+                                    pair[1].get("total_hours") or 0.0,
                                     (pair[0].get("name") or "")))
         for vessel, result in rows:
             mmsi = str(vessel.get("mmsi"))
-            tags = (mmsi, "in_port" if result.get("in_port") else "sea_plan")
-            if not result.get("complete"):
-                tags = (mmsi, "late")
-            arrival = result.get("arrival_at")
-            departure = result.get("departure_at")
-            if result.get("in_port"):
-                arrival_text = "в порту"
-            elif arrival:
-                mark = "≈" if result.get("arrival_estimate") else ""
-                arrival_text = f"{mark}{arrival:%d.%m %H:%M}"
-            elif result.get("no_position"):
-                arrival_text = "нет позиции"
+            estimated = bool(result.get("arrival_estimate"))
+            mark = "≈" if estimated else ""
+            speed = result.get("speed")
+            speed_text = f"{speed:.1f} уз" if speed else "—"
+            distance = result.get("approach_km")
+            pilot = result.get("pilot_hours")
+            if pilot is None:
+                pilot_text = "нет данных"
             else:
-                arrival_text = "не доходит"
-            # Итоговый путь — от текущего момента до выхода из порта:
-            # дорога до порта плюс стоянка.
-            total_text = "—"
-            if departure:
-                total_hours = max(0.0, (departure - datetime.now()).total_seconds() / 3600.0)
-                total_text = f"{forecast.duration_text(total_hours)} · {departure:%d.%m %H:%M}"
-            tree.insert("", "end", iid=mmsi, tags=tags, values=(
+                pilot_text = forecast.duration_text(pilot) + f" ({result.get('pilot_samples')})"
+            departure = result.get("departure_at")
+            tree.insert("", "end", iid=mmsi, tags=(mmsi, "sea_plan"), values=(
                 vessel.get("name") or "—",
                 result.get("port_label") or result.get("port") or "—",
-                arrival_text,
+                f"{mark}{distance:.0f} км" if distance else "—",
+                speed_text,
+                forecast.duration_text(result.get("arrival_hours")) if result.get("arrival_hours") is not None else "—",
+                pilot_text,
                 forecast.duration_text(result.get("stay_hours")),
                 f"{departure:%d.%m %H:%M}" if departure else "—",
-                total_text,
-                forecast.duration_text(result.get("sea_hours")) if result.get("sea_hours") else "—",
+                forecast.duration_text(result.get("total_hours")) if result.get("total_hours") is not None else "—",
                 forecast.plan_route_text(result),
                 mmsi))
+        # Суда без хода AIS: показываем только расстояние до порта и причину,
+        # почему нет часов — путь и стоянку без хода не подтвердить.
+        stopped_rows.sort(key=lambda pair: pair[0].get("name") or "")
+        for vessel, port in stopped_rows:
+            mmsi = str(vessel.get("mmsi"))
+            try:
+                km = geo.haversine_km(float(vessel["lat"]), float(vessel["lon"]),
+                                      float(port["lat"]), float(port["lon"]))
+            except (KeyError, TypeError, ValueError):
+                km = None
+            plans[mmsi] = (vessel, {"port": port.get("name"),
+                                    "port_label": port.get("label") or port.get("name"),
+                                    "no_speed": True, "approach_km": km,
+                                    "in_port": False})
+            tree.insert("", "end", iid=mmsi, tags=(mmsi, "late"), values=(
+                vessel.get("name") or "—",
+                port.get("label") or port.get("name") or "—",
+                f"{km:.0f} км" if km is not None else "—",
+                "—", "—", "—", "—", "—", "—",
+                "нет хода AIS — время в пути не подтверждено",
+                mmsi))
         self._forecast_plans = plans
-        in_port = sum(1 for _, result in rows if result.get("in_port"))
-        missing = sum(1 for _, result in rows if result.get("no_position") and not result.get("in_port"))
-        late = sum(1 for _, result in rows
-                   if not result.get("complete") and not result.get("no_position"))
+        self._forecast_stopped_count = len(stopped_rows)
         if hasattr(self, "forecast_info"):
-            text = (f"В плане судов: {len(rows)} — в порту {in_port}, "
-                    f"в пути {len(rows) - in_port - missing}.")
+            text = (f"Идут с моря в наши порты: {len(rows) + len(stopped_rows)}"
+                    f" (с подтверждённым ходом AIS: {len(rows)}).")
+            in_port = getattr(self, "_forecast_in_port", 0)
+            no_position = getattr(self, "_forecast_no_position", 0)
+            if in_port:
+                text += f" Уже в порту: {in_port} — они во вкладке «Стоянки»."
+            if no_position:
+                text += f" Без позиции AIS: {no_position}."
+            stopped = getattr(self, "_forecast_stopped", []) or []
+            if stopped:
+                names = ", ".join(str(vessel.get("name") or vessel.get("mmsi"))
+                                  for vessel, _ in stopped[:3])
+                if len(stopped) > 3:
+                    names += "…"
+                text += (f" Без хода AIS: {len(stopped)} ({names}) — показаны без "
+                         "часов: время в пути не подтверждено.")
             if late:
-                text += f" Не успевают дойти за 4 суток: {late}."
-            if missing:
-                text += f" Без позиции (только AIS-catcher): {missing}."
-            text += (" Стоянка — по истории визитов, выход и маршрут в море — "
-                     "оценка по курсу и скорости.")
+                text += f" За 4 сут не доходят: {late}."
+            text += (" Всего до выхода = путь + лоцман + стоянка. Ход и курс — AIS, "
+                     "стоянка — наши визиты, лоцман — медиана по визитам порта; "
+                     "источники каждого числа — в разборе под таблицей, ≈ — оценка.")
             text += self.hidden_stale_note(getattr(self, "_forecast_hidden_stale", 0))
             self.forecast_info.set(text)
         if keep and keep in plans:
@@ -1159,7 +1210,18 @@ class App:
             if plan:
                 vessel, result = plan
                 content = f"{vessel.get('name') or '—'} ({vessel.get('mmsi')})\n"
-                content += forecast.plan_detail(result)
+                if result.get("no_speed"):
+                    km = result.get("approach_km")
+                    age = core_module.position_age_hours(vessel)
+                    content += (f"Порт: {result.get('port_label') or result.get('port')}\n"
+                                + (f"Остаток пути по прямой: {km:.0f} км\n" if km else ""))
+                    content += ("Ход AIS: не передаётся (0 или нет данных) — время в пути, "
+                                "лоцман и стоянка не считаются: без хода это было бы "
+                                "выдумкой.\n")
+                    if age is not None:
+                        content += f"Позиция: {forecast.duration_text(age)} назад.\n"
+                else:
+                    content += forecast.plan_detail(result)
         text.configure(state="normal")
         text.delete("1.0", "end")
         text.insert("1.0", content)
@@ -2821,6 +2883,14 @@ class App:
         except Exception:
             return
         self.refresh_tab(tab)
+
+    @staticmethod
+    def vessel_underway(vessel) -> bool:
+        """Есть ли у судна подтверждённый ход по AIS (не ноль и не пустото)."""
+        try:
+            return float(vessel.get("sog")) >= 0.5
+        except (TypeError, ValueError):
+            return False
 
     def stale_visible(self) -> bool:
         """Галочка «устаревшие»: показывать ли суда с давно устаревшей позицией."""
