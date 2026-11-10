@@ -116,7 +116,7 @@
   "stale_minutes": 15.0,
   "vesselapi_key": "",
   "stale_lookup_limit": 6,
-  "berth_stale_hours": 12,
+  "berth_stale_hours": 6,
   "berth_watch_km": 20,
   "approach_radius_km": 300,
   "approach_angle_deg": 25,

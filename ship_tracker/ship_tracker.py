@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.19"
+APP_VERSION = "2026.12.20"
 
 import ais_feed
 import cargo
@@ -1323,9 +1323,12 @@ class App:
             # Здесь только те, кто стоит сейчас: ушедшие суда — в «Истории стоянок»
             if left is not None:
                 continue
-            open_visits += 1
+            # Позиция старше порога (6 ч) — уже не обстановка: судно могло уйти,
+            # а приёмник его не слышал. В просмотр такое не пускаем.
             if self.vessel_is_stale(vessel):
                 stale_open += 1
+                continue
+            open_visits += 1
             if entered:
                 stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
             else:
@@ -1355,7 +1358,7 @@ class App:
             f"за {self.config.get('history_days', 7)} дн. Стоянки по своим позициям "
             f"собираются автоматически за последние "
             f"{self.config.get('visits_backfill_days', 4)} дн."
-            + ((f" У {stale_open} из них давно нет свежих позиций: судно могло "
+            + ((f" Скрыто {stale_open} стоянок без позиции свежее 6 ч: судно могло "
                 f"уйти, но приёмник его больше не слышал.") if stale_open else ""))
 
     def load_history_stays(self):
