@@ -345,17 +345,15 @@ class Store:
         entered = iso(entered_at)
         left = iso(left_at) if left_at else None
         with self._lock, self.conn:
-            # тот же визит мог быть записан по живому AIS с точностью до минут
+            # Тот же заход мог быть записан по живому AIS или с другого трека:
+            # новый визит не добавляется, если его интервал пересекается с уже
+            # записанным (открытый визит считается до текущего момента).
             exists = self.conn.execute(
-                "SELECT id, left_at FROM port_visits WHERE mmsi = ? AND UPPER(port) = ?"
-                " AND ABS(julianday(entered_at) - julianday(?)) <= ?"
-                " ORDER BY ABS(julianday(entered_at) - julianday(?)) LIMIT 1",
-                (mmsi, str(port).upper(), entered, 2.0 / 24, entered)).fetchone()
+                "SELECT id FROM port_visits WHERE mmsi = ? AND UPPER(port) = ?"
+                " AND julianday(?) <= julianday(COALESCE(left_at, 'now'))"
+                " AND julianday(entered_at) <= julianday(?) LIMIT 1",
+                (mmsi, str(port).upper(), entered, left or iso())).fetchone()
             if exists:
-                if left:
-                    self.conn.execute(
-                        "UPDATE port_visits SET left_at = COALESCE(left_at, ?) "
-                        "WHERE id = ?", (left, exists["id"]))
                 return False
             self.conn.execute(
                 "INSERT INTO port_visits (mmsi, port, entered_at, left_at, draft_in, draft_out, "
