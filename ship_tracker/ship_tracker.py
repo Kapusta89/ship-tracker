@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.20"
+APP_VERSION = "2026.12.21"
 
 import ais_feed
 import cargo
@@ -1358,7 +1358,7 @@ class App:
             f"за {self.config.get('history_days', 7)} дн. Стоянки по своим позициям "
             f"собираются автоматически за последние "
             f"{self.config.get('visits_backfill_days', 4)} дн."
-            + ((f" Скрыто {stale_open} стоянок без позиции свежее 6 ч: судно могло "
+            + ((f" Скрыто {stale_open} стоянок без позиции свежее 9 ч: судно могло "
                 f"уйти, но приёмник его больше не слышал.") if stale_open else ""))
 
     def load_history_stays(self):

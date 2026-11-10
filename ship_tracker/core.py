@@ -47,7 +47,7 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 MIN_SOURCE_POLL_SECONDS = 15.0
 
 # Позиция старше этого возраста не показывается вообще: это уже не обстановка
-MAX_VIEW_AGE_HOURS = 6.0
+MAX_VIEW_AGE_HOURS = 9.0
 
 
 class AppError(Exception):
@@ -144,7 +144,7 @@ DEFAULT_CONFIG = {
     "stale_lookup_limit": 6,
     # Стоящее в порту или на рейде судно не двигается: его позиция остаётся
     # верной дольше, чем у идущего. 0 — не разрешать вовсе.
-    "berth_stale_hours": 6,
+    "berth_stale_hours": 9,
     # Стоящее судно без пункта назначения в AIS в этом радиусе от нашего
     # порта считается нашим: это якорная стоянка у порта, а не чужой трафик.
     "berth_watch_km": 20,
@@ -987,9 +987,38 @@ class RadarCore:
             destination = str(row.get("destination") or "").upper()
             return any(token in destination for token in tokens if token)
 
+        # Судно у наших портов должно попадать в подписку даже без Destination:
+        # подписка AISStream не имеет географии, поэтому такие суда мы находим
+        # по MMSI в любой точке мира, где их слышит хоть один приёмник.
+        watch_km = berth_watch_km(self.config)
+        ports = self.config.get("ports") or []
+
+        def near_port(row, km=None):
+            limit = km or watch_km
+            try:
+                lat, lon = float(row.get("lat")), float(row.get("lon"))
+            except (TypeError, ValueError):
+                return False
+            for port in ports:
+                try:
+                    if geo.haversine_km(lat, lon, float(port["lat"]),
+                                        float(port["lon"])) <= limit:
+                        return True
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return False
+
         ordered = sorted(rows, key=lambda row: str(row.get("updated_at") or ""),
                          reverse=True)
-        ordered.sort(key=lambda row: 0 if ours(row) else 1)
+
+        def rank(row):
+            if near_port(row):
+                return 0                      # стоит в порту — самое важное
+            if near_port(row, 50.0):
+                return 1                      # портовый район (рейд, подход)
+            return 2 if ours(row) else 3      # идёт к нам по Destination
+
+        ordered.sort(key=rank)
         result = []
         for row in ordered:
             mmsi = str(row.get("mmsi") or "")
