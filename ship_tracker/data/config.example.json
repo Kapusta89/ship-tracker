@@ -117,6 +117,7 @@
   "vesselapi_key": "",
   "stale_lookup_limit": 6,
   "berth_stale_hours": 12,
+  "berth_watch_km": 30,
   "approach_radius_km": 300,
   "approach_angle_deg": 25,
   "approach_min_sog": 1.5,

@@ -139,6 +139,9 @@ DEFAULT_CONFIG = {
     # Стоящее в порту или на рейде судно не двигается: его позиция остаётся
     # верной дольше, чем у идущего. 0 — не разрешать вовсе.
     "berth_stale_hours": 12,
+    # Стоящее судно без пункта назначения в AIS в этом радиусе от нашего
+    # порта считается нашим: это якорная стоянка у порта, а не чужой трафик.
+    "berth_watch_km": 30,
     # суда без нашего порта в AIS, идущие к нам по курсу: осторожный фильтр
     "approach_radius_km": 300,
     "approach_angle_deg": 25,
@@ -396,11 +399,26 @@ def berth_stale_hours(config) -> float:
         return 0.0
 
 
-def port_place(vessel, ports) -> dict | None:
+def berth_watch_km(config) -> float:
+    """Радиус вокруг порта, где стоящее судно без Destination считается нашим.
+
+    Судно, которое молчит о пункте назначения и стоит в 15–25 км от порта,
+    обычно ждёт на якоре лоцмана или очереди на обработку. В открытых сетях
+    у наших портов такие позиции — часто единственное, что видно.
+    """
+    try:
+        return max(0.0, min(100.0, float((config or {}).get("berth_watch_km") or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def port_place(vessel, ports, watch_km=0.0) -> dict | None:
     """Где судно относительно портов: у причала, на рейде или нигде.
 
     Рейд — это стоянка почти без хода в пределах 12 км от границы геозоны
     порта: так стоят суда в ожидании лоцмана и очереди на обработку.
+    `watch_km` добавляет якорную стоянку дальше рейда: судно без пункта
+    назначения, которое просто стоит в этом радиусе от порта.
     """
     if not vessel or not ports:
         return None
@@ -425,16 +443,25 @@ def port_place(vessel, ports) -> dict | None:
         gap = km - radius
         if best is None or gap < best[0]:
             best = (gap, candidate, km)
-    if not best or best[0] > 12 or speed > 1.5:
+    if not best:
         return None
-    place = "рейд: ждёт лоцмана" if speed < 0.5 else "подход к порту"
-    return {"port_name": best[1].get("name"), "place": place, "port_km": best[2]}
+    gap, candidate, km = best
+    if gap <= 12 and speed <= 1.5:
+        place = "рейд: ждёт лоцмана" if speed < 0.5 else "подход к порту"
+        return {"port_name": candidate.get("name"), "place": place, "port_km": km}
+    # судно не сообщает пункт назначения и просто стоит у порта на якоре
+    if (watch_km and speed <= 1.5 and km <= watch_km
+            and not norm(vessel.get("destination"))):
+        return {"port_name": candidate.get("name"), "place": "стоит у порта",
+                "port_km": km}
+    return None
 
 
 def in_port_area(vessel, config) -> bool:
-    """Стоит ли судно в порту или на рейде одного из наших портов."""
+    """Стоит ли судно в порту, на рейде или на якорной стоянке у порта."""
     try:
-        return bool(port_place(vessel, (config or {}).get("ports") or []))
+        return bool(port_place(vessel, (config or {}).get("ports") or [],
+                               berth_watch_km(config)))
     except Exception:
         return False
 
@@ -1439,7 +1466,8 @@ class RadarCore:
 
     def port_place(self, vessel) -> dict | None:
         """Где судно относительно портов: у причала, на рейде или нигде."""
-        return port_place(vessel, self.config.get("ports") or [])
+        return port_place(vessel, self.config.get("ports") or [],
+                          berth_watch_km(self.config))
 
     def port_focus(self, vessel) -> str | None:
         """Почему судно попадает на радар наших портов — или None.
@@ -1620,7 +1648,7 @@ class RadarCore:
             if self.destination_is_ours(vessel.get("destination")):
                 state.pop(mmsi, None)
                 continue
-            if port_place(vessel, known_place):
+            if port_place(vessel, known_place, berth_watch_km(self.config)):
                 state.pop(mmsi, None)
                 continue
             hit = self.approach_port(vessel)
