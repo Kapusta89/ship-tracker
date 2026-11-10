@@ -1452,16 +1452,15 @@ class App:
             else:
                 button.configure(text=f"{label} ({counts.get(name, {}).get('visits', 0)})")
         open_visits = 0
-        hidden_stale = 0
-        show_stale = self.stale_visible()
+        stale_open = 0
         for visit in rows:
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
             left = parse_iso(visit.get("left_at"))
-            if left is None and not show_stale and self.vessel_is_stale(vessel):
-                hidden_stale += 1
-                open_visits += 1
-                continue
+            # История — это аналитика: показываем все записи, даже если у
+            # открытой стоянки давно нет свежих позиций
+            if left is None and self.vessel_is_stale(vessel):
+                stale_open += 1
             if left and entered:
                 stay = span_text((left - entered).total_seconds() / 3600)
             elif entered:
@@ -1491,7 +1490,9 @@ class App:
             f"{open_visits}). Портов в базе: {len(counts)}. Стоянки считаются по "
             f"геозоне порта; история из трека добавляется кнопкой «Загрузить из "
             f"истории» во вкладке «Стоянки»."
-            + self.hidden_stale_note(hidden_stale))
+            + ((f" У {stale_open} открытых стоянок давно нет свежих позиций:"
+                f" судно могло уйти, но приёмник его больше не слышал.")
+               if stale_open else ""))
 
     def build_expected(self):
         tk, ttk = self.tk, self.ttk
