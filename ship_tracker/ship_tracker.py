@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.17"
+APP_VERSION = "2026.12.18"
 
 import ais_feed
 import cargo
@@ -944,7 +944,7 @@ class App:
         ttk.Label(toolbar, text="колесо — масштаб, перетаскивание — сдвиг, клик — карточка судна",
                   foreground="#777").pack(side="left", padx=12)
         ttk.Button(toolbar, text="Обновить",
-                   command=lambda: self.refresh_tab(self.tab_radar)).pack(side="right")
+                   command=lambda: self.refresh_now(self.tab_radar)).pack(side="right")
 
         self.photo_label = tk.Label(panel, text="фото судна", background="#eef2f4",
                                     foreground="#777", height=9, width=34,
@@ -984,7 +984,8 @@ class App:
         self.vessels_info = tk.StringVar(value="")
         ttk.Label(row, textvariable=self.vessels_info, foreground="#333",
                   wraplength=1000, justify="left").pack(side="left")
-        ttk.Button(row, text="Обновить", command=self.refresh_vessels_table).pack(side="right")
+        ttk.Button(row, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_vessels)).pack(side="right")
         self.vessels_tree = self.make_tree(
             frame, (                    ("name", "Судно", 170), ("flag", "Флаг", 140), ("type", "Тип", 100),
                     ("size", "Размеры", 115),
@@ -1022,7 +1023,8 @@ class App:
                                relief="groove", padx=8, pady=2, font=("Segoe UI", 9))
             button.pack(side="left", padx=(0, 4))
             self.sea_port_buttons[name] = button
-        ttk.Button(port_bar, text="Обновить", command=self.refresh_sea_table).pack(side="right")
+        ttk.Button(port_bar, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_sea)).pack(side="right")
         self.sea_info = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.sea_info, foreground="#333", wraplength=1200,
                   justify="left").pack(anchor="w", padx=8, pady=(0, 4))
@@ -1064,7 +1066,8 @@ class App:
         self.forecast_info = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.forecast_info, foreground="#333",
                   wraplength=980, justify="left").pack(side="left", fill="x", expand=True)
-        ttk.Button(bar, text="Обновить", command=self.refresh_forecast).pack(side="right")
+        ttk.Button(bar, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_forecast)).pack(side="right")
         self.forecast_tree = self.make_tree(
             frame, (("name", "Судно", 160), ("port", "Порт", 100),
                     ("distance", "Осталось", 95), ("speed", "Ход", 95),
@@ -1292,7 +1295,8 @@ class App:
         ttk.Label(top, text="Стоянки судов в наших портах: когда пришло, когда ушло, "
                             "сколько простояло, с какой осадкой и грузом.",
                   foreground="#555").pack(side="left")
-        ttk.Button(top, text="Обновить", command=self.refresh_visits).pack(side="right")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_visits)).pack(side="right")
         ttk.Button(top, text="Загрузить из истории", command=self.load_history_stays
                    ).pack(side="right", padx=(0, 6))
         self.visits_info = tk.StringVar(value="")
@@ -1397,7 +1401,8 @@ class App:
                             "стоянки, осадка и груз. Кнопка порта оставляет только его "
                             "стоянки; в скобках — сколько их в базе.",
                   foreground="#555").pack(side="left")
-        ttk.Button(top, text="Обновить", command=self.refresh_visit_history
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_visit_history)
                    ).pack(side="right")
         port_bar = ttk.Frame(frame)
         port_bar.pack(fill="x", padx=8, pady=(0, 4))
@@ -1686,7 +1691,8 @@ class App:
         top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(top, text="Журнал алертов: что отправлено и с каким результатом.",
                   foreground="#555").pack(side="left")
-        ttk.Button(top, text="Обновить", command=self.refresh_alerts).pack(side="right")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_alerts)).pack(side="right")
         self.alerts_tree = self.make_tree(
             frame, (("time", "Время", 120), ("name", "Судно", 190), ("route", "Маршрут", 220),
                     ("status", "Статус", 90), ("error", "Ошибка", 260)))
@@ -2118,7 +2124,7 @@ class App:
         ttk.Label(top, text="Альтернативные источники AIS и сервисы для проверки судов",
                   font=("Segoe UI", 10, "bold")).pack(side="left")
         ttk.Button(top, text="Обновить",
-                   command=lambda: self.refresh_tab(self.tab_services)).pack(side="right")
+                   command=lambda: self.refresh_now(self.tab_services)).pack(side="right")
         ttk.Label(inner, text="Можно использовать как запасной источник или для перепроверки по MMSI/IMO",
                   foreground="#555").pack(anchor="w", pady=(0, 12))
 
@@ -4012,18 +4018,37 @@ class App:
             self._source_checking.discard(source["key"])
         self._store_source_result(result)
 
-    def refresh_sources_now(self):
+    def refresh_now(self, tab=None):
+        """Кнопка «Обновить»: перерисовать вкладку и запросить свежие данные.
+
+        Таблица перечитывает базу сразу, а все включённые источники получают
+        запрос на внеочередной цикл — отвечают они одновременно, каждый в
+        своём потоке, поэтому карта заполняется по мере ответов.
+        """
+        self.refresh_tab(tab)
+        threading.Thread(target=self.ask_sources_now, daemon=True).start()
+
+    def ask_sources_now(self):
         """Внеочередной опрос всех включённых источников — одним заходом."""
-        asked = 0
         try:
             asked = self.core.refresh_all_sources()
         except Exception as error:
             self.log(f"Обновление источников: {error}")
+            return 0
         if asked:
             self.log(f"Обновление данных запрошено у всех включённых источников ({asked}) — "
                      f"ответы придут одновременно.")
+        elif getattr(self.core, "feeds", None):
+            self.log(f"Свежие данные только что запрашивались: подождите "
+                     f"{core.MIN_SOURCE_POLL_SECONDS:g} с и нажмите снова.")
         else:
-            self.log("Нет запущенных источников: включите их галочками выше или нажмите «Старт».")
+            self.log("Нет запущенных источников: включите их галочками в «Источниках» "
+                     "или проверьте ключи API.")
+        return asked
+
+    def refresh_sources_now(self):
+        """Кнопка на вкладке источников — то же обновление, но без перерисовки."""
+        threading.Thread(target=self.ask_sources_now, daemon=True).start()
 
     def check_all_sources(self):
         if getattr(self, "_sources_busy", False):

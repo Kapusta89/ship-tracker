@@ -43,6 +43,9 @@ DB_PATH = DATA_DIR / "ship_tracker.db"
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
+# пауза между внеочередными опросами источников по кнопке «Обновить»
+MIN_SOURCE_POLL_SECONDS = 15.0
+
 
 class AppError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
@@ -828,7 +831,8 @@ class RadarCore:
                          name="startup-refresh").start()
 
     def _startup_refresh_worker(self):
-        feeds = [feed for feed in list(self.feeds) if hasattr(feed, "first_done")]
+        feeds = [feed for feed in list(self.feeds)
+                 if callable(getattr(getattr(feed, "first_done", None), "wait", None))]
         if not feeds:
             return
         started = time.time()
@@ -837,6 +841,12 @@ class RadarCore:
             left = max(1.0, 180.0 - (time.time() - started))
             if feed.first_done.wait(left):
                 answered += 1
+                if answered == 1:
+                    # не ждём самого медленного: на карте уже есть первые данные,
+                    # остальные источники досылают свои параллельно
+                    title = getattr(feed, "title", None) or getattr(feed, "name", "источник")
+                    self.log(f"Первые данные при открытии: {title} — карта "
+                             f"заполняется по мере ответов остальных источников.")
         try:
             vessels = len(self.store.vessels(3000))
         except Exception:
@@ -858,6 +868,11 @@ class RadarCore:
         каждый из них выполнить следующий цикл сейчас. Возвращает число
         источников, которым отправлен запрос.
         """
+        # каждое нажатие «Обновить» будит все источники: без паузы частые
+        # клики тратили бы лимиты платных API (VesselFinder, MyShipTracking)
+        moment = time.time()
+        if moment - getattr(self, "_last_source_poll", 0) < MIN_SOURCE_POLL_SECONDS:
+            return 0
         asked = 0
         for feed in list(self.feeds):
             wake = getattr(feed, "wake", None)
@@ -869,6 +884,7 @@ class RadarCore:
             except Exception:
                 continue
         if asked:
+            self._last_source_poll = moment
             self.log(f"Внеочередное обновление: опрос отправлен источникам — {asked}.")
             self._start_startup_refresh()
         return asked
