@@ -320,6 +320,36 @@ def parse_chat_ids(value) -> list:
     return result
 
 
+def position_stamp(vessel) -> str:
+    """Время последней ПОЗИЦИИ судна, а не последнего обновления записи.
+
+    `updated_at` двигается и тогда, когда приходит только паспорт судна
+    (GFW, карточки сервисов): позиция при этом остаётся старой, и судно
+    выглядело свежим на карте и в таблицах. Для возраста берём `position_at`;
+    у старых записей его нет — тогда `updated_at`.
+    """
+    if not vessel:
+        return None
+    return vessel.get("position_at") or vessel.get("updated_at")
+
+
+def position_age_hours(vessel, now=None) -> float:
+    """Сколько часов назад судно передало последнюю позицию (None — неизвестно)."""
+    stamp = position_stamp(vessel)
+    if not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(stamp)[:19])
+    except (TypeError, ValueError):
+        return None
+    now = now or datetime.now()
+    if moment.tzinfo is not None and now.tzinfo is None:
+        now = now.astimezone()
+    if moment > now:
+        return 0.0
+    return (now - moment).total_seconds() / 3600.0
+
+
 # ------------------------------------------------------------------ телеграм
 
 class TelegramError(AppError):
@@ -1102,13 +1132,8 @@ class RadarCore:
                 continue
             if ports and geo.port_at(lat, lon, ports):
                 continue
-            age = None
-            updated = vessel.get("updated_at")
-            if updated:
-                try:
-                    age = (now - datetime.fromisoformat(str(updated)[:19])).total_seconds() / 3600
-                except ValueError:
-                    age = None
+            # возраст — по времени позиции: обогащение паспорта его не двигает
+            age = position_age_hours(vessel, now)
             ours = self.destination_is_ours(vessel.get("destination"))
             if age is not None and age > fresh_hours and not ours:
                 continue

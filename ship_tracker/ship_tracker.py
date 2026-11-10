@@ -39,10 +39,11 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.5"
+APP_VERSION = "2026.12.6"
 
 import ais_feed
 import cargo
+import core as core_module
 import flags
 import forecast
 import geo
@@ -369,7 +370,9 @@ class RadarCanvas:
             is_target = vessel["mmsi"] in target_mmsi
             if self.targets_only and not is_target:
                 continue
-            updated = parse_iso(vessel.get("updated_at"))
+            # Возраст — по времени последней ПОЗИЦИИ: паспорт может обновиться
+            # сегодня, а точка на карте остаться трёхдневной.
+            updated = parse_iso(core_module.position_stamp(vessel))
             age = (now - updated).total_seconds() if updated else None
             fresh = age is not None and age <= self.stale_seconds()
             # Без свежего сигнала, но ещё в пределах `sea_fresh_hours` — судно
@@ -437,7 +440,7 @@ class RadarCanvas:
                 lat, lon = vessel.get("lat"), vessel.get("lon")
                 if lat is None or lon is None:
                     continue
-                updated = parse_iso(vessel.get("updated_at"))
+                updated = parse_iso(core_module.position_stamp(vessel))
                 if (not self.show_stale and mmsi != self.selected
                         and (not updated
                              or (now - updated).total_seconds() > self.stale_seconds())):
@@ -528,7 +531,7 @@ class RadarCanvas:
     def _forecast_for(self, vessel):
         """Прогноз маршрута с кэшем: пересчёт только при новых данных AIS."""
         ports = self.config.get("ports") or []
-        key = (vessel.get("updated_at"), vessel.get("sog"), vessel.get("cog"),
+        key = (core_module.position_stamp(vessel), vessel.get("sog"), vessel.get("cog"),
                vessel.get("heading"), vessel.get("destination"),
                forecast.MAX_DAYS, tuple(sorted((p.get("name") or "") for p in ports)))
         mmsi = vessel.get("mmsi")
@@ -552,7 +555,7 @@ class RadarCanvas:
         """
         if vessel.get("lat") is None or vessel.get("lon") is None:
             return False
-        age = metrics.freshness_hours(vessel.get("updated_at"))
+        age = core_module.position_age_hours(vessel)
         if not allow_stale and age is not None and age * 3600 > self.stale_seconds():
             return False
         ports = self.config.get("ports") or []
@@ -1039,7 +1042,14 @@ class App:
         except Exception as error:
             self.log(f"Стоянки для прогноза: {error}")
         result = []
+        hidden_stale = 0
+        show_stale = self.stale_visible()
         for vessel in self.core.related_vessels(3000):
+            # план по трёхдневной позиции — уже фантазия: без галочки «устаревшие»
+            # такие суда в расчёт не берём
+            if not show_stale and self.vessel_is_stale(vessel):
+                hidden_stale += 1
+                continue
             mmsi = str(vessel.get("mmsi"))
             port = self.core.destination_port(vessel)
             visit = opens.get(mmsi)
@@ -1050,6 +1060,7 @@ class App:
             if not port:
                 continue
             result.append((vessel, port))
+        self._forecast_hidden_stale = hidden_stale
         return result
 
     def refresh_forecast(self):
@@ -1129,6 +1140,7 @@ class App:
                 text += f" Без позиции (только AIS-catcher): {missing}."
             text += (" Стоянка — по истории визитов, выход и маршрут в море — "
                      "оценка по курсу и скорости.")
+            text += self.hidden_stale_note(getattr(self, "_forecast_hidden_stale", 0))
             self.forecast_info.set(text)
         if keep and keep in plans:
             tree.selection_set(keep)
@@ -1180,10 +1192,18 @@ class App:
         for item in tree.get_children():
             tree.delete(item)
         open_visits = 0
+        hidden_stale = 0
+        show_stale = self.stale_visible()
         for visit in self.store.visits(300):
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
             left = parse_iso(visit.get("left_at"))
+            # Открытая стоянка судна, которое давно молчит, — не факт, а догадка:
+            # оно могло уйти незамеченным. Без галочки «устаревшие» не показываем.
+            if left is None and not show_stale and self.vessel_is_stale(vessel):
+                hidden_stale += 1
+                open_visits += 1
+                continue
             if left and entered:
                 stay = span_text((left - entered).total_seconds() / 3600)
             elif entered:
@@ -1212,7 +1232,8 @@ class App:
             f"Визитов в базе: {counts['visits']}, из них открыто сейчас: {open_visits}. "
             f"Источники: «наблюдение» — геозона порта по живому AIS (считается с момента "
             f"входа, время идёт по часам); «история» — трек за сутки и свои позиции "
-            f"за {self.config.get('history_days', 7)} дн.")
+            f"за {self.config.get('history_days', 7)} дн."
+            + self.hidden_stale_note(hidden_stale))
 
     def load_history_stays(self):
         if getattr(self, "_history_loading", False):
@@ -1299,10 +1320,16 @@ class App:
             else:
                 button.configure(text=f"{label} ({counts.get(name, {}).get('visits', 0)})")
         open_visits = 0
+        hidden_stale = 0
+        show_stale = self.stale_visible()
         for visit in rows:
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
             left = parse_iso(visit.get("left_at"))
+            if left is None and not show_stale and self.vessel_is_stale(vessel):
+                hidden_stale += 1
+                open_visits += 1
+                continue
             if left and entered:
                 stay = span_text((left - entered).total_seconds() / 3600)
             elif entered:
@@ -1331,7 +1358,8 @@ class App:
             f"Стоянок {where}: {len(rows)} (завершённых {left_count}, идут сейчас "
             f"{open_visits}). Портов в базе: {len(counts)}. Стоянки считаются по "
             f"геозоне порта; история из трека добавляется кнопкой «Загрузить из "
-            f"истории» во вкладке «Стоянки».")
+            f"истории» во вкладке «Стоянки»."
+            + self.hidden_stale_note(hidden_stale))
 
     def build_expected(self):
         tk, ttk = self.tk, self.ttk
@@ -1441,9 +1469,13 @@ class App:
             eta = row.get("eta") or "—"
             if eta_hours is not None and eta_hours < -12:
                 eta += f" (прошёл {span_text(abs(eta_hours))} назад)"
-            tags = ("old",) if hours is not None and hours > 12 else ()
-            if tags:
+            stale_row = hours is not None and hours > self.stale_limit_hours()
+            if stale_row:
                 stale_rows += 1
+                # сигнал старше порога — и ETA, и порт уже ничего не значат
+                if not self.stale_visible():
+                    continue
+            tags = ("old",) if stale_row else ()
             tree.insert("", "end", tags=tags, values=(
                 row.get("port"), row.get("name"), row.get("type") or "—",
                 eta, row.get("last_heard") or "—", row.get("mmsi"), local_stamp))
@@ -1465,9 +1497,11 @@ class App:
             info += f" Не ответили: {', '.join(failed)}."
         if missing:
             info += f" Нет страницы у AIS-catcher: {', '.join(missing)}."
-        if stale_rows:
-            info += (f" Серым — {stale_rows} судов без сигнала AIS дольше 12 ч: "
-                     f"их ETA уже не значит ничего.")
+        if stale_rows and self.stale_visible():
+            info += (f" Серым — {stale_rows} судов без сигнала AIS дольше "
+                     f"{self.stale_limit_hours():g} ч: их ETA уже не значит ничего.")
+        elif stale_rows:
+            info += self.hidden_stale_note(stale_rows)
         if cache.get("stale"):
             info += (" Сейчас страницы отдают 0 судов — показан прошлый список "
                      f"от {(cache.get('updated') or '—')[:16].replace('T', ' ')}.")
@@ -2171,9 +2205,15 @@ class App:
         self.redraw_map()
 
     def toggle_stale(self):
-        """Показать или скрыть суда с устаревшей позицией."""
+        """Показать или скрыть суда с устаревшей позицией.
+
+        Галочка общая для карты и таблиц: без неё на радаре и во вкладках
+        «Все суда», «В море», «Прогноз 4 дня», «Ожидаемые», «Стоянки»
+        остаются только суда, приславшие позицию не позже порога.
+        """
         self.radar.show_stale = bool(self.var_stale.get())
         self.redraw_map()
+        self.refresh_tab()
 
     def toggle_schematic(self):
         """Переключить схематический вид карты."""
@@ -2384,10 +2424,11 @@ class App:
             f"Осадка: {fmt_number(vessel.get('draft'))} м",
             f"В порту: {vessel.get('port') or '—'}",
             f"Координаты: {fmt_number(vessel.get('lat'))}, {fmt_number(vessel.get('lon'))}",
-            f"Обновлено: {self.fmt_time(vessel.get('updated_at'))}"
-            f" ({metrics.stale_note(vessel, self.core.stale_hours())})",
+            f"Обновлено: {self.fmt_time(core_module.position_stamp(vessel))}"
+            f" ({metrics.stale_note(dict(vessel, updated_at=core_module.position_stamp(vessel)),
+                                  self.core.stale_hours())})",
         ]
-        age = metrics.freshness_hours(vessel.get("updated_at"))
+        age = core_module.position_age_hours(vessel)
         if age is not None and age > self.core.stale_hours():
             lines.append(f"⚠ Данные устарели: AIS не поступал {span_text(age)}. "
                          f"Скорость, курс и позиция могут быть неактуальны — "
@@ -2760,6 +2801,34 @@ class App:
             return
         self.refresh_tab(tab)
 
+    def stale_visible(self) -> bool:
+        """Галочка «устаревшие»: показывать ли суда с давно устаревшей позицией."""
+        var = getattr(self, "var_stale", None)
+        return bool(var.get()) if var is not None else False
+
+    def stale_limit_hours(self) -> float:
+        """Порог устаревания в часах — тот же, что у карты (по умолчанию 12 ч)."""
+        radar = getattr(self, "radar", None)
+        if radar is not None:
+            return radar.max_age_seconds() / 3600.0
+        try:
+            hours = float(self.config.get("sea_fresh_hours") or 12)
+        except (TypeError, ValueError):
+            hours = 12.0
+        return max(0.25, hours)
+
+    def vessel_is_stale(self, vessel) -> bool:
+        """Позиция судна старше порога (или времени позиции нет вовсе)."""
+        age = core_module.position_age_hours(vessel)
+        return age is None or age > self.stale_limit_hours()
+
+    def hidden_stale_note(self, count) -> str:
+        """Пояснение к скрытым устаревшим строкам — с той же галочкой, что на карте."""
+        if not count:
+            return ""
+        return (f" Скрыто устаревших (позиция старше {self.stale_limit_hours():g} ч): "
+                f"{count} — включите галочку «устаревшие» на карте, чтобы увидеть.")
+
     def refresh_tab(self, tab=None):
         """Обновляет данные выбранной вкладки — при заходе и по кнопке."""
         if tab is None:
@@ -2875,14 +2944,21 @@ class App:
             self.log(f"Список «Все суда»: {error}")
             vessels = []
         radius = self.core.area_radius_km()
+        hidden_stale = 0
+        show_stale = self.stale_visible()
         for vessel in vessels:
             mmsi = str(vessel.get("mmsi"))
             seen.add(mmsi)
             info = expected_map.get(mmsi)
             # судно из AIS-catcher: координат у него нет, вместо расчёта — заявленный ETA
             no_position = info and (vessel.get("lat") is None or vessel.get("lon") is None)
+            # Без галочки «устаревшие» строки с давно устаревшей позицией не
+            # показываем: цифры в них уже ничего не значат.
+            if not show_stale and self.vessel_is_stale(vessel):
+                hidden_stale += 1
+                continue
             tags = (vessel["mmsi"],)
-            age = metrics.freshness_hours(vessel.get("updated_at"))
+            age = core_module.position_age_hours(vessel)
             if age is not None and age > self.core.stale_hours():
                 tags = (vessel["mmsi"], "stale")
             tree.insert("", "end", tags=tags, values=(
@@ -2901,13 +2977,17 @@ class App:
                     vessel, self.core.stale_hours()) or "—"),
                 "ожидается" if no_position else self.port_text(vessel),
                 (f"сигнал {info.get('last_heard') or '—'} · AIS-catcher {updated}"
-                 if no_position else self.fmt_time(vessel.get("updated_at"))),
+                 if no_position else self.fmt_time(core_module.position_stamp(vessel))),
                 vessel.get("mmsi"),
             ))
         # Если база ещё не успела принять список — показываем строки напрямую.
         for row in rows:
             mmsi = str(row.get("mmsi") or "")
             if not mmsi or mmsi in seen:
+                continue
+            heard = self._heard_hours(row.get("last_heard"))
+            if not show_stale and heard is not None and heard > self.stale_limit_hours():
+                hidden_stale += 1
                 continue
             seen.add(mmsi)
             tree.insert("", "end", tags=(mmsi,), values=(
@@ -2933,8 +3013,9 @@ class App:
                 f"Судов в базе района: {len(vessels)} (с позицией {near}), "
                 f"ожидаемых из AIS-catcher: {len(rows)}. Радиус района: {radius:.0f} км "
                 f"от каждого порта — меняется во вкладке «Фильтры». Суда без связи с "
-                f"портами дольше двух суток убираются из базы и с карты. "
-                f"Обновляется само; двойной щелчок открывает карточку.")
+                f"портами дольше двух суток убираются из базы и с карты."
+                + self.hidden_stale_note(hidden_stale)
+                + " Обновляется само; двойной щелчок открывает карточку.")
 
     def refresh_sea_table(self):
         """Обновляет вкладку «В море»: только свежие позиции вне портов."""
@@ -2953,7 +3034,13 @@ class App:
         except Exception:
             visit_ports = {}
         linked = []
+        show_stale = self.stale_visible()
+        hidden_stale = 0
         for vessel in rows:
+            # без галочки «устаревшие» — только те, кто прислал позицию недавно
+            if not show_stale and self.vessel_is_stale(vessel):
+                hidden_stale += 1
+                continue
             try:
                 vessel["links"] = self.core.vessel_links(vessel, visit_ports)
             except Exception:
@@ -3012,7 +3099,7 @@ class App:
                 self.course_text(vessel),
                 distance,
                 self.arrival_text(voyage),
-                self.fmt_time(vessel.get("updated_at")),
+                self.fmt_time(core_module.position_stamp(vessel)),
                 vessel.get("mmsi"),
             ))
         try:
@@ -3028,7 +3115,8 @@ class App:
             f"(под ходом {moved}, на рейде/якоре {len(rows) - moved}). "
             f"Из них далеко от порта (только по Destination или визиту): {far}. "
             f"Не показываются: {hidden} чужих судов района."
-            f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
+            + self.hidden_stale_note(hidden_stale)
+            + f" Без сигнала AIS: {len(silent)} — они остаются во вкладке «Все суда». "
             f"Обновляется само; двойной щелчок открывает карточку.")
 
     def course_text(self, vessel):

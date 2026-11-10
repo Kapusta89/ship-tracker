@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS vessels (
     heading     INTEGER,
     port        TEXT,
     updated_at  TEXT,
+    position_at TEXT,
     first_seen  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vessels_seen ON vessels (updated_at);
@@ -102,7 +103,8 @@ FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "
 # Колонки, добавленные позже: старые базы дополняются при открытии.
 MIGRATIONS = {
     "vessels": (("eta_declared", "TEXT"), ("length_m", "REAL"), ("beam_m", "REAL"),
-                ("draft_min", "REAL"), ("draft_max", "REAL"), ("tracked", "INTEGER")),
+                ("draft_min", "REAL"), ("draft_max", "REAL"), ("tracked", "INTEGER"),
+                ("position_at", "TEXT")),
     "port_visits": (("draft_in", "REAL"), ("draft_out", "REAL"),
                     ("cargo_kind", "TEXT"), ("source", "TEXT")),
 }
@@ -141,6 +143,15 @@ class Store:
             for name, sql_type in columns:
                 if name not in existing:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+        # Время последней ПОЗИЦИИ отдельно от updated_at: обогащение паспорта
+        # (GFW, карточки сервисов) обновляет запись, но позицию не двигает, и
+        # старое судно выглядело свежим. Восстанавливаем время из журнала позиций.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vessels_position ON vessels (position_at)")
+        self.conn.execute(
+            "UPDATE vessels SET position_at = COALESCE("
+            " (SELECT MAX(p.ts) FROM positions p WHERE p.mmsi = vessels.mmsi),"
+            " updated_at) WHERE position_at IS NULL OR position_at = ''")
 
     # ------------------------------------------------------------------ суда
     def upsert_static(self, mmsi: str, **values):
@@ -177,13 +188,14 @@ class Store:
         ts = iso(when)
         with self._lock, self.conn:
             self.conn.execute(
-                """INSERT INTO vessels (mmsi, lat, lon, sog, cog, heading, port, updated_at, first_seen)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO vessels (mmsi, lat, lon, sog, cog, heading, port, updated_at,
+                                        position_at, first_seen)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(mmsi) DO UPDATE SET
                        lat = excluded.lat, lon = excluded.lon, sog = excluded.sog,
                        cog = excluded.cog, heading = excluded.heading, port = excluded.port,
-                       updated_at = excluded.updated_at""",
-                (mmsi, lat, lon, sog, cog, heading, port, ts, ts),
+                       updated_at = excluded.updated_at, position_at = excluded.position_at""",
+                (mmsi, lat, lon, sog, cog, heading, port, ts, ts, ts),
             )
 
     def add_position(self, mmsi: str, lat: float, lon: float, sog=None, cog=None, when=None):

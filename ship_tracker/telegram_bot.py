@@ -21,6 +21,7 @@ import importlib
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -51,12 +52,20 @@ PLAN_BUTTON = "📅 Прогноз 4 дня"
 EXPECTED_BUTTON = "⏱ Ожидаемые"
 ALERTS_BUTTON = "🚨 Алерты"
 SOURCES_BUTTON = "🔌 Источники"
+CONNECTION_BUTTON = "🔑 Подключение"
+FILTERS_BUTTON = "🎛 Фильтры"
+TELEGRAM_BUTTON = "🤖 Telegram"
+SERVICES_BUTTON = "🛠 Сервисы"
+LOG_BUTTON = "📜 Журнал"
 
-# Пункты меню — те же, что вкладки в приложении
+# Пункты меню — те же, что вкладки в приложении (порядок как у вкладок)
 MENU_BUTTONS: List[str] = [
     MAP_BUTTON, ALL_BUTTON, SEA_BUTTON, PLAN_BUTTON, VISITS_BUTTON,
-    HISTORY_BUTTON, EXPECTED_BUTTON, ALERTS_BUTTON, SOURCES_BUTTON,
+    HISTORY_BUTTON, EXPECTED_BUTTON, ALERTS_BUTTON, CONNECTION_BUTTON,
+    FILTERS_BUTTON, TELEGRAM_BUTTON, SERVICES_BUTTON, LOG_BUTTON, SOURCES_BUTTON,
 ]
+
+STARTED_AT = datetime.now()
 
 DEFAULT_PORT_NAMES: List[str] = [
     "RENI", "IZMAIL", "VYLKOVE", "CHORNOMORSK", "ODESSA", "YUZHNY",
@@ -125,7 +134,9 @@ def make_port_keyboard() -> ReplyKeyboardMarkup:
         builder.button(text=name)
     for text in MENU_BUTTONS:
         builder.button(text=text)
-    builder.adjust(2)
+    # по три кнопки в ряд: портов и пунктов меню стало много, иначе
+    # клавиатура занимает весь экран
+    builder.adjust(3)
     return builder.as_markup(resize_keyboard=True)
 
 
@@ -676,6 +687,11 @@ async def cmd_help(message: Message):
         "🚨 /alerts — журнал алертов: что отправлено и с каким результатом.\n"
         "🚢 /vessel MMSI или название — карточка любого судна.\n"
         "🔌 /sources — подключения и проверка источников (живы ли и читаются ли).\n"
+        "🔑 /connection — какие каналы и ключи настроены (без самих ключей).\n"
+        "🎛 /filters — текущие фильтры: порты, окно рейса, скорость, пороги устаревания.\n"
+        "🤖 /status — состояние бота: чаты, включён ли приём команд, база.\n"
+        "🛠 /services — сервисы и ссылки для проверки судов.\n"
+        "📜 /log — последние строки журнала бота.\n"
         "/start — вернуть клавиатуру портов и меню.",
         reply_markup=make_port_keyboard(),
     )
@@ -857,10 +873,16 @@ async def cmd_sea(message: Message):
     except Exception as error:
         await message.answer(f"Список судов в море недоступен: {error}")
         return
+    limit = _fresh_limit_hours(reload_config())
+    # В приложении вкладка «В море» без галочки «устаревшие» показывает только
+    # свежие позиции — в боте то же правило.
+    stale_count = sum(1 for vessel in vessels if _is_stale(vessel, limit))
+    vessels = [vessel for vessel in vessels if not _is_stale(vessel, limit)]
     moved = sum(1 for vessel in vessels if vessel.get("underway"))
     lines = ["🌊 <b>Суда в море сейчас</b>",
              f"Всего: <b>{len(vessels)}</b> (под ходом {moved}, "
-             f"на рейде/якоре {len(vessels) - moved}).",
+             f"на рейде/якоре {len(vessels) - moved})."
+             + (f" Устаревших позиций скрыто: {stale_count}." if stale_count else ""),
              "Позиции собраны всеми каналами: AISStream, Open Waters, снимок района "
              "(включая Средиземное море) и глобальное слежение по MMSI. Сюда попадают "
              "и суда с нашим портом в Destination за 1000 км от него."]
@@ -900,7 +922,12 @@ async def cmd_plan(message: Message):
         except Exception:
             opens = {}
         result = []
+        limit = _fresh_limit_hours(reload_config())
         for vessel in core.related_vessels(3000):
+            # план по устаревшей позиции — фантазия: как и в приложении,
+            # без галочки «устаревшие» такие суда в расчёт не берём
+            if _is_stale(vessel, limit):
+                continue
             mmsi = str(vessel.get("mmsi"))
             port = core.destination_port(vessel)
             if not port:
@@ -962,6 +989,21 @@ async def cmd_plan(message: Message):
     await message.answer(text, disable_web_page_preview=True)
 
 
+def _fresh_limit_hours(config: dict) -> float:
+    """Порог устаревания — тот же, что у карты и вкладок приложения."""
+    try:
+        return max(0.25, float(config.get("sea_fresh_hours") or 12))
+    except (TypeError, ValueError):
+        return 12.0
+
+
+def _is_stale(vessel: dict, limit_hours: float) -> bool:
+    """Позиция старше порога: такие суда приложение без галочки не показывает."""
+    core_module = _import("core")
+    age = _age_hours(core_module.position_stamp(vessel))
+    return age is None or age > limit_hours
+
+
 def _age_hours(value) -> Optional[float]:
     """Сколько часов прошло с момента в базе — для отметки устаревших."""
     store_module = _import("store")
@@ -991,17 +1033,15 @@ async def cmd_all(message: Message):
         stale_hours = max(0.0, float(config.get("stale_minutes") or 15)) / 60.0
     except (TypeError, ValueError):
         stale_hours = 0.25
+    limit = _fresh_limit_hours(config)
     with_pos = sum(1 for vessel in vessels if vessel.get("lat") is not None)
-    fresh = 0
-    for vessel in vessels:
-        age = _age_hours(vessel.get("updated_at"))
-        if age is None or age <= stale_hours:
-            fresh += 1
+    board = [vessel for vessel in vessels if not _is_stale(vessel, limit)]
+    stale_count = len(vessels) - len(board)
     lines = ["🚢 <b>Все суда</b>",
              f"В базе: <b>{len(vessels)}</b>, с позицией: {with_pos}, "
              f"без позиции: {len(vessels) - with_pos}.",
-             f"Свежие (AIS не старше {int(stale_hours * 60)} мин): <b>{fresh}</b> · "
-             f"устаревшие: {len(vessels) - fresh}.", ""]
+             f"С позицией не старше {limit:g} ч: <b>{len(board)}</b> · "
+             f"устаревших скрыто: {stale_count}", ""]
 
     kinds: dict = {}
     for vessel in vessels:
@@ -1021,8 +1061,8 @@ async def cmd_all(message: Message):
         lines.append("<b>Назначение</b>: " + ", ".join(f"{name} — {count}"
                                                     for name, count in top_dest))
     lines.append("")
-    lines.append(f"<b>Последние {min(25, len(vessels))} по времени AIS</b>")
-    for vessel in vessels[:25]:
+    lines.append(f"<b>Последние {min(25, len(board))} по времени AIS</b>")
+    for vessel in board[:25]:
         name = html.escape(str(vessel.get("name") or f"MMSI {vessel.get('mmsi')}"))
         tail = [html.escape(str(vessel.get("type_label") or "—"))]
         if vessel.get("destination"):
@@ -1033,7 +1073,7 @@ async def cmd_all(message: Message):
         except (TypeError, ValueError):
             value = 0.0
         tail.append(f"{value:.1f} уз" if value > 0.5 else "без хода")
-        age = _age_hours(vessel.get("updated_at"))
+        age = _age_hours(core_module.position_stamp(vessel))
         if age is not None:
             tail.append(core_module.span_text(age) + " назад")
         stale = age is not None and age > stale_hours
@@ -1057,8 +1097,19 @@ async def cmd_visits(message: Message):
         await message.answer(f"Стоянки недоступны: {error}")
         return
     current = [visit for visit in visits if not visit.get("left_at")]
+    # открытая стоянка судна без свежей позиции — догадка: оно могло уйти незамеченным
+    limit = _fresh_limit_hours(reload_config())
+    kept = []
+    for visit in current:
+        if _is_stale(store.vessel(visit.get("mmsi")) or {}, limit):
+            continue
+        kept.append(visit)
+    stale_current = len(current) - len(kept)
+    current = kept
     lines = ["⚓ <b>Стоянки сейчас</b>",
-             f"Открытых стоянок: <b>{len(current)}</b> из {len(visits)} в базе.", ""]
+             f"Открытых стоянок: <b>{len(current)}</b> из {len(visits)} в базе."
+             + (f" Скрыто по устаревшей позиции: {stale_current}." if stale_current else ""),
+             ""]
     if not current:
         lines.append("Сейчас никто из наблюдаемых судов не стоит в наших портах.")
     groups: dict = {}
@@ -1378,6 +1429,196 @@ async def expected_watcher(bot: Bot) -> None:
         await asyncio.sleep(120)
 
 
+# ── остальные вкладки приложения: подключение, фильтры, Telegram,
+#    сервисы и журнал ────────────────────────────────────────────────────────
+def _app_version() -> str:
+    """Версия приложения из ship_tracker.py — без импорта Tk-модуля."""
+    try:
+        text = (BASE_DIR / "ship_tracker.py").read_text(encoding="utf-8")
+    except OSError:
+        return "—"
+    found = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', text)
+    return found.group(1) if found else "—"
+
+
+def _key_state(config: dict, key: str) -> str:
+    """«ключ задан» или «нет ключа» — сам ключ в чат не отправляется."""
+    return "ключ задан" if (config.get(key) or "").strip() else "нет ключа"
+
+
+def _num(value) -> str:
+    """Число из настроек без хвоста «.0»: 96.0 → 96, 17.5 → 17.5."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{number:g}"
+
+
+def _boxes_text(boxes) -> str:
+    """Район подписки человекопонятно: «40.5, 26.0 – 47.5, 42.0»."""
+    parts = []
+    try:
+        for box in boxes or []:
+            south, west = box[0][0], box[0][1]
+            north, east = box[1][0], box[1][1]
+            parts.append(f"{_num(south)}, {_num(west)} – {_num(north)}, {_num(east)}")
+    except (TypeError, IndexError, ValueError):
+        return str(boxes or "—")
+    return "; ".join(parts) or "—"
+
+
+async def cmd_connection(message: Message):
+    """Вкладка «Подключение»: какие каналы и ключи настроены (без значений)."""
+    config = reload_config()
+    lines = ["🔑 <b>Подключение</b>", "",
+             f"Версия приложения: {_app_version()}",
+             f"AISStream (живой поток): {_key_state(config, 'api_key')}"]
+
+    # 2. Остальные каналы
+    ow = "включён" if config.get("use_openwaters", True) else "выключен"
+    lines.append(f"Open Waters AIS: {ow}, {_key_state(config, 'openwaters_token')}")
+    snap = "включён" if config.get("use_snapshot", True) else "выключен"
+    lines.append(f"Снимок района: {snap}, каждые "
+                 f"{_num(config.get('snapshot_minutes', 10))} мин")
+    lines.append(f"Район подписки: {_boxes_text(config.get('bounding_boxes'))}")
+
+    # 3. Дополнительные сервисы
+    try:
+        services_feed = _import("services_feed")
+    except Exception:
+        services_feed = None
+    extras = []
+    for key, fallback_title in (("vf", "VesselFinder"), ("vfa", "VesselFinder API"),
+                                ("mt", "MarineTraffic"), ("mst", "MyShipTracking"),
+                                ("dt", "Digitraffic"), ("gor", "Goradar"),
+                                ("mlive", "MarineTraffic.live"), ("srd", "Ship Radar 24"),
+                                ("aci", "AIS-catcher (ожидаемые)"),
+                                ("gfw", "Global Fishing Watch"),
+                                ("dat", "Datalastic"), ("aishub", "AISHub")):
+        enabled = bool(config.get(f"use_{key}"))
+        title = (services_feed.SERVICE_TITLES.get(key, fallback_title)
+                 if services_feed else fallback_title)
+        state = "включён" if enabled else "выключен"
+        if enabled and services_feed and services_feed.needs_key(key):
+            api_key = (config.get(f"{key}_key") or "").strip()
+            if key == "vfa" and not api_key:
+                api_key = (config.get("vf_key") or "").strip()
+            state += f", {'ключ задан' if api_key else 'нужен ключ'}"
+        extras.append(f"• {title} — {state}")
+    if extras:
+        lines.append("")
+        lines.append("<b>Дополнительные сервисы</b>")
+        lines += extras
+
+    ports = config.get("ports") or []
+    lines.append("")
+    lines.append(f"Портов отслеживается: {len(ports)} — "
+                 + ", ".join((port.get("name") or "").upper() for port in ports))
+    lines.append("Ключи и токены в чат не отправляются: они меняются во вкладке "
+                 "«Подключение» в приложении.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_filters(message: Message):
+    """Вкладка «Фильтры»: текущие настройки одним сообщением."""
+    config = reload_config()
+    ports = [(port.get("name") or "").upper() for port in (config.get("ports") or [])]
+    dests = [str(name).upper() for name in (config.get("filter_destinations") or [])]
+    origs = [str(name).upper() for name in (config.get("filter_origins") or [])]
+    stale = config.get("stale_minutes", 15)
+    fresh = config.get("sea_fresh_hours", 12)
+    lines = ["🎛 <b>Фильтры</b>", "",
+             "Порты: " + (", ".join(ports) if ports else "—"),
+             "Идут в порты: " + (", ".join(dests) if dests else "все"),
+             "Только из портов: " + (", ".join(origs) if origs else "любые"),
+             f"Окно рейса: {_num(config.get('trip_window_hours', 96))} ч",
+             f"Минимальный ход: {_num(config.get('min_speed_knots', 2))} уз",
+             f"Пауза повтора алерта: {_num(config.get('alert_cooldown_hours', 6))} ч",
+             f"Хранить историю: {_num(config.get('history_days', 7))} дн",
+             f"Точка в базу раз в: {_num(config.get('position_interval_seconds', 60))} с",
+             f"Бледным на карте: старше {_num(stale)} мин",
+             f"Устаревшие (скрыты без галочки): старше {_num(fresh)} ч",
+             f"Радиус интереса: {_num(config.get('port_watch_km', 50))} км",
+             f"Район вокруг портов: {_num(config.get('area_radius_km', 900))} км"]
+    lines.append("")
+    lines.append("Меняются во вкладке «Фильтры» в приложении; там же галочка «устаревшие» "
+                 "на карте показывает и устаревшие строки во всех списках.")
+    await message.answer("\n".join(lines))
+
+
+async def cmd_telegram(message: Message):
+    """Вкладка «Telegram»: состояние бота и чаты, куда он пишет."""
+    config = reload_config()
+    core_module = _import("core")
+    chats = core_module.parse_chat_ids(config.get("telegram_chat_id"))
+    started = globals().get("STARTED_AT")
+    uptime = "—"
+    if started:
+        hours = (datetime.now() - started).total_seconds() / 3600
+        uptime = core_module.span_text(hours)
+    lines = ["🤖 <b>Telegram</b>", "",
+             f"Токен: {_key_state(config, 'telegram_token')}",
+             f"Команды принимаются: "
+             + ("да" if config.get("telegram_commands", True) else "нет"),
+             f"Чатов в настройках: {len(chats)}"
+             + (" — " + ", ".join(chats) if chats else ""),
+             f"Бот работает: {uptime}, PID {os.getpid()}",
+             f"Меню команд: {len(BOT_COMMANDS)} — полный список в /help",
+             "Запускается вместе с приложением и закрывается вместе с ним; "
+             "второй экземпляр не стартует (data/bot.lock)."]
+    try:
+        counts = get_store().counts()
+        lines.append(f"База: судов {counts.get('vessels', 0)}, позиций "
+                     f"{counts.get('positions', 0)}, визитов {counts.get('visits', 0)}.")
+    except Exception:
+        pass
+    lines.append(f"Журнал бота: data/bot_run.log — смотрите /log.")
+    await message.answer("\n".join(lines))
+
+
+async def cmd_services(message: Message):
+    """Вкладка «Сервисы»: те же ссылки, что в приложении."""
+    lines = ["🛠 <b>Сервисы</b>", ""]
+    lines.append("<b>Онлайн-сервисы (карточки судов)</b>")
+    for name, url in (("VesselFinder", "https://www.vesselfinder.com/"),
+                      ("MarineTraffic", "https://www.marinetraffic.com/"),
+                      ("MyShipTracking", "https://www.myshiptracking.com/"),
+                      ("Equasis", "https://www.equasis.org/"),
+                      ("IMO GISIS", "https://gisis.imo.org/"),
+                      ("Open Waters", "https://openwaters.io/ais/")):
+        lines.append(f'• <a href="{url}">{name}</a>')
+    lines.append("")
+    lines.append("<b>AIS-потоки и десктоп</b>")
+    for name, url in (("Open Waters AIS", "https://openwaters.io/ais/"),
+                      ("AISHub", "https://www.aishub.net/"),
+                      ("Digitraffic", "https://www.digitraffic.fi/en/marine-traffic/"),
+                      ("OpenCPN", "https://opencpn.org/"),
+                      ("AIS-catcher", "https://github.com/jvde-github/AIS-catcher"),
+                      ("AIS Dispatcher", "https://www.aishub.net/ais-dispatcher")):
+        lines.append(f'• <a href="{url}">{name}</a>')
+    lines.append("")
+    lines.append("Карточка любого судна — /vessel MMSI или название; "
+                 "какие потоки включены — /sources.")
+    await message.answer("\n".join(lines), disable_web_page_preview=True)
+
+
+async def cmd_log(message: Message):
+    """Вкладка «Журнал»: последние строки журнала бота."""
+    path = BASE_DIR / "data" / "bot_run.log"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        await message.answer(f"📜 Журнал недоступен: {error}")
+        return
+    rows = [row.strip() for row in text.splitlines() if row.strip()][-25:]
+    body = "\n".join(html.escape(row) for row in rows) or "Журнал пуст."
+    if len(body) > 3400:
+        body = body[-3400:]
+    await message.answer(f"📜 <b>Журнал бота</b> (последние {len(rows)} строк)\n"
+                         f"<pre>{body}</pre>")
+
+
 async def fallback(message: Message):
     await message.answer("Выберите порт:", reply_markup=make_port_keyboard())
 
@@ -1400,6 +1641,11 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_vessel, Command("vessel"))
     dp.message.register(cmd_map, Command("map"))
     dp.message.register(cmd_sources, Command("sources"))
+    dp.message.register(cmd_connection, Command("connection"))
+    dp.message.register(cmd_filters, Command("filters"))
+    dp.message.register(cmd_telegram, Command("status"))
+    dp.message.register(cmd_services, Command("services"))
+    dp.message.register(cmd_log, Command("log"))
     # кнопки меню — те же пункты, что вкладки в приложении
     dp.message.register(cmd_map, F.text == MAP_BUTTON)
     dp.message.register(cmd_all, F.text == ALL_BUTTON)
@@ -1410,6 +1656,11 @@ def make_dispatcher() -> Tuple[Bot, Dispatcher]:
     dp.message.register(cmd_expected, F.text == EXPECTED_BUTTON)
     dp.message.register(cmd_alerts, F.text == ALERTS_BUTTON)
     dp.message.register(cmd_sources, F.text == SOURCES_BUTTON)
+    dp.message.register(cmd_connection, F.text == CONNECTION_BUTTON)
+    dp.message.register(cmd_filters, F.text == FILTERS_BUTTON)
+    dp.message.register(cmd_telegram, F.text == TELEGRAM_BUTTON)
+    dp.message.register(cmd_services, F.text == SERVICES_BUTTON)
+    dp.message.register(cmd_log, F.text == LOG_BUTTON)
     dp.message.register(handle_port, F.text.in_(DEFAULT_PORT_NAMES))
     dp.message.register(fallback)
     return bot, dp
@@ -1427,6 +1678,11 @@ BOT_COMMANDS: List[Tuple[str, str]] = [
     ("expected", "ожидаемые прибытия"),
     ("alerts", "журнал алертов"),
     ("vessel", "карточка судна по MMSI или названию"),
+    ("connection", "какие каналы и ключи настроены"),
+    ("filters", "текущие фильтры и пороги"),
+    ("status", "состояние бота, чаты, база"),
+    ("services", "сервисы и ссылки для проверки судов"),
+    ("log", "последние строки журнала"),
     ("sources", "подключения и источники"),
     ("help", "справка"),
 ]
