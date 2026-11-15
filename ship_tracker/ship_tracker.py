@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.28"
+APP_VERSION = "2026.12.29"
 
 import ais_feed
 import analysis
@@ -2955,6 +2955,19 @@ class App:
             f"Тип: {ais_feed.type_detail(vessel.get('type_code'))} "
             f"(код AIS {vessel.get('type_code')}, {vessel.get('type_label') or '—'})",
             f"Назначение: {vessel.get('destination') or '—'}",
+        ]
+        # история поля Destination: капитан меняет его в AIS, и порт в карточке
+        # может «переехать» — без этой строки выглядит как ошибка программы
+        try:
+            changes = self.store.destination_changes(mmsi, 5)
+        except Exception:
+            changes = []
+        if changes:
+            history = "; ".join(
+                f"{item['old'] or '—'} → {item['new']} ({self.fmt_time(item['at'])})"
+                for item in reversed(changes))
+            lines.append(f"  назначение менялось: {history}")
+        lines += [
             f"Скорость: {fmt_number(vessel.get('sog'))} уз",
             f"Размеры: {self.size_text(vessel)} (длина × ширина)",
             f"Курс: {fmt_number(vessel.get('cog'))}°",

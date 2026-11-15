@@ -2254,6 +2254,13 @@ class RadarCore:
         )
         self.store.set_tracked(mmsi, True)
         after = self.store.vessel(mmsi)
+        if after and before is not None:
+            # капитан правит Destination на ходу: пишем в журнал, чтобы было
+            # видно, почему в карточке был один порт, а стал другой
+            old_dest = str(before.get("destination") or "").strip()
+            new_dest = str(after.get("destination") or "").strip()
+            if old_dest and new_dest and old_dest.upper() != new_dest.upper():
+                self.log(f"Назначение {after.get('name') or mmsi}: {old_dest} → {new_dest}.")
         if after and (before is None or before.get("name") != after.get("name")):
             self.log(f"Новое судно: {after.get('name') or mmsi} "
                      f"({after.get('type_label') or 'тип неизвестен'}), "

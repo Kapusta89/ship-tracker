@@ -94,6 +94,18 @@ CREATE TABLE IF NOT EXISTS sea_traffic (
     updated_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sea_traffic_seen ON sea_traffic (updated_at);
+
+-- История поля Destination: капитан правит его в AIS, и судно может
+-- «переехать» из одного порта в другой. Без этой таблицы видно только
+-- последнее значение, и непонятно, почему в карточке был другой порт.
+CREATE TABLE IF NOT EXISTS destination_changes (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    mmsi     TEXT NOT NULL,
+    old_dest TEXT,
+    new_dest TEXT NOT NULL,
+    at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dest_changes_mmsi ON destination_changes (mmsi, id);
 """
 
 FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "draft",
@@ -163,7 +175,18 @@ class Store:
         except (TypeError, ValueError):
             draft = None
         with self._lock, self.conn:
-            row = self.conn.execute("SELECT mmsi FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
+            row = self.conn.execute("SELECT mmsi, destination FROM vessels WHERE mmsi = ?",
+                                    (mmsi,)).fetchone()
+            # назначение меняется на глазах: пишем каждое изменение, иначе
+            # в карточке остаётся только последний порт без объяснений
+            new_destination = str(data.get("destination") or "").strip()
+            old_destination = str(row[1] or "").strip() if row else ""
+            if (new_destination and old_destination
+                    and new_destination.upper() != old_destination.upper()):
+                self.conn.execute(
+                    "INSERT INTO destination_changes (mmsi, old_dest, new_dest, at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (mmsi, old_destination, new_destination, now))
             if row is None:
                 columns = ["mmsi", "first_seen", "updated_at", *data.keys()]
                 params = [mmsi, now, now, *data.values()]
@@ -182,6 +205,18 @@ class Store:
                     "UPDATE vessels SET draft_min = MIN(COALESCE(draft_min, ?), ?), "
                     "draft_max = MAX(COALESCE(draft_max, ?), ?) WHERE mmsi = ?",
                     (draft, draft, draft, draft, mmsi))
+
+    def destination_changes(self, mmsi, limit=5) -> list:
+        """Последние изменения поля Destination: [{old, new, at}], новые сверху."""
+        try:
+            with self._lock:
+                rows = self.conn.execute(
+                    "SELECT old_dest, new_dest, at FROM destination_changes "
+                    "WHERE mmsi = ? ORDER BY id DESC LIMIT ?",
+                    (str(mmsi), int(limit))).fetchall()
+        except Exception:
+            return []
+        return [{"old": row[0], "new": row[1], "at": row[2]} for row in rows]
 
     def upsert_position(self, mmsi: str, lat: float, lon: float, sog=None, cog=None,
                         heading=None, port=None, when=None):
