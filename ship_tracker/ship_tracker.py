@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.32"
+APP_VERSION = "2026.12.33"
 
 import ais_feed
 import analysis
@@ -2968,17 +2968,31 @@ class App:
                 for item in reversed(changes))
             lines.append(f"  назначение менялось: {history}")
         try:
-            usual = self.store.usual_port(mmsi)
-        except Exception:
-            usual = None
-        if usual and usual.get("port"):
-            port = self.core.port_by_name(usual["port"])
-            if port and port.get("lat") is not None and port.get("lon") is not None:
-                where = f"{float(port['lat']):.4f}, {float(port['lon']):.4f}"
-            else:
-                where = "координаты не заданы"
-            lines.append(f"Чаще всего разгружался: {usual['port']} ({where}) — "
-                         f"стоянок {usual['visits']} по истории")
+            berth = self.core.usual_berth(mmsi)
+        except Exception as error:
+            berth = None
+            self.log(f"Причал по истории: {error}")
+        if berth:
+            spread = f", разброс {berth['spread_m']:.0f} м" if berth.get("spread_m") else ""
+            lines.append(
+                f"Чаще всего разгружался: причал {berth['port']} "
+                f"({berth['lat']:.5f}, {berth['lon']:.5f}) — "
+                f"стоянок {berth['visits']}{spread}")
+        else:
+            # своих точек за стоянки нет — показываем хотя бы центр порта
+            try:
+                usual = self.store.usual_port(mmsi)
+            except Exception:
+                usual = None
+            if usual and usual.get("port"):
+                port = self.core.port_by_name(usual["port"])
+                if port and port.get("lat") is not None and port.get("lon") is not None:
+                    where = f"{float(port['lat']):.4f}, {float(port['lon']):.4f}"
+                else:
+                    where = "координаты не заданы"
+                lines.append(f"Чаще всего разгружался: {usual['port']} ({where}) — "
+                             f"стоянок {usual['visits']}; точное место стоянки "
+                             f"в истории не сохранилось, это центр порта")
         lines += [
             f"Скорость: {fmt_number(vessel.get('sog'))} уз",
             f"Размеры: {self.size_text(vessel)} (длина × ширина)",

@@ -436,6 +436,18 @@ class Store:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
+    def positions_between(self, mmsi, start, end) -> list:
+        """Позиции судна за отрезок времени (для поиска причала по стоянкам)."""
+        try:
+            with self._lock:
+                rows = self.conn.execute(
+                    "SELECT ts, lat, lon, sog FROM positions WHERE mmsi = ? "
+                    "AND ts >= ? AND ts <= ? ORDER BY ts",
+                    (str(mmsi), str(start), str(end))).fetchall()
+        except Exception:
+            return []
+        return [dict(row) for row in rows]
+
     def usual_port(self, mmsi) -> dict | None:
         """Порт, где судно стояло чаще всего: {"port": имя, "visits": сколько}."""
         try:

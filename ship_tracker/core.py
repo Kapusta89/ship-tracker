@@ -2481,6 +2481,63 @@ class RadarCore:
             "key": f"{mmsi}|{departure['port']}|{dest_hit}",
         }
 
+    def usual_berth(self, mmsi, cluster_km=0.4):
+        """Причал, где судно стояло чаще всего — с его координатами.
+
+        По каждому визиту берутся свои позиции за время стоянки (ход не больше
+        0.5 уз), считается их центр; центры ближе `cluster_km` объединяются
+        в один причал. Возвращается причал с наибольшим числом стоянок:
+        {port, lat, lon, visits, spread_m}. Это координаты стоянки, а не
+        центра порта: у Измаила причалы разнесены на километры.
+        """
+        try:
+            visits = self.store.visits(60, mmsi=mmsi)
+        except Exception:
+            return None
+        clusters = []
+        for visit in visits:
+            started = visit.get("entered_at")
+            if not started:
+                continue
+            left = visit.get("left_at") or "9999-12-31T00:00:00"
+            try:
+                points = self.store.positions_between(mmsi, started, left)
+            except Exception:
+                points = []
+            still = []
+            for point in points:
+                try:
+                    sog = float(point.get("sog") or 0)
+                except (TypeError, ValueError):
+                    sog = 0.0
+                if sog <= 0.5 and point.get("lat") is not None and point.get("lon") is not None:
+                    still.append(point)
+            if not still:
+                # стоянка из истории трека: своих точек нет, берём место визита
+                if visit.get("lat") is None or visit.get("lon") is None:
+                    continue
+                still = [{"lat": visit["lat"], "lon": visit["lon"]}]
+            lat = sum(float(p["lat"]) for p in still) / len(still)
+            lon = sum(float(p["lon"]) for p in still) / len(still)
+            for cluster in clusters:
+                if geo.haversine_km(lat, lon, cluster["lat"], cluster["lon"]) <= cluster_km:
+                    n = cluster["n"] + 1
+                    cluster["lat"] = (cluster["lat"] * cluster["n"] + lat) / n
+                    cluster["lon"] = (cluster["lon"] * cluster["n"] + lon) / n
+                    cluster["n"] = n
+                    cluster["points"].append((lat, lon))
+                    break
+            else:
+                clusters.append({"port": visit.get("port"), "lat": lat, "lon": lon,
+                                 "n": 1, "points": [(lat, lon)]})
+        if not clusters:
+            return None
+        best = max(clusters, key=lambda cluster: cluster["n"])
+        spread = max((geo.haversine_km(best["lat"], best["lon"], lat, lon) * 1000.0
+                      for lat, lon in best["points"]), default=0.0)
+        return {"port": best["port"], "lat": best["lat"], "lon": best["lon"],
+                "visits": best["n"], "spread_m": spread}
+
     def port_by_name(self, name):
         """Наш порт из настроек по имени или подписи (для координат в карточке)."""
         wanted = str(name or "").strip().upper()
