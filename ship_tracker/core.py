@@ -1538,38 +1538,6 @@ class RadarCore:
 
         return self._cached_selection(("related", limit), select)
 
-    def area_vessels(self, limit=2000) -> list:
-        """Все суда района — в радиусе `area_radius_km` от любого нашего порта.
-
-        В базу такие суда уже пишутся (проверка района есть при сохранении),
-        поэтому здесь достаточно отдать записи: они и есть «все суда» вкладки.
-        """
-        def select():
-            try:
-                rows = self.store.vessels(limit)
-            except Exception:
-                return []
-            radius = self.area_radius_km()
-            ports = self.config.get("ports") or []
-            result = []
-            for row in rows:
-                lat, lon = row.get("lat"), row.get("lon")
-                if lat is None or lon is None:
-                    result.append(row)
-                    continue
-                if self._vessel_related(row.get("mmsi"), lat, lon, row, area=True):
-                    result.append(row)
-                    continue
-                nearest = min((geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
-                               for port in ports
-                               if port.get("lat") is not None and port.get("lon") is not None),
-                              default=None)
-                if nearest is not None and nearest <= radius:
-                    result.append(row)
-            return result
-
-        return self._cached_selection(("area", limit), select, seconds=3.0)
-
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
 
