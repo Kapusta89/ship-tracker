@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.33"
+APP_VERSION = "2026.12.34"
 
 import ais_feed
 import analysis
@@ -1323,7 +1323,8 @@ class App:
                    command=lambda: self.refresh_now(self.tab_forecast_all)).pack(side="right")
         self.forecast_all_tree = self.make_tree(
             frame, (("name", "Судно", 170), ("type", "Тип", 110),
-                    ("port", "Порт", 175), ("dest", "Назначение AIS", 130),
+                    ("port", "Порт", 175), ("berth", "Частый причал", 190),
+                    ("dest", "Назначение AIS", 130),
                     ("speed", "Ход", 80), ("distance", "До порта", 100),
                     ("eta", "Прибытие", 170),
                     ("day1", "Через день", 150), ("day2", "Через 2 дня", 150),
@@ -1425,10 +1426,20 @@ class App:
                 port_label += " (по курсу)"
                 guessed_count += 1
             computed = "≈" if "трек" in str(source) else ""
+            try:
+                berth = self.core.usual_berth(mmsi)
+            except Exception:
+                berth = None
+            if berth:
+                berth_text = (f"{berth['port']} {berth['lat']:.4f}, "
+                              f"{berth['lon']:.4f} ({berth['visits']})")
+            else:
+                berth_text = "—"
             collected.append((hours is None, hours or 0.0, (
                 vessel.get("name") or mmsi,
                 vessel.get("type_label") or "не указан",
                 port_label,
+                berth_text,
                 destination_text or "—",
                 f"{computed}{speed:.1f} уз" if moving else "0 уз",
                 f"{distance:.0f} км" if distance is not None else "—",
@@ -2974,10 +2985,11 @@ class App:
             self.log(f"Причал по истории: {error}")
         if berth:
             spread = f", разброс {berth['spread_m']:.0f} м" if berth.get("spread_m") else ""
+            basis = " по своему треку" if berth.get("source") == "трек" else ""
             lines.append(
                 f"Чаще всего разгружался: причал {berth['port']} "
                 f"({berth['lat']:.5f}, {berth['lon']:.5f}) — "
-                f"стоянок {berth['visits']}{spread}")
+                f"стоянок {berth['visits']}{spread}{basis}")
         else:
             # своих точек за стоянки нет — показываем хотя бы центр порта
             try:

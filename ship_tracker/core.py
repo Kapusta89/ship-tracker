@@ -2482,6 +2482,87 @@ class RadarCore:
         }
 
     def usual_berth(self, mmsi, cluster_km=0.4):
+        """Частый причал: сначала по записанным визитам, потом по своему треку."""
+        berth = self._berth_from_visits(mmsi, cluster_km)
+        if berth:
+            return berth
+        return self._berth_from_track(mmsi, cluster_km)
+
+    def _berth_from_track(self, mmsi, cluster_km=0.4, port_km=6.0):
+        """Причал по собственным позициям судна, когда визитов в базе нет.
+
+        Стоянкой считается серия точек с ходом не больше 0,5 уз не дальше
+        `port_km` от нашего порта; серия прерывается, если судно прошло
+        больше 0,5 уз или в AIS был пропуск больше получаса. Стоянки ближе
+        `cluster_km` считаются одним причалом.
+        """
+        try:
+            days = float(self.config.get("history_days") or 7)
+        except (TypeError, ValueError):
+            days = 7.0
+        # берём всю накопленную историю (но не больше месяца): стоянки бывают
+        # редко, и недельного окна часто не хватает, чтобы причал нашёлся
+        days = max(days, 30.0)
+        try:
+            points = self.store.track(mmsi, days * 24.0)
+        except Exception:
+            return None
+        ports = self.config.get("ports") or []
+        stops, current, previous = [], [], None
+        for point in points:
+            try:
+                sog = float(point.get("sog") or 0)
+                lat, lon = float(point["lat"]), float(point["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if sog > 0.5:
+                current, previous = [], None
+                continue
+            near = None
+            for port in ports:
+                try:
+                    km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if km <= port_km and (near is None or km < near[0]):
+                    near = (km, port)
+            if not near:
+                current, previous = [], None
+                continue
+            moment = parse_iso(point.get("ts"))
+            if not current or (previous and moment and
+                               (moment - previous).total_seconds() > 1800):
+                current = []
+                stops.append(current)
+            current.append((lat, lon, near[1]))
+            previous = moment
+        clusters = []
+        for stop in stops:
+            if not stop:
+                continue
+            lat = sum(item[0] for item in stop) / len(stop)
+            lon = sum(item[1] for item in stop) / len(stop)
+            port = stop[0][2]
+            for cluster in clusters:
+                if geo.haversine_km(lat, lon, cluster["lat"], cluster["lon"]) <= cluster_km:
+                    n = cluster["n"] + 1
+                    cluster["lat"] = (cluster["lat"] * cluster["n"] + lat) / n
+                    cluster["lon"] = (cluster["lon"] * cluster["n"] + lon) / n
+                    cluster["n"] = n
+                    cluster["points"].append((lat, lon))
+                    break
+            else:
+                clusters.append({"port": port.get("name"), "lat": lat, "lon": lon,
+                                 "n": 1, "points": [(lat, lon)]})
+        if not clusters:
+            return None
+        best = max(clusters, key=lambda cluster: cluster["n"])
+        spread = max((geo.haversine_km(best["lat"], best["lon"], lat, lon) * 1000.0
+                      for lat, lon in best["points"]), default=0.0)
+        return {"port": best["port"], "lat": best["lat"], "lon": best["lon"],
+                "visits": best["n"], "spread_m": spread, "source": "трек"}
+
+    def _berth_from_visits(self, mmsi, cluster_km=0.4):
         """Причал, где судно стояло чаще всего — с его координатами.
 
         По каждому визиту берутся свои позиции за время стоянки (ход не больше
