@@ -2481,6 +2481,17 @@ class RadarCore:
             "key": f"{mmsi}|{departure['port']}|{dest_hit}",
         }
 
+    def port_by_name(self, name):
+        """Наш порт из настроек по имени или подписи (для координат в карточке)."""
+        wanted = str(name or "").strip().upper()
+        if not wanted:
+            return None
+        for port in self.config.get("ports") or []:
+            if (str(port.get("name") or "").upper() == wanted
+                    or str(port.get("label") or "").upper() == wanted):
+                return port
+        return None
+
     def destination_port(self, vessel):
         """Порт назначения судна из AIS — любой известный порт, не только фильтр."""
         destination = (vessel or {}).get("destination") or ""

@@ -251,10 +251,18 @@ class Store:
             )
 
     def add_position(self, mmsi: str, lat: float, lon: float, sog=None, cog=None, when=None):
+        # одну и ту же точку могут прислать два источника (живой AIS и снимок):
+        # без проверки в базу ложились по 3–4 одинаковых строки на секунду
+        stamp = iso(when)
         with self._lock, self.conn:
+            exists = self.conn.execute(
+                "SELECT 1 FROM positions WHERE mmsi = ? AND ts = ? LIMIT 1",
+                (mmsi, stamp)).fetchone()
+            if exists:
+                return
             self.conn.execute(
                 "INSERT INTO positions (mmsi, ts, lat, lon, sog, cog) VALUES (?, ?, ?, ?, ?, ?)",
-                (mmsi, iso(when), lat, lon, sog, cog))
+                (mmsi, stamp, lat, lon, sog, cog))
 
     def vessel(self, mmsi: str):
         with self._lock:
@@ -427,6 +435,18 @@ class Store:
         with self._lock:
             rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def usual_port(self, mmsi) -> dict | None:
+        """Порт, где судно стояло чаще всего: {"port": имя, "visits": сколько}."""
+        try:
+            with self._lock:
+                row = self.conn.execute(
+                    "SELECT port, COUNT(*) FROM port_visits WHERE mmsi = ? "
+                    "GROUP BY UPPER(port) ORDER BY COUNT(*) DESC, MAX(entered_at) DESC "
+                    "LIMIT 1", (str(mmsi),)).fetchone()
+        except Exception:
+            return None
+        return {"port": row[0], "visits": row[1]} if row else None
 
     def visit_ports(self) -> dict:
         """MMSI → порты, в которых судно было (по всем визитам в базе)."""

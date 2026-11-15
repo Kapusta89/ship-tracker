@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.31"
+APP_VERSION = "2026.12.32"
 
 import ais_feed
 import analysis
@@ -2967,6 +2967,18 @@ class App:
                 f"{item['old'] or '—'} → {item['new']} ({self.fmt_time(item['at'])})"
                 for item in reversed(changes))
             lines.append(f"  назначение менялось: {history}")
+        try:
+            usual = self.store.usual_port(mmsi)
+        except Exception:
+            usual = None
+        if usual and usual.get("port"):
+            port = self.core.port_by_name(usual["port"])
+            if port and port.get("lat") is not None and port.get("lon") is not None:
+                where = f"{float(port['lat']):.4f}, {float(port['lon']):.4f}"
+            else:
+                where = "координаты не заданы"
+            lines.append(f"Чаще всего разгружался: {usual['port']} ({where}) — "
+                         f"стоянок {usual['visits']} по истории")
         lines += [
             f"Скорость: {fmt_number(vessel.get('sog'))} уз",
             f"Размеры: {self.size_text(vessel)} (длина × ширина)",
@@ -3325,7 +3337,7 @@ class App:
             self.log(f"Обновление таблиц: {error}")
         finally:
             try:
-                self.root.after(3000, self.slow_tick)
+                self.root.after(2000, self.slow_tick)
             except Exception:
                 pass
 
@@ -3343,10 +3355,10 @@ class App:
         except Exception:
             current = None
         if current is getattr(self, "tab_traffic", None) and \
-                now - getattr(self, "_traffic_drawn_at", 0.0) >= 30.0:
+                now - getattr(self, "_traffic_drawn_at", 0.0) >= 15.0:
             self.refresh_traffic()
             self._traffic_drawn_at = now
-        if current is getattr(self, "tab_forecast_all", None) and                 now - getattr(self, "_forecast_all_drawn_at", 0.0) >= 60.0:
+        if current is getattr(self, "tab_forecast_all", None) and                 now - getattr(self, "_forecast_all_drawn_at", 0.0) >= 20.0:
             self.refresh_forecast_all()
             self._forecast_all_drawn_at = now
         if now - getattr(self, "_forecast_drawn_at", 0.0) >= 8.0:
