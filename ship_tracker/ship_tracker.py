@@ -4422,7 +4422,7 @@ class App:
                      f"ответы придут одновременно.")
         elif getattr(self.core, "feeds", None):
             self.log(f"Свежие данные только что запрашивались: подождите "
-                     f"{core.MIN_SOURCE_POLL_SECONDS:g} с и нажмите снова.")
+                     f"{core_module.MIN_SOURCE_POLL_SECONDS:g} с и нажмите снова.")
         else:
             self.log("Нет запущенных источников: включите их галочками в «Источниках» "
                      "или проверьте ключи API.")
