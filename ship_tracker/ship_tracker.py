@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.27"
+APP_VERSION = "2026.12.28"
 
 import ais_feed
 import analysis
@@ -293,6 +293,27 @@ class RadarCanvas:
         self.selected = mmsi
         self.request_redraw()
 
+    def focus_on(self, lat, lon):
+        """Центрирует карту на судне, если оно сейчас вне видимой области.
+
+        Так судно, выбранное в любой вкладке (в том числе далеко у Босфора),
+        сразу оказывается в кадре, а не «выбрано, но не видно».
+        """
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            return
+        width = self.canvas.winfo_width() or 900
+        height = self.canvas.winfo_height() or 560
+        try:
+            x, y = self.projector().to_screen(lat, lon)
+        except Exception:
+            x, y = None, None
+        inside = (x is not None and 40 <= x <= width - 40
+                  and 40 <= y <= height - 40)
+        if not inside:
+            self.center_lat, self.center_lon = lat, lon
+
     # -- мышь
     def _on_press(self, event):
         self._press = (event.x, event.y)
@@ -397,10 +418,12 @@ class RadarCanvas:
             if lat is None or lon is None:
                 continue
             is_target = vessel["mmsi"] in target_mmsi
+            is_selected = vessel["mmsi"] == self.selected
             # «Только цели»: на карте остаются лишь суда, связанные с нашими
             # портами (на любом расстоянии) — список приходит из App.
+            # Выбранное вручную судно показываем всегда.
             if (self.targets_only and allowed_mmsi is not None
-                    and vessel["mmsi"] not in allowed_mmsi):
+                    and vessel["mmsi"] not in allowed_mmsi and not is_selected):
                 continue
             # Возраст — по времени последней ПОЗИЦИИ: паспорт может обновиться
             # сегодня, а точка на карте остаться трёхдневной.
@@ -411,7 +434,9 @@ class RadarCanvas:
             limit = core_module.stale_hours(vessel, self.config) * 3600.0
             fresh = age is not None and age <= self.stale_seconds()
             stale = age is None or age > limit
-            if stale:
+            if stale and not is_selected:
+                # выбранное вручную судно остаётся на карте даже с давней
+                # позицией: иначе из вкладки выбираешь — и ничего не видно
                 stale_count += 1
                 stale_hidden += 1
                 continue
@@ -441,7 +466,7 @@ class RadarCanvas:
                 elif color == "#7fa8bf": color = "#42a5f5"
             if not fresh:
                 color = "#5d7786"
-            if vessel["mmsi"] == self.selected:
+            if is_selected:
                 canvas.create_oval(x - 11, y - 11, x + 11, y + 11, outline="#ffffff", width=2)
             course = vessel.get("cog")
             if course is None:
@@ -460,7 +485,10 @@ class RadarCanvas:
             elif is_approach:
                 canvas.create_text(x + 7, y + 8, anchor="w", fill="#39d3ff",
                                    font=("Consolas", 6), text="≈ к нам")
-            if drawn % 7 == 0 and vessel.get("name"):
+            if is_selected:
+                # у выбранного судна на карте всегда есть подпись с данными
+                self._draw_selected_label(canvas, x, y, vessel, age, fresh)
+            elif drawn % 7 == 0 and vessel.get("name"):
                 if self.schematic_view:
                     canvas.create_text(x + 7, y - 7, text="", anchor="w",
                                        fill="#5d7280", font=("Consolas", 5))
@@ -502,6 +530,25 @@ class RadarCanvas:
                           traffic_hidden=traffic_hidden, faded=faded,
                           newest=min(ages) if ages else None,
                           approach=len(approach_mmsi or ()))
+
+    def _draw_selected_label(self, canvas, x, y, vessel, age, fresh):
+        """Подпись выбранного судна: имя, ход, назначение, свежесть точки."""
+        parts = [str(vessel.get("name") or vessel.get("mmsi") or "")]
+        sog = vessel.get("sog")
+        if sog is not None:
+            try:
+                parts.append(f"{float(sog):.1f} уз")
+            except (TypeError, ValueError):
+                pass
+        destination = str(vessel.get("destination") or "").strip()
+        if destination:
+            parts.append(destination)
+        canvas.create_text(x + 9, y - 9, anchor="w", text=" · ".join(parts),
+                           fill="#ffffff", font=("Consolas", 8, "bold"))
+        if age is not None and not fresh:
+            canvas.create_text(x + 9, y + 20, anchor="w",
+                               text=f"позиция {age / 3600.0:.1f} ч назад",
+                               fill="#ffd166", font=("Consolas", 7))
 
     def _draw_grid(self, projector, width, height):
         canvas = self.canvas
@@ -2661,6 +2708,19 @@ class App:
                 approach = self.core.approach_mmsis()
             except Exception:
                 approach = set()
+            # судно, выбранное в любой вкладке, рисуем всегда — даже если по
+            # правилам отбора его в списке радара нет (чужой порт, дальний
+            # район, старая позиция)
+            chosen = getattr(self.radar, "selected", None)
+            if chosen:
+                chosen = str(chosen)
+                if chosen not in {str(v.get("mmsi")) for v in vessels}:
+                    try:
+                        row = self.store.vessel(chosen)
+                    except Exception:
+                        row = None
+                    if row:
+                        vessels = list(vessels) + [row]
             self.radar.draw(vessels, set(self._targets.keys()), [],
                             allowed_mmsi=allowed, approach_mmsi=approach)
         except Exception as error:
@@ -2669,6 +2729,11 @@ class App:
     def select_vessel(self, mmsi):
         self.selected = mmsi
         self.radar.selected = mmsi
+        vessel = self.store.vessel(mmsi) or {}
+        try:
+            self.radar.focus_on(vessel.get("lat"), vessel.get("lon"))
+        except Exception as error:
+            self.log(f"Карта: не удалось показать судно {mmsi}: {error}")
         self.update_detail()
         self.update_track()
         self.load_photo(mmsi)
