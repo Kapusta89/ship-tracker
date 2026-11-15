@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.29"
+APP_VERSION = "2026.12.30"
 
 import ais_feed
 import analysis
@@ -434,12 +434,12 @@ class RadarCanvas:
             limit = core_module.stale_hours(vessel, self.config) * 3600.0
             fresh = age is not None and age <= self.stale_seconds()
             stale = age is None or age > limit
-            if stale and not is_selected:
-                # выбранное вручную судно остаётся на карте даже с давней
-                # позицией: иначе из вкладки выбираешь — и ничего не видно
+            if stale:
+                # позиция давняя, но судно есть в таблицах — значит, и на
+                # карте оно должно быть: рисуем бледным, с возрастом точки,
+                # а не выбрасываем молча
                 stale_count += 1
-                stale_hidden += 1
-                continue
+                stale_drawn += 1
             if not fresh:
                 # сигнал старый, но судно стоит — точка приглушённая, с возрастом
                 faded += 1
@@ -2684,11 +2684,12 @@ class App:
             self.log(f"Масштаб по нашим судам: {error}")
 
     def redraw_map(self):
-        """Рисует только нашу обстановку: идут к нам, стоят в порту или на рейде.
+        """Рисует всё, что есть в таблицах: наши суда и трафик района целиком.
 
-        Чужой трафик района (суда, идущие мимо, рыбаки у своих берегов) с карты
-        убран полностью, как и устаревшие позиции: радар показывает только
-        свежие суда, связанные с нашими портами.
+        Раньше карта показывала только суда, связанные с нашими портами, и
+        судно из «Трафика района», «В море» или «Прогнозов» на радаре могло
+        отсутствовать. Теперь к «нашим» добавляются все суда района из той же
+        базы, поэтому карта и таблицы показывают один и тот же набор.
         """
         try:
             port_only = bool(getattr(self, "var_port_only", None) is not None
@@ -2702,6 +2703,21 @@ class App:
                 vessels = self.core.port_vessels(600)
             else:
                 vessels = self.core.port_focus_vessels(3000)
+                # всё, что видно в таблицах района, должно быть и на карте:
+                # иначе «в таблице есть, на радаре нет»
+                boxes = self.config.get("bounding_boxes") or [[[40.5, 26.0], [47.5, 42.0]]]
+                south = min(float(box[0][0]) for box in boxes)
+                west = min(float(box[0][1]) for box in boxes)
+                north = max(float(box[1][0]) for box in boxes)
+                east = max(float(box[1][1]) for box in boxes)
+                try:
+                    area = self.store.vessels_in_bbox(south, west, north, east, limit=3000)
+                except Exception as error:
+                    area = []
+                    self.log(f"Радар: трафик района не прочитан: {error}")
+                known = {str(v.get("mmsi")) for v in vessels}
+                vessels = list(vessels) + [v for v in area
+                                           if str(v.get("mmsi")) not in known]
             if targets_only:
                 allowed = set(self._targets.keys())
             try:
