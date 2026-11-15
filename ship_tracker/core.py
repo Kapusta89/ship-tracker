@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import places
 import requests
 
 import ais_feed
@@ -2523,6 +2524,54 @@ class RadarCore:
         stops.append({"lat": sum(item[0] for item in run) / len(run),
                       "lon": sum(item[1] for item in run) / len(run),
                       "started": first, "ended": last, "points": len(run)})
+
+    def ensure_quays(self, force=False):
+        """Скачивает причалы, краны и верфи вокруг наших портов в базу.
+
+        Выполняется в фоне при запуске: один запрос на порт, результат лежит в
+        `quay_places`, поэтому карточка открывается без интернета. Если OSM
+        недоступен, участок просто остаётся нескачанным — карточка покажет
+        координаты стоянки без названия причала.
+        """
+        for port in self.config.get("ports") or []:
+            try:
+                lat, lon = float(port["lat"]), float(port["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            area = f"{lat:.3f},{lon:.3f}"
+            if not force and self.store.quay_area_cached(area):
+                continue
+            try:
+                items = places.fetch_quays(lat - 0.12, lon - 0.15,
+                                           lat + 0.12, lon + 0.15)
+            except Exception as error:
+                self.log(f"Причалы {port.get('name')}: {error}")
+                continue
+            if not items:
+                continue
+            try:
+                saved = self.store.save_quay_places(area, items)
+            except Exception as error:
+                self.log(f"Причалы {port.get('name')}: {error}")
+                continue
+            self.log(f"Причалы {port.get('name')}: сохранено {saved} объектов OSM")
+
+    def berth_place(self, lat, lon):
+        """Ближайший причал/кран/верфь к точке стоянки — из скачанного кэша."""
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            return None
+        try:
+            items = self.store.quay_places(lat - 0.02, lon - 0.03,
+                                           lat + 0.02, lon + 0.03)
+        except Exception:
+            return None
+        return places.nearest(items, lat, lon, km=0.8)
+
+    def place_text(self, place):
+        """Строка про причал для карточки."""
+        return places.describe(place)
 
     def berth_info(self, mmsi):
         """Всё о стоянках судна для карточки: частый причал и последняя стоянка.

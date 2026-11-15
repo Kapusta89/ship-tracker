@@ -4,6 +4,7 @@ SQLite в режиме WAL: один файл ship_tracker.db, к нему мо�
 DB Browser for SQLite, пока программа работает.
 """
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -106,6 +107,22 @@ CREATE TABLE IF NOT EXISTS destination_changes (
     at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dest_changes_mmsi ON destination_changes (mmsi, id);
+
+-- Причалы, краны и верфи из OpenStreetMap вокруг наших портов. Позиция судна
+-- в AIS всегда на воде, поэтому для карточки нужно ближайшее место на стенке:
+-- скачиваем один раз на порт и держим в базе, чтобы карточка открывалась без
+-- интернета.
+CREATE TABLE IF NOT EXISTS quay_places (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    area     TEXT NOT NULL,
+    lat      REAL NOT NULL,
+    lon      REAL NOT NULL,
+    name     TEXT,
+    kind     TEXT,
+    osm      TEXT,
+    fetched_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quay_places_area ON quay_places (area);
 """
 
 FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "draft",
@@ -117,6 +134,7 @@ MIGRATIONS = {
     "vessels": (("eta_declared", "TEXT"), ("length_m", "REAL"), ("beam_m", "REAL"),
                 ("draft_min", "REAL"), ("draft_max", "REAL"), ("tracked", "INTEGER"),
                 ("position_at", "TEXT")),
+    "quay_places": (("geometry", "TEXT"),),
     "port_visits": (("draft_in", "REAL"), ("draft_out", "REAL"),
                     ("cargo_kind", "TEXT"), ("source", "TEXT")),
 }
@@ -205,6 +223,46 @@ class Store:
                     "UPDATE vessels SET draft_min = MIN(COALESCE(draft_min, ?), ?), "
                     "draft_max = MAX(COALESCE(draft_max, ?), ?) WHERE mmsi = ?",
                     (draft, draft, draft, draft, mmsi))
+
+    def quay_area_cached(self, area) -> bool:
+        """Уже скачаны ли причалы для этого участка."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM quay_places WHERE area = ? LIMIT 1", (str(area),)).fetchone()
+        return row is not None
+
+    def save_quay_places(self, area, items) -> int:
+        """Сохраняет причалы участка, заменяя прежнюю выборку."""
+        stamp = iso(datetime.now())
+        rows = [(str(area), float(item["lat"]), float(item["lon"]),
+                 item.get("name") or "", item.get("kind") or "", item.get("osm") or "",
+                 json.dumps(item.get("geometry") or []), stamp)
+                for item in items
+                if item.get("lat") is not None and item.get("lon") is not None]
+        with self._lock:
+            self.conn.execute("DELETE FROM quay_places WHERE area = ?", (str(area),))
+            self.conn.executemany(
+                "INSERT INTO quay_places (area, lat, lon, name, kind, osm, geometry, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self.conn.commit()
+        return len(rows)
+
+    def quay_places(self, south, west, north, east) -> list:
+        """Причалы в прямоугольнике — для поиска ближайшего к стоянке."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT lat, lon, name, kind, osm, geometry FROM quay_places "
+                "WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                (float(south), float(north), float(west), float(east))).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["geometry"] = [tuple(point) for point in json.loads(item.get("geometry") or "[]")]
+            except (TypeError, ValueError):
+                item["geometry"] = []
+            result.append(item)
+        return result
 
     def destination_changes(self, mmsi, limit=5) -> list:
         """Последние изменения поля Destination: [{old, new, at}], новые сверху."""

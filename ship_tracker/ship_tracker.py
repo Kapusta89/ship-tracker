@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.35"
+APP_VERSION = "2026.12.36"
 
 import ais_feed
 import analysis
@@ -2997,6 +2997,12 @@ class App:
                 f"Чаще всего разгружался: причал {berth['port']} "
                 f"({berth['lat']:.5f}, {berth['lon']:.5f}) — "
                 f"стоянок {berth['visits']}{spread}{basis}")
+            try:
+                spot = self.core.berth_place(berth["lat"], berth["lon"])
+            except Exception:
+                spot = None
+            if spot:
+                lines.append(f"Точка разгрузки: {self.core.place_text(spot)}")
         else:
             # своих точек за стоянки нет — показываем хотя бы центр порта
             try:
@@ -4007,6 +4013,7 @@ class App:
         self.core.start()
         self.start_bot()
         self.log("Поток AIS запущен.")
+        threading.Thread(target=self.core.ensure_quays, daemon=True).start()
 
     def stop_core(self):
         self.core.stop()
