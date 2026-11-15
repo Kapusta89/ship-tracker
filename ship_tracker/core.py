@@ -2481,6 +2481,86 @@ class RadarCore:
             "key": f"{mmsi}|{departure['port']}|{dest_hit}",
         }
 
+    def stops_anywhere(self, mmsi, radius_km=0.3, min_minutes=30):
+        """Стоянки судна в любом месте по треку — даже вне наших портов.
+
+        Опорой считается первая точка серии: пока судно не отошло от неё
+        дальше `radius_km`, серия продолжается. Серия засчитывается стоянкой,
+        если длится не меньше `min_minutes`. Скорость не используется: у части
+        судов AIS не отдаёт SOG, а смещение по координатам есть всегда.
+        """
+        try:
+            days = max(float(self.config.get("history_days") or 7), 30.0)
+        except (TypeError, ValueError):
+            days = 30.0
+        try:
+            points = self.store.track(mmsi, days * 24.0)
+        except Exception:
+            return []
+        stops, run, anchor = [], [], None
+        for point in points:
+            try:
+                lat, lon = float(point["lat"]), float(point["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            moment = parse_iso(point.get("ts"))
+            if anchor is not None and geo.haversine_km(anchor[0], anchor[1], lat, lon) > radius_km:
+                self._add_stop(stops, run, min_minutes)
+                run = []
+            if not run:
+                anchor = (lat, lon)
+            run.append((lat, lon, moment))
+        self._add_stop(stops, run, min_minutes)
+        return stops
+
+    @staticmethod
+    def _add_stop(stops, run, min_minutes):
+        if len(run) < 2:
+            return
+        first, last = run[0][2], run[-1][2]
+        if not first or not last or (last - first).total_seconds() < min_minutes * 60:
+            return
+        stops.append({"lat": sum(item[0] for item in run) / len(run),
+                      "lon": sum(item[1] for item in run) / len(run),
+                      "started": first, "ended": last, "points": len(run)})
+
+    def berth_info(self, mmsi):
+        """Всё о стоянках судна для карточки: частый причал и последняя стоянка.
+
+        Возвращает {berth, last_stop, since, points}. `berth` — причал у наших
+        портов (или None), `last_stop` — последняя стоянка в любом месте, если
+        заходов к нам в истории нет: так по судну, которое ещё только идёт к
+        нам, видно хотя бы, где оно стояло в последний раз.
+        """
+        berth = self.usual_berth(mmsi)
+        try:
+            days = max(float(self.config.get("history_days") or 7), 30.0)
+        except (TypeError, ValueError):
+            days = 30.0
+        try:
+            track = self.store.track(mmsi, days * 24.0)
+        except Exception:
+            track = []
+        since = track[0].get("ts") if track else None
+        last_stop = None
+        if not berth:
+            stops = self.stops_anywhere(mmsi)
+            if stops:
+                stop = stops[-1]
+                nearest = None
+                for port in self.config.get("ports") or []:
+                    try:
+                        km = geo.haversine_km(stop["lat"], stop["lon"],
+                                              float(port["lat"]), float(port["lon"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if nearest is None or km < nearest[1]:
+                        nearest = (port.get("name"), km)
+                last_stop = dict(stop, port=nearest[0] if nearest else None,
+                                 km=nearest[1] if nearest else None)
+        return {"berth": berth, "last_stop": last_stop,
+                "since": since, "points": len(track)}
+
     def usual_berth(self, mmsi, cluster_km=0.4):
         """Частый причал: сначала по записанным визитам, потом по своему треку."""
         berth = self._berth_from_visits(mmsi, cluster_km)

@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.34"
+APP_VERSION = "2026.12.35"
 
 import ais_feed
 import analysis
@@ -1427,14 +1427,20 @@ class App:
                 guessed_count += 1
             computed = "≈" if "трек" in str(source) else ""
             try:
-                berth = self.core.usual_berth(mmsi)
+                info = self.core.berth_info(mmsi)
             except Exception:
-                berth = None
+                info = {}
+            berth = info.get("berth")
             if berth:
                 berth_text = (f"{berth['port']} {berth['lat']:.4f}, "
                               f"{berth['lon']:.4f} ({berth['visits']})")
             else:
-                berth_text = "—"
+                stop = info.get("last_stop")
+                if stop:
+                    berth_text = (f"нет стоянок у нас · последняя "
+                                  f"{stop['lat']:.4f}, {stop['lon']:.4f}")
+                else:
+                    berth_text = "нет стоянок у нас"
             collected.append((hours is None, hours or 0.0, (
                 vessel.get("name") or mmsi,
                 vessel.get("type_label") or "не указан",
@@ -2979,10 +2985,11 @@ class App:
                 for item in reversed(changes))
             lines.append(f"  назначение менялось: {history}")
         try:
-            berth = self.core.usual_berth(mmsi)
+            info = self.core.berth_info(mmsi)
         except Exception as error:
-            berth = None
+            info = {"berth": None, "last_stop": None, "since": None}
             self.log(f"Причал по истории: {error}")
+        berth = info.get("berth")
         if berth:
             spread = f", разброс {berth['spread_m']:.0f} м" if berth.get("spread_m") else ""
             basis = " по своему треку" if berth.get("source") == "трек" else ""
@@ -3005,6 +3012,25 @@ class App:
                 lines.append(f"Чаще всего разгружался: {usual['port']} ({where}) — "
                              f"стоянок {usual['visits']}; точное место стоянки "
                              f"в истории не сохранилось, это центр порта")
+            stop = info.get("last_stop")
+            if stop:
+                moment = stop.get("ended")
+                when = (f"{moment:%d.%m %H:%M}" if moment and
+                        moment.date() == datetime.now().date()
+                        else f"{moment:%d.%m %H:%M}" if moment else "—")
+                if stop.get("km") is not None and stop["km"] <= 50:
+                    distance = f", {stop['km']:.0f} км от {stop['port']}"
+                else:
+                    distance = ", вне наших портов — к разгрузке у нас не относится"
+                lines.append(
+                    f"Стоянок у наших портов в истории нет. Последняя стоянка в базе: "
+                    f"{stop['lat']:.4f}, {stop['lon']:.4f} — {when}{distance}")
+            elif not usual:
+                since = info.get("since")
+                since_text = (f"; в базе с {since[8:10]}.{since[5:7]} {since[11:16]}"
+                              if since else "")
+                lines.append("Стоянок у наших портов в истории нет"
+                             f"{since_text} — судно ещё не заходило к нам")
         lines += [
             f"Скорость: {fmt_number(vessel.get('sog'))} уз",
             f"Размеры: {self.size_text(vessel)} (длина × ширина)",
