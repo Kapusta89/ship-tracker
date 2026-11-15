@@ -3502,7 +3502,9 @@ class App:
             was = self.core.was_in_our_port(vessel.get("mmsi"))
             vessel["dest_ours"] = ours
             vessel["was_in_port"] = was
-            if ours or was:
+            pinned = str(vessel.get("mmsi") or "") in getattr(self.core,
+                                                              "pinned_mmsis", ())
+            if ours or was or pinned:
                 linked.append(vessel)
         hidden = len(rows) - len(linked)
         counts = {}

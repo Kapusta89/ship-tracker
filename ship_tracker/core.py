@@ -693,6 +693,10 @@ class RadarCore:
         self._approach = {}
         self.service_status = {}
         self.on_service_status = None
+        # суда из списка «нужно видеть всегда» (`pinned_mmsis`): их не отсекают
+        # правила связи с портами — иначе судно, у которого в AIS чужой порт,
+        # пропадает с радара и из списков, хотя его специально отслеживают
+        self.pinned_mmsis = self._load_pinned(config)
         self._feed_lock = None
         self.feed_elsewhere = False
 
@@ -1352,6 +1356,14 @@ class RadarCore:
         return rows
 
     # ------------------------------------------------ только «наши» суда
+    @staticmethod
+    def _load_pinned(config) -> set:
+        """MMSI из `pinned_mmsis`: суда, которые показываются всегда."""
+        raw = (config or {}).get("pinned_mmsis") or []
+        if isinstance(raw, str):
+            raw = raw.replace(";", ",").split(",")
+        return {str(item).strip() for item in raw if str(item).strip()}
+
     def _vessel_related(self, mmsi, lat=None, lon=None, vessel=None, destination=None,
                         area=False) -> bool:
         """Относится ли судно к нашим портам: стоит/проходит рядом, был в порту
@@ -1362,6 +1374,9 @@ class RadarCore:
         тоже записывается в базу и попадает во вкладку «Все суда».
         """
         mmsi = str(mmsi)
+        # список «видеть всегда» перебивает любые правила отбора
+        if mmsi and mmsi in getattr(self, "pinned_mmsis", ()):
+            return True
         ports = self.config.get("ports") or []
         if ports and lat is not None and lon is not None:
             if geo.port_at(lat, lon, ports):
@@ -1671,6 +1686,10 @@ class RadarCore:
         """
         if not vessel:
             return None
+        if str(vessel.get("mmsi") or "") in getattr(self, "pinned_mmsis", ()):
+            # судно из списка «видеть всегда»: показываем, даже если оно
+            # сейчас идёт не к нам (например, ждёт у Босфора)
+            return "в списке наблюдения"
         lat, lon = vessel.get("lat"), vessel.get("lon")
         if lat is not None and lon is not None:
             place = self.port_place(vessel)
