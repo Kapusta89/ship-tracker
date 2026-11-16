@@ -153,6 +153,12 @@ DEFAULT_CONFIG = {
     # Судно, у которого позиция старше этого срока, не показываем ни на радаре,
     # ни во вкладках: это уже не обстановка, а мусор в списке.
     "hide_after_hours": 20,
+    # Постоянное обновление координат всех судов прямыми запросами к Open Waters:
+    # полный круг по базе занимает минуты, а не часы, как при ожидании AIS.
+    "bulk_refresh_enabled": True,
+    "bulk_refresh_workers": 6,
+    "bulk_refresh_batch": 200,
+    "bulk_refresh_pause_seconds": 5,
     # Бесплатный ключ VesselAPI (150 вызовов в месяц): перед тем как убрать
     # устаревшее судно со всех вкладок, им проверяется его AIS-позиция.
     "vesselapi_key": "",
@@ -913,6 +919,9 @@ class RadarCore:
         # следующего сообщения в общем потоке AIS
         threading.Thread(target=self._focus_refresh_worker, daemon=True,
                          name="focus-refresh").start()
+        # постоянное обновление координат всех судов базы, по кругу
+        threading.Thread(target=self._bulk_refresh_worker, daemon=True,
+                         name="bulk-refresh").start()
         # суда без нашего порта в AIS, но идущие к нам по курсу
         threading.Thread(target=self._approach_worker, daemon=True,
                          name="approach-scan").start()
@@ -2028,6 +2037,76 @@ class RadarCore:
             if found and found.get("fresh"):
                 updated += 1
         return {"checked": min(len(focus), max(1, int(limit))), "updated": updated}
+
+    def bulk_refresh(self, batch=150, workers=6) -> dict:
+        """Обновляет позиции очередной пачки судов — по кругу, без пропусков.
+
+        Каждый проход берёт следующий кусок списка (наши и закреплённые первыми,
+        дальше все остальные, включая скрытые), поэтому за несколько минут
+        координаты обновляются у всех судов базы, а не только у тех, кому
+        повезло попасть в MMSI-подписку AISStream.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        try:
+            # обновляем все суда базы, а не только связанные с нашими портами:
+            # координаты нужны по любому судну, которое может появиться на карте
+            rows = self.store.vessels(4000)
+        except Exception:
+            rows = []
+        if not rows:
+            return {"checked": 0, "updated": 0}
+        pinned = set(getattr(self, "pinned_mmsis", ()) or ())
+        ordered = sorted(rows, key=lambda row: (
+            0 if str(row.get("mmsi")) in pinned else
+            1 if self.destination_is_ours(row.get("destination")) else 2,
+            str(row.get("mmsi"))))
+        offset = getattr(self, "_bulk_offset", 0) % len(ordered)
+        slice_ = ordered[offset:offset + batch]
+        if len(slice_) < batch:
+            slice_ += ordered[:batch - len(slice_)]
+        self._bulk_offset = (offset + len(slice_)) % len(ordered)
+
+        def one(row):
+            try:
+                found = self.refresh_vessel(str(row.get("mmsi")))
+            except Exception:
+                return False
+            return bool(found and found.get("fresh"))
+
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+                results = list(pool.map(one, slice_))
+        except Exception as error:
+            self.log(f"Обновление координат: {error}")
+            return {"checked": len(slice_), "updated": 0}
+        return {"checked": len(slice_), "updated": sum(1 for flag in results if flag),
+                "total": len(ordered)}
+
+    def _bulk_refresh_worker(self):
+        """Крутит обновление координат всех судов, пока приложение запущено."""
+        if self.stop_event.wait(45):
+            return
+        while not self.stop_event.is_set():
+            try:
+                if not self.config.get("bulk_refresh_enabled", True):
+                    if self.stop_event.wait(120):
+                        break
+                    continue
+                result = self.bulk_refresh(
+                    batch=int(self.config.get("bulk_refresh_batch") or 150),
+                    workers=int(self.config.get("bulk_refresh_workers") or 6))
+                if result.get("checked"):
+                    self.log(f"Координаты: обновлено {result['updated']} из "
+                             f"{result['checked']} (в базе {result.get('total', '?')}).")
+            except Exception as error:
+                self.log(f"Обновление координат: {error}")
+            try:
+                pause = float(self.config.get("bulk_refresh_pause_seconds") or 5)
+            except (TypeError, ValueError):
+                pause = 5.0
+            if self.stop_event.wait(max(1.0, pause)):
+                break
 
     def _focus_refresh_worker(self):
         """Каждые несколько минут тянет свежие данные по нашим судам."""
