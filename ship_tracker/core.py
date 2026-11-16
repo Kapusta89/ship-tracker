@@ -917,11 +917,7 @@ class RadarCore:
                          name="stale-revival").start()
         # наши суда и закреплённые обновляются по прямому запросу, не дожидаясь
         # следующего сообщения в общем потоке AIS
-        threading.Thread(target=self._focus_refresh_worker, daemon=True,
-                         name="focus-refresh").start()
-        # постоянное обновление координат всех судов базы, по кругу
-        threading.Thread(target=self._bulk_refresh_worker, daemon=True,
-                         name="bulk-refresh").start()
+        # обновление координат поднимается в _start_services (см. ниже)
         # суда без нашего порта в AIS, но идущие к нам по курсу
         threading.Thread(target=self._approach_worker, daemon=True,
                          name="approach-scan").start()
@@ -1053,6 +1049,15 @@ class RadarCore:
         if started:
             self.log(f"Источники запущены одновременно ({len(started)}): "
                      + ", ".join(started) + ".")
+        # Постоянное обновление координат: поднимаем здесь, потому что этот
+        # метод вызывают все режимы запуска (окно, бот, второй процесс без
+        # своего потока AIS) — иначе в части из них обновление не стартовало.
+        if not getattr(self, "_refresh_threads_started", False):
+            self._refresh_threads_started = True
+            threading.Thread(target=self._focus_refresh_worker, daemon=True,
+                             name="focus-refresh").start()
+            threading.Thread(target=self._bulk_refresh_worker, daemon=True,
+                             name="bulk-refresh").start()
 
     def tracked_mmsis(self):
         """MMSI всех судов в базе — для обогащения внешними API."""
