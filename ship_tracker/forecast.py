@@ -165,6 +165,10 @@ def target_port(vessel, ports):
 
 # Насколько далеко искать порт по курсу, если Destination молчит.
 GUESS_MAX_KM = 700.0
+# Прогноз «по курсу» без известного порта назначения длиннее этого — уже
+# фантазия: судно повернёт, а прямая уйдёт в сушу (так VIRTUOUS STRIKER
+# «приплывал» в Минск). Дальше этого расстояния точки не строим.
+COURSE_MAX_KM = 350.0
 # Допустимое отклонение судна от линии на порт: больше — это уже не «идёт туда».
 GUESS_MAX_OFFSET = 35.0
 
@@ -244,6 +248,7 @@ def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
         return []
 
     speed_kmh = speed * KNOT_KMH
+    covered_km = 0.0
     started = datetime.now()
     points = [{"hours": 0.0, "at": started, "lat": lat, "lon": lon,
                "label": _label(0), "source": source, "course": course,
@@ -272,7 +277,11 @@ def route(vessel, ports, days=MAX_DAYS, step_hours=STEP_HOURS, track=None):
                 break
         else:
             new_course = course
+            if covered_km + step_km > COURSE_MAX_KM:
+                # без порта назначения линия по курсу быстро уходит в сушу
+                break
         lat, lon = destination_point(lat, lon, new_course, step_km)
+        covered_km += step_km
         course = new_course
         hours += step
         points.append({"hours": hours, "at": started + timedelta(hours=hours),
@@ -692,6 +701,9 @@ def endpoint_text(points, port_name=None):
         course = last.get("course")
         if course is not None:
             text += f", курс {float(course):.0f}°"
+    # порта назначения нет — это движение по курсу, а не маршрут: дальше
+    # судно повернёт, поэтому линия обрезана по расстоянию
+    text += " (по курсу AIS, без учёта поворотов)"
     return text
 
 
