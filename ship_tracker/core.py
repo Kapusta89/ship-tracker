@@ -891,6 +891,10 @@ class RadarCore:
         # устаревшие суда не выбрасываем сразу: сначала ищем их AIS заново
         threading.Thread(target=self._stale_worker, daemon=True,
                          name="stale-revival").start()
+        # наши суда и закреплённые обновляются по прямому запросу, не дожидаясь
+        # следующего сообщения в общем потоке AIS
+        threading.Thread(target=self._focus_refresh_worker, daemon=True,
+                         name="focus-refresh").start()
         # суда без нашего порта в AIS, но идущие к нам по курсу
         threading.Thread(target=self._approach_worker, daemon=True,
                          name="approach-scan").start()
@@ -1927,6 +1931,83 @@ class RadarCore:
         self.store.upsert_position(mmsi, lat, lon, sog=sog, cog=cog, when=moment)
         self.store.add_position(mmsi, lat, lon, sog, cog, moment)
         return True
+
+    def refresh_vessel(self, mmsi) -> dict | None:
+        """Срочно обновляет одно судно по прямому запросу к Open Waters.
+
+        Один HTTP-запрос отдаёт последнюю позицию (`seen`), ход, курс, место
+        рядом и паспорт (IMO, позывной, длина, осадка, назначение, ETA) —
+        это быстрее, чем ждать следующего сообщения в общем потоке AIS.
+        """
+        data = ais_feed.fetch_vessel(str(mmsi))
+        if not data:
+            return None
+        # источник отдаёт время в UTC с «Z»: переводим в местное, как в базе
+        moment = None
+        seen = str(data.get("seen") or "").strip()
+        if seen:
+            try:
+                parsed = datetime.fromisoformat(seen.replace("Z", "+00:00"))
+                moment = (parsed.astimezone().replace(tzinfo=None)
+                          if parsed.tzinfo else parsed)
+            except ValueError:
+                moment = parse_iso(seen)
+        fresh = self._accept_position(str(mmsi), data.get("lat"), data.get("lon"),
+                                      data.get("sog"), data.get("cog"), moment)
+        self.store.upsert_static(
+            str(mmsi), name=data.get("name"), imo=str(data.get("imo") or "") or None,
+            callsign=data.get("callsign"), destination=data.get("destination"),
+            draft=data.get("draught"), eta_declared=data.get("eta"),
+            length_m=data.get("length"), beam_m=data.get("beam"))
+        return dict(data, fresh=bool(fresh))
+
+    def refresh_focus(self, limit=20) -> dict:
+        """Обновляет по прямому запросу наши суда и закреплённые (pinned)."""
+        focus = []
+        try:
+            focus.extend(self.pinned_mmsis or [])
+        except Exception:
+            pass
+        try:
+            vessels = self.related_vessels(400)
+        except Exception:
+            vessels = []
+        for vessel in vessels:
+            mmsi = str(vessel.get("mmsi") or "")
+            if not mmsi or mmsi in focus:
+                continue
+            focus.append(mmsi)
+        updated = 0
+        for mmsi in focus[:max(1, int(limit))]:
+            if self.stop_event.is_set():
+                break
+            try:
+                found = self.refresh_vessel(mmsi)
+            except Exception as error:
+                self.log(f"Обновление {mmsi}: {error}")
+                continue
+            if found and found.get("fresh"):
+                updated += 1
+        return {"checked": min(len(focus), max(1, int(limit))), "updated": updated}
+
+    def _focus_refresh_worker(self):
+        """Каждые несколько минут тянет свежие данные по нашим судам."""
+        try:
+            minutes = float(self.config.get("focus_refresh_minutes") or 5)
+        except (TypeError, ValueError):
+            minutes = 5.0
+        if self.stop_event.wait(20):
+            return
+        while not self.stop_event.is_set():
+            try:
+                result = self.refresh_focus(limit=int(self.config.get("focus_refresh_limit") or 20))
+                if result.get("updated"):
+                    self.log(f"Свежие данные: обновлено {result['updated']} "
+                             f"из {result['checked']} судов (Open Waters).")
+            except Exception as error:
+                self.log(f"Обновление наших судов: {error}")
+            if self.stop_event.wait(max(60.0, minutes * 60.0)):
+                break
 
     def revive_vessel(self, mmsi) -> str | None:
         """Ищет судно заново во всех источниках, прежде чем убрать его.

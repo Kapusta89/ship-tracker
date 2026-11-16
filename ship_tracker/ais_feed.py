@@ -897,6 +897,42 @@ def parse_track(data) -> list:
     return points
 
 
+VESSEL_URL = "https://ais.openwaters.io/v1/vessels/{mmsi}"
+
+
+def fetch_vessel(mmsi, timeout=20) -> dict | None:
+    """Последняя известная позиция и паспорт судна — Open Waters, без ключа.
+
+    Возвращает {lat, lon, sog, cog, seen, near, name, destination, eta,
+    draught, imo, callsign, length, beam} либо None, если судна нет в базе
+    источника (404) или он недоступен.
+    """
+    import requests
+
+    try:
+        response = requests.get(VESSEL_URL.format(mmsi=mmsi), timeout=timeout,
+                                headers={"User-Agent": "ShipTracker/1.0 (study project)"})
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    props = body.get("properties") or {}
+    coords = (body.get("geometry") or {}).get("coordinates") or []
+    if len(coords) < 2:
+        return None
+    return {"lat": float(coords[1]), "lon": float(coords[0]),
+            "sog": props.get("sog"), "cog": props.get("cog"),
+            "seen": props.get("seen"), "near": props.get("near"),
+            "name": props.get("name"), "destination": props.get("destination"),
+            "eta": props.get("eta"), "draught": props.get("draught"),
+            "imo": props.get("imo"), "callsign": props.get("callsign"),
+            "length": props.get("length"), "beam": props.get("beam")}
+
+
 def fetch_track(mmsi, timeout=25) -> list:
     """История трека судна за сутки — Open Waters, без ключа."""
     import requests
