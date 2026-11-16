@@ -159,6 +159,78 @@ def _mmsi(value):
     return text.zfill(9)
 
 
+# Ключ MarineTraffic — 40 шестнадцатеричных символов; строка короче это
+# уже не ключ, и запрос гарантированно вернёт «SERVICE KEY NOT FOUND».
+MARINETRAFFIC_KEY_LENGTH = 40
+
+# Коды ошибок MarineTraffic, ради которых стоит объяснять причину словами:
+# без этого в окне оставалось только «401 Client Error».
+MARINETRAFFIC_ERRORS = {
+    "10": "ключ не найден в аккаунте MarineTraffic — проверьте, что скопирован "
+          "весь 40-символьный ключ из кабинета services.marinetraffic.com",
+    "11": "ключ существует, но у него нет оплаченного периода",
+    "12": "исчерпан лимит запросов по ключу",
+    "13": "ключ не имеет доступа к этому методу API",
+    "14": "в кабинете MarineTraffic не задан район наблюдения (AREA) для этого метода",
+    "1r": "слишком много запросов: сервер MarineTraffic просит подождать",
+}
+
+
+def clean_marinetraffic_key(raw):
+    """Ключ из поля настроек: вынимаем 40 знаков, даже если вставлен URL.
+
+    Люди копируют ключ вместе с адресом вида
+    ``services.marinetraffic.com/api/exportvessels/<ключ>`` — такой хвост
+    сервер не принимает, а виноват «неправильный ключ».
+    """
+    text = (raw or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    found = re.search(r"[0-9a-fA-F]{40}", text)
+    return found.group(0) if found else text
+
+
+def service_error_text(body, status=None):
+    """Текст ошибки из JSON-ответа сервиса — вместо голого HTTP-кода.
+
+    MarineTraffic присылает ``{"errors": [{"code": "10", "detail": ...}]}``
+    вместе с 401, и `raise_for_status` выбрасывал всё это содержимое: в окне
+    было не понять, что не так с ключом.
+    """
+    if isinstance(body, dict):
+        errors = body.get("errors")
+        if isinstance(errors, str) and errors.strip():
+            return errors.strip()
+        if isinstance(errors, list):
+            parts = []
+            for item in errors:
+                if isinstance(item, dict):
+                    code = str(item.get("code") or "").strip().lower()
+                    detail = str(item.get("detail") or item.get("message") or "").strip()
+                    hint = MARINETRAFFIC_ERRORS.get(code)
+                    if hint:
+                        parts.append(hint)
+                    elif detail:
+                        parts.append(detail)
+                elif item:
+                    parts.append(str(item).strip())
+            parts = [part for part in parts if part]
+            if parts:
+                return "; ".join(parts)
+        for name in ("error", "message", "detail"):
+            value = body.get(name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _json_or_none(response):
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
 def _heading(value):
     value = _number(value)
     if value is None:
@@ -343,7 +415,11 @@ class ServiceFeed(threading.Thread):
         merged = {"User-Agent": "ShipTracker/1.0"}
         merged.update(headers or {})
         response = requests.get(url, params=params, headers=merged, timeout=timeout)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            detail = service_error_text(_json_or_none(response), response.status_code)
+            if detail:
+                raise RuntimeError(detail)
+            response.raise_for_status()
         return response.json()
 
     def boxes_lat_lon(self):
@@ -966,14 +1042,25 @@ class MarineTrafficFeed(ServiceFeed):
     def poll_once(self):
         if not self.api_key:
             raise RuntimeError("не задан ключ API")
+        key = clean_marinetraffic_key(self.api_key)
+        # API-ключ MarineTraffic — 40 шестнадцатеричных символов. Строка из
+        # девяти знаков (например «mt_946752») ключом быть не может: сервер
+        # отвечает «SERVICE KEY NOT FOUND», и без этой проверки причина
+        # оставалась загадкой.
+        if len(key) != MARINETRAFFIC_KEY_LENGTH or any(
+                symbol not in "0123456789abcdefABCDEF" for symbol in key):
+            raise RuntimeError(
+                f"ключ не той длины ({len(key)} симв.): нужен 40-значный ключ "
+                "из кабинета services.marinetraffic.com → API Keys. Это не "
+                "логин, не номер аккаунта и не часть адреса — ключ выглядит как "
+                "0123456789abcdef0123456789abcdef01234567")
         data = self.request(
-            f"{MARINETRAFFIC_URL}/{self.api_key}",
+            f"{MARINETRAFFIC_URL}/{key}",
             params={"v": 2, "protocol": "jsono", "timespan": 15, "limit": 2000},
             timeout=60)
         if isinstance(data, dict) and data.get("errors"):
-            errors = data.get("errors")
-            text = errors if isinstance(errors, str) else "; ".join(map(str, errors))
-            raise RuntimeError(text)
+            text = service_error_text(data)
+            raise RuntimeError(text or "сервер MarineTraffic вернул ошибку")
         rows = data.get("DATA") if isinstance(data, dict) else data
         if not isinstance(rows, list):
             raise RuntimeError("неожиданный ответ сервера")
