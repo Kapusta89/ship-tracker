@@ -2787,16 +2787,35 @@ class RadarCore:
         """Строка про причал для карточки."""
         return places.describe(place)
 
+    def _fresh_sources(self, mmsi, hours=6.0):
+        """Последние точки источников, которым можно верить сейчас.
+
+        Сравнивать свежую позицию с записью суточной давности бессмысленно:
+        судно за это время прошло сотни километров, и в журнал попадали
+        ложные «источники расходятся».
+        """
+        try:
+            rows = self.store.source_positions(mmsi)
+        except Exception:
+            return []
+        limit = datetime.now() - timedelta(hours=hours)
+        fresh = []
+        for row in rows:
+            try:
+                moment = parse_iso(row.get("ts"))
+            except (TypeError, ValueError):
+                continue
+            if moment is None or moment >= limit:
+                fresh.append(row)
+        return fresh
+
     def _log_source_conflict(self, mmsi, lat, lon, threshold_km=5.0, quiet_minutes=60):
         """Пишет в журнал, если источники разошлись сильнее порога.
 
         Молча выбирать «самый свежий» нельзя: при ошибке в источнике судно
         уезжает на десятки километров, и это должно быть видно в журнале.
         """
-        try:
-            rows = self.store.source_positions(mmsi)
-        except Exception:
-            return
+        rows = self._fresh_sources(mmsi)
         if len(rows) < 2:
             return
         worst = 0.0
@@ -2824,10 +2843,7 @@ class RadarCore:
         Возвращает строку для карточки или пустую строку, если источник один:
         незачем писать «сверено», когда сверять нечего.
         """
-        try:
-            rows = self.store.source_positions(mmsi)[:max_rows]
-        except Exception:
-            return ""
+        rows = self._fresh_sources(mmsi)[:max_rows]
         if len(rows) < 2:
             return ""
         names = {"aisstream": "AISStream", "openwaters": "Open Waters",
