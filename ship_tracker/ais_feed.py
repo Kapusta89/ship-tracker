@@ -390,6 +390,15 @@ class AISStreamFeed(threading.Thread):
         self.last_error = ""
         self.connected_since = None
 
+    def source_name(self) -> str:
+        """Короткое имя источника: aisstream или openwaters."""
+        url = (getattr(self, "stream_url", "") or "").lower()
+        if "openwaters" in url:
+            return "openwaters"
+        if "aisstream" in url:
+            return "aisstream"
+        return getattr(self, "key", "") or "ais"
+
     def subscription(self) -> dict:
         url = getattr(self, "stream_url", "") or ""
         if "openwaters" in url.lower():
@@ -512,6 +521,10 @@ class AISStreamFeed(threading.Thread):
         if not event:
             return
         self.events += 1
+        # помечаем, откуда пришла точка: разные сети дают разные позиции,
+        # и в карточке видно, совпадают ли они
+        event = dict(event)
+        event.setdefault("source", self.source_name())
         self.on_event(event)
 
 

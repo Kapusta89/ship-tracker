@@ -722,6 +722,7 @@ class RadarCore:
         # правила связи с портами — иначе судно, у которого в AIS чужой порт,
         # пропадает с радара и из списков, хотя его специально отслеживают
         self.pinned_mmsis = self._load_pinned(config)
+        self._source_conflict = {}
         self._feed_lock = None
         self.feed_elsewhere = False
 
@@ -2005,6 +2006,9 @@ class RadarCore:
                           if parsed.tzinfo else parsed)
             except ValueError:
                 moment = parse_iso(seen)
+        self.store.save_source_position(
+            str(mmsi), "openwaters", data.get("lat"), data.get("lon"),
+            data.get("sog"), data.get("cog"), moment)
         fresh = self._accept_position(str(mmsi), data.get("lat"), data.get("lon"),
                                       data.get("sog"), data.get("cog"), moment)
         self.store.upsert_static(
@@ -2509,6 +2513,12 @@ class RadarCore:
         self.store.upsert_position(
             mmsi, lat, lon, event.get("sog"), event.get("cog"),
             event.get("heading"), port_name, event.get("at"))
+        # позиция каждого источника пишется отдельно: так видно, совпадают
+        # ли AISStream, снимок и прямой запрос, а не «одна точка на всех»
+        self.store.save_source_position(
+            mmsi, event.get("source") or "aisstream", lat, lon,
+            event.get("sog"), event.get("cog"), event.get("at"))
+        self._log_source_conflict(mmsi, lat, lon)
 
         if event.get("name"):
             existing = self.store.vessel(mmsi)
@@ -2776,6 +2786,73 @@ class RadarCore:
     def place_text(self, place):
         """Строка про причал для карточки."""
         return places.describe(place)
+
+    def _log_source_conflict(self, mmsi, lat, lon, threshold_km=5.0, quiet_minutes=60):
+        """Пишет в журнал, если источники разошлись сильнее порога.
+
+        Молча выбирать «самый свежий» нельзя: при ошибке в источнике судно
+        уезжает на десятки километров, и это должно быть видно в журнале.
+        """
+        try:
+            rows = self.store.source_positions(mmsi)
+        except Exception:
+            return
+        if len(rows) < 2:
+            return
+        worst = 0.0
+        for row in rows[:4]:
+            try:
+                km = geo.haversine_km(float(lat), float(lon),
+                                      float(row["lat"]), float(row["lon"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            worst = max(worst, km)
+        if worst < threshold_km:
+            return
+        now_mono = time.monotonic()
+        last = self._source_conflict.get(mmsi, 0.0)
+        if now_mono - last < quiet_minutes * 60:
+            return
+        self._source_conflict[mmsi] = now_mono
+        name = (self.store.vessel(mmsi) or {}).get("name") or mmsi
+        self.log(f"Источники расходятся: {name} — до {worst:.1f} км "
+                 f"между {len(rows[:4])} источниками.")
+
+    def sources_text(self, mmsi, max_rows=4):
+        """Сверка источников по судну: кто что прислал и насколько расходится.
+
+        Возвращает строку для карточки или пустую строку, если источник один:
+        незачем писать «сверено», когда сверять нечего.
+        """
+        try:
+            rows = self.store.source_positions(mmsi)[:max_rows]
+        except Exception:
+            return ""
+        if len(rows) < 2:
+            return ""
+        names = {"aisstream": "AISStream", "openwaters": "Open Waters",
+                 "snapshot": "снимок района", "vesselfinder": "VesselFinder",
+                 "myshiptracking": "MyShipTracking"}
+        parts = []
+        worst = 0.0
+        base = rows[0]
+        for row in rows:
+            label = names.get(str(row.get("source")), str(row.get("source")))
+            try:
+                km = geo.haversine_km(float(base["lat"]), float(base["lon"]),
+                                      float(row["lat"]), float(row["lon"]))
+            except (KeyError, TypeError, ValueError):
+                km = 0.0
+            worst = max(worst, km)
+            stamp = str(row.get("ts") or "")[11:16]
+            parts.append(f"{label} {stamp} ({float(row['lat']):.4f}, "
+                         f"{float(row['lon']):.4f})")
+        text = "Сверка источников: " + "; ".join(parts)
+        if worst * 1000 >= 200:
+            text += f" — ⚠ расхождение {worst:.1f} км"
+        else:
+            text += f" — расхождение {worst * 1000:.0f} м"
+        return text
 
     def berth_info(self, mmsi):
         """Всё о стоянках судна для карточки: частый причал и последняя стоянка.

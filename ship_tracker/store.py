@@ -123,6 +123,20 @@ CREATE TABLE IF NOT EXISTS quay_places (
     fetched_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_quay_places_area ON quay_places (area);
+
+-- Последняя позиция судна в каждом источнике отдельно. Нужна, чтобы сверять
+-- источники между собой, а не верить одному: если AISStream и снимок дают
+-- точки в разных местах, это видно в карточке, а не тонет в одной строке.
+CREATE TABLE IF NOT EXISTS source_positions (
+    mmsi   TEXT NOT NULL,
+    source TEXT NOT NULL,
+    ts     TEXT NOT NULL,
+    lat    REAL,
+    lon    REAL,
+    sog    REAL,
+    cog    REAL,
+    PRIMARY KEY (mmsi, source)
+);
 """
 
 FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "draft",
@@ -307,6 +321,37 @@ class Store:
                        updated_at = excluded.updated_at""",
                 (mmsi, lat, lon, sog, cog, heading, port, ts, ts, ts),
             )
+
+    def save_source_position(self, mmsi, source, lat, lon, sog=None, cog=None, when=None):
+        """Последняя позиция судна от конкретного источника."""
+        if not source or lat is None or lon is None:
+            return
+
+        def number(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            with self._lock, self.conn:
+                self.conn.execute(
+                    "INSERT INTO source_positions (mmsi, source, ts, lat, lon, sog, cog) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(mmsi, source) DO UPDATE SET ts=excluded.ts, "
+                    "lat=excluded.lat, lon=excluded.lon, sog=excluded.sog, cog=excluded.cog",
+                    (str(mmsi), str(source), iso(when), float(lat), float(lon),
+                     number(sog), number(cog)))
+        except Exception:
+            return
+
+    def source_positions(self, mmsi) -> list:
+        """Все источники, которые присылали позицию этого судна."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT source, ts, lat, lon, sog, cog FROM source_positions "
+                "WHERE mmsi = ? ORDER BY ts DESC", (str(mmsi),)).fetchall()
+        return [dict(row) for row in rows]
 
     def add_position(self, mmsi: str, lat: float, lon: float, sog=None, cog=None, when=None):
         # одну и ту же точку могут прислать два источника (живой AIS и снимок):
