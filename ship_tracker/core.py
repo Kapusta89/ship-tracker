@@ -2807,6 +2807,23 @@ class RadarCore:
                 continue
             if moment is None or moment >= limit:
                 fresh.append(row)
+        if len(fresh) < 2:
+            return fresh
+        # Сравнивать точки можно только рядом по времени: идущее судно за час
+        # уходит на 20 км, и «расхождение» было бы его же ходом. Оставляем
+        # записи не старше получаса от самой свежей.
+        newest = None
+        for row in fresh:
+            try:
+                moment = parse_iso(row.get("ts"))
+            except (TypeError, ValueError):
+                continue
+            if moment is not None and (newest is None or moment > newest):
+                newest = moment
+        if newest is not None:
+            near = newest - timedelta(minutes=30)
+            fresh = [row for row in fresh
+                     if (parse_iso(row.get("ts")) or newest) >= near]
         return fresh
 
     def _log_source_conflict(self, mmsi, lat, lon, threshold_km=5.0, quiet_minutes=60):
