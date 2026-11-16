@@ -1309,6 +1309,11 @@ class GoradarFeed(ServiceFeed):
                 speed = _number(row[7]) if len(row) > 7 else None
                 label = str(row[8] or "").strip() if len(row) > 8 else ""
                 when = _time(row[5], utc=True) if len(row) > 5 and row[5] else None
+                if when is None:
+                    # без времени карты точка может быть суточной давности:
+                    # подписанная текущим временем, она и портила позицию, и
+                    # давала ложные «источники расходятся» на километры
+                    continue
                 seen[mmsi] = _position(mmsi, lat, lon, sog=speed, cog=course,
                                        heading=heading, source="goradar",
                                        at=when, type_label=label)
