@@ -150,6 +150,9 @@ DEFAULT_CONFIG = {
     "min_speed_knots": 2.0,
     "alert_cooldown_hours": 6,
     "stale_minutes": 15,
+    # Судно, у которого позиция старше этого срока, не показываем ни на радаре,
+    # ни во вкладках: это уже не обстановка, а мусор в списке.
+    "hide_after_hours": 20,
     # Бесплатный ключ VesselAPI (150 вызовов в месяц): перед тем как убрать
     # устаревшее судно со всех вкладок, им проверяется его AIS-позиция.
     "vesselapi_key": "",
@@ -522,8 +525,23 @@ def stale_hours(vessel, config) -> float:
     return base
 
 
+def hide_after_hours(config) -> float:
+    """Срок, после которого судно убирается со всех экранов совсем."""
+    try:
+        hours = float((config or {}).get("hide_after_hours") or 20)
+    except (TypeError, ValueError):
+        hours = 20.0
+    return max(1.0, hours)
+
+
+def is_abandoned(vessel, config) -> bool:
+    """Судно молчит дольше `hide_after_hours` (или позиции нет вовсе)."""
+    age = position_age_hours(vessel)
+    return age is None or age > hide_after_hours(config)
+
+
 def is_stale(vessel, config) -> bool:
-    """Пора ли прятать судно: позиции нет или она старше его порога."""
+    """Пора ли помечать судно устаревшим (бледная точка, пометка в карточке)."""
     age = position_age_hours(vessel)
     return age is None or age > stale_hours(vessel, config)
 
@@ -1544,7 +1562,11 @@ class RadarCore:
         cached[key] = (now, value)
         return value
 
-    def related_vessels(self, limit=1000) -> list:
+    def visible(self, rows) -> list:
+        """Убирает суда, которые молчат дольше `hide_after_hours`."""
+        return [row for row in rows if not self.is_abandoned(row)]
+
+    def related_vessels(self, limit=1000, include_old=False) -> list:
         """Только суда, связанные с нашими портами — для карты и списков.
 
         База чистится реже, чем приходят сообщения, поэтому судно, которое
@@ -1552,11 +1574,12 @@ class RadarCore:
         уже не попадает: фильтр проверяется при каждой отрисовке.
         """
         def select():
-            return [vessel for vessel in self.store.vessels(limit)
+            rows = [vessel for vessel in self.store.vessels(limit)
                     if self._vessel_related(vessel.get("mmsi"), vessel.get("lat"),
                                             vessel.get("lon"), vessel)]
+            return rows if include_old else self.visible(rows)
 
-        return self._cached_selection(("related", limit), select)
+        return self._cached_selection(("related", limit, include_old), select)
 
     def sea_vessels(self, limit=1000) -> list:
         """Суда, которые прямо сейчас находятся в море.
@@ -1672,6 +1695,16 @@ class RadarCore:
                 return 0.25
         return stale_hours(vessel, self.config)
 
+    def hide_after_hours(self) -> float:
+        return hide_after_hours(self.config)
+
+    def is_abandoned(self, vessel) -> bool:
+        """Скрывать ли судно полностью: молчит дольше `hide_after_hours`."""
+        mmsi = str((vessel or {}).get("mmsi") or "")
+        if mmsi and mmsi in getattr(self, "pinned_mmsis", ()):
+            return False
+        return is_abandoned(vessel, self.config)
+
     def is_stale(self, vessel) -> bool:
         """Пора ли прятать судно из вкладок: позиции нет или она старая."""
         return is_stale(vessel, self.config)
@@ -1711,16 +1744,22 @@ class RadarCore:
             return f"идёт к нам по курсу: {approach.get('port_name')}"
         return None
 
-    def port_focus_vessels(self, limit=3000) -> list:
-        """Суда нашей обстановки — то, что рисуется на радаре."""
+    def port_focus_vessels(self, limit=3000, include_old=False) -> list:
+        """Суда нашей обстановки — то, что рисуется на радаре.
+
+        Молчащие дольше `hide_after_hours` сюда не попадают: на радаре и во
+        вкладках остаётся только то, что реально на связи. `include_old` нужен
+        поиску устаревших судов — ему как раз нужны те, кого мы спрятали.
+        """
         def select():
             try:
                 rows = self.store.vessels(limit)
             except Exception:
                 return []
-            return [row for row in rows if self.port_focus(row)]
+            rows = [row for row in rows if self.port_focus(row)]
+            return rows if include_old else self.visible(rows)
 
-        return self._cached_selection(("focus", limit), select, seconds=3.0)
+        return self._cached_selection(("focus", limit, include_old), select, seconds=3.0)
 
     # ------------------------- суда без нашего порта в AIS, но идущие к нам
     def _setting_float(self, name, default: float) -> float:
@@ -2052,7 +2091,7 @@ class RadarCore:
     def stale_focus(self, max_age_hours=48.0, limit=40) -> list:
         """Суда нашей обстановки с устаревшей позицией — кого искать заново."""
         result = []
-        for vessel in self.port_focus_vessels(3000):
+        for vessel in self.port_focus_vessels(3000, include_old=True):
             age = position_age_hours(vessel)
             if age is None or age <= stale_hours(vessel, self.config):
                 continue
