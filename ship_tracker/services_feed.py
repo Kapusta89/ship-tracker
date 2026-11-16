@@ -1061,7 +1061,13 @@ class MarineTrafficFeed(ServiceFeed):
         if isinstance(data, dict) and data.get("errors"):
             text = service_error_text(data)
             raise RuntimeError(text or "сервер MarineTraffic вернул ошибку")
-        rows = data.get("DATA") if isinstance(data, dict) else data
+        # старые версии отдают DATA, новая AIS API (v9) — data;
+        # ниже лежит сам массив судов
+        rows = data
+        if isinstance(data, dict):
+            rows = data.get("DATA") or data.get("data") or []
+            if isinstance(rows, dict):
+                rows = rows.get("vessels") or rows.get("DATA") or []
         if not isinstance(rows, list):
             raise RuntimeError("неожиданный ответ сервера")
 
