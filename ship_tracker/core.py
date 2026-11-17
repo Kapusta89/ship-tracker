@@ -2071,6 +2071,75 @@ class RadarCore:
         self.store.upsert_static(str(mmsi), **self.merged_static(str(mmsi)))
         return dict(data, fresh=bool(fresh))
 
+    def refresh_card(self, mmsi, name="") -> dict | None:
+        """Разовая карточка судна на Ship Radar 24 — по кнопке «Обновить».
+
+        Open Waters знает не все суда: местные буксиры и катера есть только
+        в карточке сайта (именно оттуда пришла позиция STAR). Запрашиваем
+        не чаще раза в две минуты на судно, чтобы не злить сайт.
+        """
+        mmsi = str(mmsi or "").strip()
+        if not mmsi or not str(name or "").strip():
+            return None
+        now = time.monotonic()
+        asked = getattr(self, "_card_asked", None)
+        if asked is None:
+            asked = self._card_asked = {}
+        if now - asked.get(mmsi, -1e9) < 120.0:
+            return None
+        asked[mmsi] = now
+        try:
+            feed = services_feed.build(
+                "srd", self._receive, self.log, self.stop_event,
+                vessels=lambda: [])
+        except Exception as error:
+            self.log(f"Карточка {mmsi}: {error}")
+            return None
+        if feed is None:
+            return None
+        try:
+            return feed.poll_vessel(mmsi, name)
+        except Exception as error:
+            self.log(f"Карточка {mmsi}: {error}")
+            return None
+
+    def refresh_vessel_now(self, mmsi) -> dict:
+        """Обновляет одно судно прямо сейчас: Open Waters, затем карточка сайта.
+
+        Возвращает короткий отчёт для карточки в окне: что ответило и
+        появилась ли новая позиция.
+        """
+        mmsi = str(mmsi or "").strip()
+        if not mmsi:
+            return {"text": "судно не выбрано", "fresh": False}
+        parts = []
+        fresh = False
+        data = None
+        try:
+            data = self.refresh_vessel(mmsi)
+        except Exception as error:
+            parts.append(f"Open Waters: ошибка ({error})")
+        if data:
+            fresh = bool(data.get("fresh"))
+            parts.append("Open Waters: новая позиция" if fresh
+                         else "Open Waters: позиция без изменений")
+        elif not parts:
+            parts.append("Open Waters: судна нет в базе")
+        if not fresh:
+            row = self.store.vessel(mmsi) or {}
+            name = str(row.get("name") or "")
+            card = self.refresh_card(mmsi, name)
+            if card and card.get("lat") is not None:
+                parts.append("карточка сайта: позиция обновлена")
+                fresh = True
+            elif card:
+                parts.append("карточка сайта: прочитана, позиции нет")
+            elif name:
+                parts.append("карточка сайта: только что запрашивалась")
+            else:
+                parts.append("карточки нет: имя судна неизвестно")
+        return {"text": "; ".join(parts), "fresh": fresh}
+
     def refresh_focus(self, limit=20) -> dict:
         """Обновляет по прямому запросу наши суда и закреплённые (pinned)."""
         focus = []

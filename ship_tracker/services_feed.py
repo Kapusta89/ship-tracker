@@ -1636,6 +1636,65 @@ class ShipRadarDetailsFeed(ServiceFeed):
         slug = re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-")
         return SHIPRADAR_CARD_URL.format(slug=slug or "x", mmsi=mmsi)
 
+    def _store_card(self, mmsi, name, card) -> int:
+        """Пишет в базу позицию и паспорт из карточки; 1 — если был паспорт."""
+        if not card:
+            return 0
+        if card.get("lat") is not None and card.get("lon") is not None:
+            # точка из карточки идёт в общий поток как обычная позиция:
+            # источник подписан «srd», чтобы сверка и журнал видели,
+            # откуда она пришла
+            self.emit({"kind": "position", "mmsi": mmsi,
+                       "lat": card["lat"], "lon": card["lon"],
+                       "sog": card.get("sog"), "cog": card.get("cog"),
+                       "heading": None,
+                       "name": card.get("name") or name or "",
+                       "at": card.get("seen_at") or datetime.now(),
+                       "source": "srd"})
+        if not any(card.get(key) for key in
+                   ("name", "type_text", "draft", "length_m", "beam_m",
+                    "destination")):
+            return 0
+        code = None
+        try:
+            import ais_feed
+            code = ais_feed.type_code_for_label(card.get("type_text"))
+        except Exception:
+            code = None
+        self.emit({"kind": "static", "mmsi": mmsi,
+                   "name": card.get("name") or "",
+                   "imo": card.get("imo") or "",
+                   "callsign": card.get("callsign") or "",
+                   "type_code": code,
+                   "type_label": card.get("type_text") or "",
+                   "destination": card.get("destination") or "",
+                   "draft": card.get("draft"),
+                   "length_m": card.get("length_m"),
+                   "beam_m": card.get("beam_m"),
+                   "eta_declared": None,
+                   "at": datetime.now(),
+                   "source": "srd"})
+        return 1
+
+    def poll_vessel(self, mmsi, name="") -> dict | None:
+        """Разовая карточка одного судна — по кнопке «Обновить» и автообновлению.
+
+        Журнал попыток не мешает: судно попросили вручную, значит читаем прямо
+        сейчас. Ошибку отдаём вызывающему, чтобы окно показало её заметно.
+        """
+        mmsi = str(mmsi or "").strip()
+        if not mmsi:
+            return None
+        response = self.http().get(self.url_for(mmsi, name), timeout=30)
+        response.raise_for_status()
+        card = parse_vessel_card(response.text)
+        self.attempts[mmsi] = {"at": time.time(), "ok": True}
+        self._save_attempts()
+        if card:
+            self._store_card(mmsi, name, card)
+        self.ok(1 if card else 0, "карточка по запросу")
+        return card
+
     def poll_once(self):
         session = self.http()
         targets = self.candidates()
@@ -1660,39 +1719,7 @@ class ShipRadarDetailsFeed(ServiceFeed):
                 self.stop_event.wait(self.pause)
                 continue
             self.attempts[mmsi] = {"at": time.time(), "ok": True}
-            if card and card.get("lat") is not None and card.get("lon") is not None:
-                # точка из карточки идёт в общий поток как обычная позиция:
-                # источник подписан «srd», чтобы сверка и журнал видели,
-                # откуда она пришла
-                self.emit({"kind": "position", "mmsi": mmsi,
-                           "lat": card["lat"], "lon": card["lon"],
-                           "sog": card.get("sog"), "cog": card.get("cog"),
-                           "heading": None,
-                           "name": card.get("name") or name or "",
-                           "at": card.get("seen_at") or datetime.now(),
-                           "source": "srd"})
-            if card and any(card.get(key) for key in
-                            ("name", "type_text", "draft", "length_m", "beam_m",
-                             "destination")):
-                code = None
-                try:
-                    import ais_feed
-                    code = ais_feed.type_code_for_label(card.get("type_text"))
-                except Exception:
-                    code = None
-                self.emit({"kind": "static", "mmsi": mmsi,
-                           "name": card.get("name") or "",
-                           "imo": card.get("imo") or "",
-                           "callsign": card.get("callsign") or "",
-                           "type_code": code,
-                           "type_label": card.get("type_text") or "",
-                           "destination": card.get("destination") or "",
-                           "draft": card.get("draft"),
-                           "length_m": card.get("length_m"),
-                           "beam_m": card.get("beam_m"),
-                           "eta_declared": None,
-                           "at": datetime.now(),
-                           "source": "srd"})
+            if self._store_card(mmsi, name, card):
                 filled += 1
             self.stop_event.wait(self.pause)
         self._save_attempts()

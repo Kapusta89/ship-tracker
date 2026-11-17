@@ -39,7 +39,9 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.45"
+APP_VERSION = "2026.12.46"
+# Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
+AUTO_REFRESH_SECONDS = 60.0
 
 import ais_feed
 import analysis
@@ -846,6 +848,8 @@ class App:
                     self.show_banner(payload)
                 elif kind == "photo":
                     self.show_photo(*payload)
+                elif kind == "action":
+                    self.action_var.set(payload)
                 elif kind == "refresh":
                     self._slow_tick()
         except queue.Empty:
@@ -887,6 +891,15 @@ class App:
                                 font=("Segoe UI", 11, "bold"), anchor="center", padding=6)
         self.banner.pack(fill="x", padx=10, pady=(0, 4))
         self.banner.pack_forget()
+
+        # постоянная полоса ошибок: связь и ключи должны быть видны сразу,
+        # а не только в журнале на последней вкладке
+        self.problem_var = tk.StringVar(value="")
+        self.problem_banner = ttk.Label(self.root, textvariable=self.problem_var,
+                                        background="#b3261e", foreground="#ffffff",
+                                        font=("Segoe UI", 11, "bold"), anchor="center",
+                                        padding=6, wraplength=1160, justify="left")
+        self._problems_shown = False
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=10, pady=4)
@@ -943,6 +956,10 @@ class App:
         ttk.Button(bar, text="■ Остановить", command=self.stop_core).pack(side="left", padx=(6, 0))
         self.stats_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.stats_var, foreground="#555").pack(side="left", padx=16)
+        # подтверждение нажатий «Обновить»: сразу видно, что кнопка сработала
+        self.action_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self.action_var, foreground="#1b5e20",
+                  wraplength=520).pack(side="right", padx=(0, 12))
         ttk.Button(bar, text="Открыть папку данных",
                    command=lambda: open_folder(DATA_DIR)).pack(side="right")
 
@@ -2057,6 +2074,13 @@ class App:
         tk, ttk = self.tk, self.ttk
         frame = self.tab_connection
         inner = self.scrollable_tab(frame)
+        top = ttk.Frame(inner)
+        top.pack(fill="x", pady=(0, 8))
+        ttk.Label(top, text="Подключение: ключ, каналы AIS и сервисы",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(top, text="Обновить",
+                   command=lambda: self.refresh_now(self.tab_connection)
+                   ).pack(side="right")
         box = ttk.Frame(inner)
         box.pack(fill="x", padx=0, pady=0)
         box.columnconfigure(1, weight=1)
@@ -2300,7 +2324,7 @@ class App:
                             "из файла и затирает несохранённые правки.",
                   foreground="#555").pack(side="left")
         ttk.Button(top, text="Обновить",
-                   command=lambda: self.refresh_tab(self.tab_filters)).pack(side="right")
+                   command=lambda: self.refresh_ui(self.tab_filters)).pack(side="right")
         box = ttk.Frame(frame)
         box.pack(fill="x", padx=10, pady=8)
         box.columnconfigure(1, weight=1)
@@ -2424,7 +2448,7 @@ class App:
         ttk.Button(box, text="Отправить тестовое сообщение",
                    command=self.test_telegram).grid(row=3, column=1, sticky="w", pady=8)
         ttk.Button(box, text="Обновить",
-                   command=lambda: self.refresh_tab(self.tab_telegram)
+                   command=lambda: self.refresh_ui(self.tab_telegram)
                    ).grid(row=3, column=2, sticky="w", pady=8)
 
         ttk.Label(
@@ -2518,7 +2542,7 @@ class App:
                                     self.log_text.delete("1.0", "end"),
                                     self.log_text.configure(state="disabled"))).pack(side="left")
         ttk.Button(top, text="Обновить",
-                   command=lambda: self.refresh_tab(self.tab_log)).pack(side="left", padx=(6, 0))
+                   command=lambda: self.refresh_ui(self.tab_log)).pack(side="left", padx=(6, 0))
         ttk.Label(top, text=f"База: {DB_PATH}", foreground="#777").pack(side="right")
         self.log_text = tk.Text(frame, state="disabled", wrap="word", font=("Consolas", 9))
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.log_text.yview)
@@ -2973,6 +2997,7 @@ class App:
             f"(код AIS {vessel.get('type_code')}, {vessel.get('type_label') or '—'})",
             f"Назначение: {vessel.get('destination') or '—'}",
         ]
+        lines += self.coords_lines(vessel, mmsi)
         # история поля Destination: капитан меняет его в AIS, и порт в карточке
         # может «переехать» — без этой строки выглядит как ошибка программы
         try:
@@ -3055,7 +3080,6 @@ class App:
             f"Курс: {fmt_number(vessel.get('cog'))}°",
             f"Осадка: {fmt_number(vessel.get('draft'))} м",
             f"В порту: {vessel.get('port') or '—'}",
-            f"Координаты: {fmt_number(vessel.get('lat'))}, {fmt_number(vessel.get('lon'))}",
             f"Обновлено: {self.fmt_time(core_module.position_stamp(vessel))}"
             f" ({metrics.stale_note(dict(vessel, updated_at=core_module.position_stamp(vessel)),
                                   self.core.stale_hours())})",
@@ -3209,6 +3233,90 @@ class App:
                 lines.append(f"  {visit['port']}: {self.fmt_time(visit.get('entered_at'))} → {left}{span}"
                              + (f" · {visit_cargo}" if visit_cargo else "") + drafts)
         return "\n".join(lines)
+
+    def coord_place(self, lat, lon) -> str:
+        """Ближайший наш порт и расстояние до него — по текущей точке."""
+        try:
+            ports = self.config.get("ports") or []
+        except Exception:
+            ports = []
+        best = None
+        for port in ports:
+            try:
+                km = geo.haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if best is None or km < best[0]:
+                best = (km, port.get("name") or "")
+        if not best:
+            return ""
+        return f"{best[0]:.1f} км от {best[1]}"
+
+    def coords_lines(self, vessel, mmsi):
+        """Блок «текущие координаты»: пересчитывается на каждом такте окна.
+
+        Координаты берутся из базы заново, а не из текста карточки, поэтому
+        новая точка от любого источника появляется через секунду-две после
+        записи — без нажатия «Обновить».
+        """
+        head = "ТЕКУЩИЕ КООРДИНАТЫ (обновляются автоматически)"
+        lat, lon = vessel.get("lat"), vessel.get("lon")
+        if lat is None or lon is None:
+            return ["", head, "  нет данных AIS: позиция судна неизвестна", ""]
+        lat, lon = float(lat), float(lon)
+        stamp = parse_iso(core_module.position_stamp(vessel))
+        age = core_module.position_age_hours(vessel)
+        age_text = span_text(age) if age is not None else "неизвестно"
+        course = fmt_number(vessel.get("cog"))
+        lines = ["", head, f"  {lat:.5f}, {lon:.5f}",
+                 f"  ход {fmt_number(vessel.get('sog'))} уз · курс {course}"
+                 + ("°" if course not in ("—", "") else "")]
+        where = self.coord_place(lat, lon)
+        if where:
+            lines.append(f"  {where}")
+        lines.append(f"  позиция: {age_text} назад"
+                     + (f" ({stamp:%d.%m %H:%M:%S})" if stamp else ""))
+        note = getattr(self, "_auto_state", None) or {}
+        if str(note.get("mmsi")) == str(mmsi) and note.get("at"):
+            lines.append(f"  автообновление: {note['at']:%H:%M:%S} — "
+                         f"{note.get('text') or 'запрос отправлен'}")
+        else:
+            lines.append("  автообновление: включено, раз в "
+                         f"{AUTO_REFRESH_SECONDS:.0f} с")
+        lines.append("")
+        return lines
+
+    def auto_refresh_selected(self, force=False):
+        """Перезапрашивает выбранное судно, чтобы координаты были свежими.
+
+        Окно читает базу каждые две секунды, но новую точку надо у кого-то
+        спросить: раз в минуту просим Open Waters и карточку сайта ответить
+        по конкретному судну. Так открытая карточка не «замерзает» на старой
+        точке, даже если судна нет в общем потоке AIS.
+        """
+        mmsi = str(self.selected or "")
+        if not mmsi or getattr(self, "_auto_busy", False):
+            return
+        if not (self.core.running() or getattr(self.core, "feed_elsewhere", False)):
+            return
+        now = time.monotonic()
+        if not force and now - getattr(self, "_auto_at", 0.0) < AUTO_REFRESH_SECONDS:
+            return
+        self._auto_at = now
+        self._auto_busy = True
+        threading.Thread(target=self._auto_refresh_worker, args=(mmsi,),
+                         daemon=True).start()
+
+    def _auto_refresh_worker(self, mmsi):
+        text = ""
+        try:
+            result = self.core.refresh_vessel_now(mmsi)
+            text = str(result.get("text") or "")
+        except Exception as error:
+            text = f"ошибка: {error}"
+        finally:
+            self._auto_busy = False
+            self._auto_state = {"mmsi": mmsi, "at": datetime.now(), "text": text}
 
     def forecast_lines(self, vessel):
         """Блок карточки: прогноз пути на 3 суток вперёд.
@@ -3400,6 +3508,60 @@ class App:
             if var.get() != text:
                 var.set(text)
 
+    PROBLEM_WORDS = ("ошибк", "error", "invalid", "not found", "не найден",
+                     "не найдена", "не принят", "нет ответа", "не отвечает",
+                     "не удалось", "лимит", "429", "401", "403", "503",
+                     "отказ", "timeout", "timed out", "unavailable")
+
+    def collect_problems(self):
+        """Текущие ошибки связи и ключей — короткими строками для шапки."""
+        problems = []
+        try:
+            states = self.core.feeds_state()
+        except Exception:
+            states = []
+        for state in states:
+            if state.get("connected"):
+                continue
+            error = str(state.get("error") or "").strip()
+            if error:
+                problems.append(f"{state.get('name') or 'поток'}: "
+                                f"{self.short_error(error).lstrip('· ')}")
+        titles = {key: value[0] for key, value in SERVICE_SITES.items()}
+        for key, text in (getattr(self.core, "service_status", {}) or {}).items():
+            text = str(text or "")
+            low = text.lower()
+            if not text or not any(word in low for word in self.PROBLEM_WORDS):
+                continue
+            problems.append(f"{titles.get(key, key.upper())}: {text}")
+        seen, unique = set(), []
+        for item in problems:
+            item = " ".join(str(item).split())
+            if item in seen:
+                continue
+            seen.add(item)
+            unique.append(item)
+        return unique
+
+    def update_problems(self):
+        """Красная полоса под шапкой: ошибки видно на любой вкладке."""
+        problems = self.collect_problems()
+        if not problems:
+            if getattr(self, "_problems_shown", False):
+                self.problem_banner.pack_forget()
+                self._problems_shown = False
+                self.problem_var.set("")
+            return
+        text = "⚠ Ошибка подключения: " + " · ".join(problems[:3])
+        if len(problems) > 3:
+            text += f" · и ещё {len(problems) - 3} — вкладка «Подключение»"
+        if not getattr(self, "_problems_shown", False):
+            self.problem_banner.pack(fill="x", padx=10, pady=(0, 4),
+                                     before=self.notebook)
+            self._problems_shown = True
+        if self.problem_var.get() != text:
+            self.problem_var.set(text)
+
     def slow_tick(self):
         try:
             self._slow_tick()
@@ -3428,7 +3590,8 @@ class App:
                 now - getattr(self, "_traffic_drawn_at", 0.0) >= 15.0:
             self.refresh_traffic()
             self._traffic_drawn_at = now
-        if current is getattr(self, "tab_forecast_all", None) and                 now - getattr(self, "_forecast_all_drawn_at", 0.0) >= 20.0:
+        if current is getattr(self, "tab_forecast_all", None) and \
+                now - getattr(self, "_forecast_all_drawn_at", 0.0) >= 20.0:
             self.refresh_forecast_all()
             self._forecast_all_drawn_at = now
         if now - getattr(self, "_forecast_drawn_at", 0.0) >= 8.0:
@@ -3441,6 +3604,8 @@ class App:
         self.update_detail()
         self.update_track()
         self.redraw_map()
+        self.update_problems()
+        self.auto_refresh_selected()
         self.watch_foreign_feed()
 
     def watch_foreign_feed(self):
@@ -4444,14 +4609,22 @@ class App:
             self._source_checking.discard(source["key"])
         self._store_source_result(result)
 
+    def refresh_ui(self, tab=None):
+        """Перечитывает вкладку и подтверждает нажатие в нижней строке окна."""
+        self.refresh_tab(tab)
+        self.action_var.set(f"вкладка обновлена в {datetime.now():%H:%M:%S}")
+
     def refresh_now(self, tab=None):
         """Кнопка «Обновить»: перерисовать вкладку и запросить свежие данные.
 
         Таблица перечитывает базу сразу, а все включённые источники получают
         запрос на внеочередной цикл — отвечают они одновременно, каждый в
-        своём потоке, поэтому карта заполняется по мере ответов.
+        своём потоке, поэтому карта заполняется по мере ответов. Выбранное
+        судно запрашивается вне очереди: его координаты обновляются сразу.
         """
-        self.refresh_tab(tab)
+        self.refresh_ui(tab)
+        if self.selected:
+            self.auto_refresh_selected(force=True)
         threading.Thread(target=self.ask_sources_now, daemon=True).start()
 
     def ask_sources_now(self):
@@ -4461,15 +4634,23 @@ class App:
         except Exception as error:
             self.log(f"Обновление источников: {error}")
             return 0
+        stamp = f"{datetime.now():%H:%M:%S}"
         if asked:
             self.log(f"Обновление данных запрошено у всех включённых источников ({asked}) — "
                      f"ответы придут одновременно.")
+            self.events.put(("action", f"{stamp}: запрос отправлен источникам ({asked}), "
+                                       f"данные придут по мере ответов"))
         elif getattr(self.core, "feeds", None):
             self.log(f"Свежие данные только что запрашивались: подождите "
                      f"{core_module.MIN_SOURCE_POLL_SECONDS:g} с и нажмите снова.")
+            self.events.put(("action", f"{stamp}: источники опрошены только что, "
+                                       f"повторите через "
+                                       f"{core_module.MIN_SOURCE_POLL_SECONDS:g} с"))
         else:
             self.log("Нет запущенных источников: включите их галочками в «Источниках» "
                      "или проверьте ключи API.")
+            self.events.put(("action", f"{stamp}: нет запущенных источников — "
+                                       f"проверьте ключи на вкладке «Подключение»"))
         return asked
 
     def refresh_sources_now(self):
@@ -4650,6 +4831,39 @@ def test_telegram_cli(config) -> int:
     return 0
 
 
+def refresh_mmsi_cli(args) -> int:
+    """Обновляет указанные суда прямо сейчас, без окна и без потока AIS.
+
+    Нужно, когда по конкретному судну (например, закреплённому STAR) надо
+    получить самые свежие координаты и паспорт, не дожидаясь цикла источников.
+    """
+    config_path = Path(args.config) if args.config else CONFIG_PATH
+    config = load_config(config_path)
+    store = Store(Path(config_path).parent / DB_PATH.name)
+    core = RadarCore(config, store, log=console_log)
+    mmsis = [part.strip() for part in str(args.refresh_mmsi).split(",") if part.strip()]
+    if not mmsis:
+        console_log("Не указан ни один MMSI.")
+        store.close()
+        return 2
+    for mmsi in mmsis:
+        row = store.vessel(mmsi) or {}
+        console_log(f"Обновляю {row.get('name') or 'без имени'} ({mmsi})…")
+        try:
+            result = core.refresh_vessel_now(mmsi)
+        except Exception as error:
+            console_log(f"  ошибка: {error}")
+            continue
+        console_log(f"  {result.get('text')}")
+        fresh = store.vessel(mmsi) or {}
+        console_log(f"  в базе: {fmt_number(fresh.get('lat'))}, "
+                    f"{fmt_number(fresh.get('lon'))} · ход "
+                    f"{fmt_number(fresh.get('sog'))} уз · позиция "
+                    f"{fmt_moment(parse_iso(core_module.position_stamp(fresh)))}")
+    store.close()
+    return 0
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -4664,11 +4878,15 @@ def main():
     parser.add_argument("--api-key", help="ключ AISStream (сохранится в настройки)")
     parser.add_argument("--config", help="путь к своему config.json")
     parser.add_argument("--test-telegram", action="store_true", help="проверить Telegram")
+    parser.add_argument("--refresh-mmsi",
+                        help="обновить суда с этими MMSI (через запятую) и выйти")
     args = parser.parse_args()
 
     if args.test_telegram:
         path = Path(args.config) if args.config else CONFIG_PATH
         sys.exit(test_telegram_cli(load_config(path)))
+    if args.refresh_mmsi:
+        sys.exit(refresh_mmsi_cli(args))
     if args.headless:
         sys.exit(headless(args))
     try:
