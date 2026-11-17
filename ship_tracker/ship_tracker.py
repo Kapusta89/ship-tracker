@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.46"
+APP_VERSION = "2026.12.48"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -270,6 +270,33 @@ class RadarCanvas:
 
     # -- вид
     def _initial_view(self):
+        """Стартовый вид — по нашим портам, а не по всему району AIS.
+
+        В настройках район может быть задан широко (вся акватория Чёрного
+        моря), и тогда масштаб выходил в 17–18°: вместо портов на экране была
+        почти вся карта, а суда — горсткой точек в углу. Считаем рамку по
+        портам наблюдения: Измаил, Вилково, Затока, Черноморск, Одесса,
+        Южный, Очаков.
+        """
+        points = []
+        for port in self.config.get("ports") or []:
+            try:
+                points.append((float(port["lat"]), float(port["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if points:
+            lats = [lat for lat, _ in points]
+            lons = [lon for _, lon in points]
+            # снизу запас больше: суда у Измаила и Вилково стоят ниже портов
+            lat_lo, lat_hi = min(lats) - 0.38, max(lats) + 0.15
+            lon_lo, lon_hi = min(lons) - 0.45, max(lons) + 0.45
+            center_lat = (lat_lo + lat_hi) / 2
+            center_lon = (lon_lo + lon_hi) / 2
+            cos_lat = max(0.05, math.cos(math.radians(center_lat)))
+            # ширина в градусах; по высоте помещается span * height / (width * cos)
+            span = max(lon_hi - lon_lo,
+                       (lat_hi - lat_lo) * 900 / (575 * cos_lat))
+            return center_lat, center_lon, max(0.4, min(25.0, span))
         boxes = self.config.get("bounding_boxes") or geo.DEFAULT_BOUNDING_BOXES
         try:
             (south, west), (north, east) = boxes[0]
@@ -280,7 +307,37 @@ class RadarCanvas:
 
     def fit_all(self):
         self.center_lat, self.center_lon, self.span = self._initial_view()
+        # следующий кадр уточнит вид по реальному размеру холста
+        self._view_ready = False
         self.request_redraw()
+
+    def fit_ports(self, width, height):
+        """Вид по портам наблюдения с точным учётом размера холста.
+
+        Ширина задаётся в градусах долготы, а по высоте помещается
+        `span * height / (width * cos широты)` градусов широты — поэтому
+        запас по широте считается отдельно, иначе суда у Измаила (они южнее
+        порта) обрезались нижним краем карты.
+        """
+        points = []
+        for port in self.config.get("ports") or []:
+            try:
+                points.append((float(port["lat"]), float(port["lon"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not points:
+            return
+        lats = [lat for lat, _ in points]
+        lons = [lon for _, lon in points]
+        lat_lo, lat_hi = min(lats) - 0.38, max(lats) + 0.15
+        lon_lo, lon_hi = min(lons) - 0.45, max(lons) + 0.45
+        self.center_lat = (lat_lo + lat_hi) / 2
+        self.center_lon = (lon_lo + lon_hi) / 2
+        cos_lat = max(0.05, math.cos(math.radians(self.center_lat)))
+        self.span = max(lon_hi - lon_lo,
+                        (lat_hi - lat_lo) * max(1.0, width) /
+                        max(1.0, height * cos_lat))
+        self.span = max(0.4, min(25.0, self.span))
 
     def zoom(self, factor):
         self.span = max(0.04, min(25.0, self.span / factor))
@@ -383,7 +440,8 @@ class RadarCanvas:
         cos_lat = max(0.05, math.cos(math.radians(self.center_lat)))
         width_deg = (max(lons) - min(lons)) * margin
         height_deg = (max(lats) - min(lats)) * margin
-        self.span = max(0.04, min(25.0, max(width_deg, height_deg / cos_lat)))
+        # больше 8° показывать смысла нет: суда превращаются в точку у порта
+        self.span = max(0.04, min(8.0, max(width_deg, height_deg / cos_lat)))
         self.request_redraw()
 
     # -- отрисовка
@@ -400,9 +458,16 @@ class RadarCanvas:
             height = 560
         if width < 20 or height < 20:
             return
+        if not getattr(self, "_view_ready", False):
+            # первый кадр после запуска: вид по портам под реальный размер окна
+            self._view_ready = True
+            self.fit_ports(width, height)
         projector = geo.Projector(width, height, self.center_lat, self.center_lon, self.span)
         self._draw_grid(projector, width, height)
-        self._draw_ports(projector)
+        # легенда живёт внизу слева: фон рисуем сразу, чтобы подписи судов
+        # и портов на него не заезжали
+        boxes = [self._draw_legend_background(width, height)]
+        self._draw_ports(projector, width, height, boxes)
         self._draw_forecasts(projector, vessels)
         self._draw_track(projector)
         self._hits = []
@@ -489,14 +554,8 @@ class RadarCanvas:
             if is_selected:
                 # у выбранного судна на карте всегда есть подпись с данными
                 self._draw_selected_label(canvas, x, y, vessel, age, fresh)
-            elif drawn % 7 == 0 and vessel.get("name"):
-                if self.schematic_view:
-                    canvas.create_text(x + 7, y - 7, text="", anchor="w",
-                                       fill="#5d7280", font=("Consolas", 5))
-                else:
-                    canvas.create_text(x + 7, y - 7, text=vessel["name"], anchor="w",
-                                       fill="#d7e6ee" if not stale else "#5d7280",
-                                       font=("Consolas", 7))
+            elif vessel.get("name") and not self.schematic_view:
+                self._draw_vessel_label(canvas, x, y, vessel["name"], stale, boxes)
         # Весь остальной трафик района: мелкие точки, чтобы на карте были все суда.
         shown_traffic = 0
         traffic_hidden = 0
@@ -591,25 +650,85 @@ class RadarCanvas:
                                        fill=label_color, font=("Consolas", font_size))
             lon += step
 
-    def _draw_ports(self, projector):
+    @staticmethod
+    def _free_space(x, y, w, h, boxes) -> bool:
+        """Не занято ли место под подпись: подписи не должны наезжать друг на друга."""
+        for left, top, box_w, box_h in boxes:
+            if x < left + box_w and x + w > left and y < top + box_h and y + h > top:
+                return False
+        return True
+
+    def _draw_vessel_label(self, canvas, x, y, name, stale, boxes):
+        """Подпись судна — только если рядом нет другой подписи.
+
+        У причалов Измаила суда стоят вплотную, и раньше имена ложились друг
+        на друга нечитаемым клубком.
+        """
+        text = str(name)[:18]
+        width = max(18, len(text) * 5 + 4)
+        left, top = x + 7, y - 13
+        if not self._free_space(left, top, width, 12, boxes):
+            return
+        boxes.append((left, top, width, 12))
+        canvas.create_text(left, y - 7, text=text, anchor="w",
+                           fill="#d7e6ee" if not stale else "#5d7280",
+                           font=("Consolas", 7))
+
+    LEGEND_WIDTH = 430
+    LEGEND_HEIGHT = 100
+
+    def _legend_rect(self, width, height):
+        """Рамка легенды — в левом верхнем углу.
+
+        Там почти всегда пустая вода и суша к северо-западу от Одессы, а внизу
+        слева стоят суда у Измаила и Вилково: легенда их закрывала.
+        """
+        w = min(self.LEGEND_WIDTH, max(200, width - 20))
+        h = min(self.LEGEND_HEIGHT, max(60, height - 40))
+        return (10, 10, 10 + w, 10 + h)
+
+    def _draw_legend_background(self, width, height):
+        left, top, right, bottom = self._legend_rect(width, height)
+        self.canvas.create_rectangle(left, top, right, bottom, fill="#0a1a24",
+                                     outline="#1d3d4f", tags=("legend",))
+        return (left, top, right - left, bottom - top)
+
+    def _draw_ports(self, projector, width=None, height=None, boxes=None):
         canvas = self.canvas
+        width = width or (self.canvas.winfo_width() or 800)
+        height = height or (self.canvas.winfo_height() or 560)
         for port in self.config.get("ports") or []:
             try:
                 x, y = projector.to_screen(port["lat"], port["lon"])
             except (KeyError, TypeError, ValueError):
                 continue
+            # порт за краем экрана не подписываем: раньше его имя висело
+            # в воздухе у границы карты
+            if not (-10 <= x <= width + 10 and -10 <= y <= height + 10):
+                continue
             radius = max(4.0, projector.km_to_px(float(port.get("radius_km") or 5)))
+            label = port.get("name") or ""
+            label_w = max(20, len(label) * 6)
             if self.schematic_view:
-                # Схемatical view: simpler port markers (no inner circle / label simplified)
                 canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                    outline="#1c6b42", width=2)
-                canvas.create_text(x, y + radius + 6, text=port.get("name") or "",
+                label_x, label_y = x - label_w / 2, y + radius + 1
+                if boxes is not None:
+                    if not self._free_space(label_x, label_y, label_w, 10, boxes):
+                        continue
+                    boxes.append((label_x, label_y, label_w, 10))
+                canvas.create_text(x, y + radius + 6, text=label,
                                    fill="#607080", font=("Consolas", 6, "bold"))
             else:
                 canvas.create_oval(x - radius, y - radius, x + radius, y + radius,
                                    outline="#1f7a52", dash=(3, 3))
                 canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill="#35d08a", outline="")
-                canvas.create_text(x, y - radius - 8, text=port.get("name") or "",
+                label_x, label_y = x - label_w / 2, y - radius - 18
+                if boxes is not None:
+                    if not self._free_space(label_x, label_y, label_w, 12, boxes):
+                        continue
+                    boxes.append((label_x, label_y, label_w, 12))
+                canvas.create_text(x, y - radius - 8, text=label,
                                    fill="#7fe0b3", font=("Consolas", 8, "bold"))
 
     def _draw_track(self, projector):
@@ -726,37 +845,35 @@ class RadarCanvas:
     def _draw_legend(self, width, height, vessels, targets, drawn, stale, without_position=0,
                      traffic=0, stale_hidden=0, traffic_hidden=0, faded=0, newest=None,
                      approach=0):
-        fresh = drawn - stale - faded
+        """Легенда внизу слева, на своей подложке.
+
+        Раньше семь строк мелкого текста лежали прямо на карте в левом верхнем
+        углу и закрывали как раз район Измаила с судами.
+        """
+        left, top, right, bottom = self._legend_rect(width, height)
+        fresh = max(0, drawn - faded)
         berth = core_module.berth_stale_hours(self.config)
-        limit = (f"{self._stale_label()}"
-                 + (f", стоящие в порту — {berth:g} ч" if berth else ""))
-        text = (f"источник: живой AIS (AISStream, Open Waters)\n"
-                f"наших судов: {vessels}   целей: {targets}   на экране: {drawn}\n"
-                f"со свежим сигналом: {fresh}   стоящих со старым (приглушены): {faded}\n"
-                f"скрыто устаревших: {stale + stale_hidden} (порог {limit})\n")
+        limit = self._stale_label() + (f" / {berth:g} ч в порту" if berth else "")
+        hidden = stale_hidden + traffic_hidden
+        text = (f"на экране: {drawn} из {vessels} · целей: {targets}\n"
+                f"свежих: {fresh} · приглушены (старый сигнал): {faded}"
+                + (f" · не показано старых: {hidden}" if hidden else "") + "\n")
         if approach:
-            text += (f"идёт к нашим портам по курсу (≈, подтверждено): {approach}\n")
+            text += f"идут к нашим портам по курсу: {approach}\n"
         if newest is not None:
-            if newest < 1.0:
-                text += f"последний сигнал AIS в районе: {newest * 60:.0f} мин назад\n"
-            else:
-                text += (f"последний сигнал AIS в районе: {newest:.1f} ч назад — "
-                         f"живых приёмников у наших портов в открытых сетях нет\n")
+            text += ("последний сигнал AIS в районе: "
+                     + (f"{newest * 60:.0f} мин назад" if newest < 1.0 else
+                        f"{newest:.1f} ч назад — живых приёмников у наших портов "
+                        f"в открытых сетях нет")
+                     + "\n")
         if without_position:
-            text += (f"без позиции (только в списках): {without_position} — AIS-catcher\n")
+            text += f"без позиции (только в списках): {without_position}\n"
         if traffic:
-            text += f"трафик района (точки): {traffic}"
-            if traffic_hidden:
-                text += f", скрыто старых: {traffic_hidden}"
-            text += "\n"
-        if self.show_forecast:
-            text += (f"пунктир — прогноз выбранного судна на {int(forecast.MAX_DAYS)} сут: "
-                     f"голубой — в наш порт, жёлтый — по текущему курсу\n")
-            text += (f"план на {int(forecast.PLAN_DAYS)} дня (путь, стоянка, выход в море) — "
-                     f"во вкладке «Прогноз 4 дня»\n")
-        text += (f"масштаб: {self.span:.2f}°   район: {self.center_lat:.2f}, {self.center_lon:.2f}")
-        self.canvas.create_text(10, 10, anchor="nw", text=text,
-                                fill="#5f8ea3", font=("Consolas", 8))
+            text += f"трафик района (точки): {traffic}\n"
+        text += (f"порог свежести: {limit} · масштаб: {self.span:.2f}° · "
+                 f"район: {self.center_lat:.2f}, {self.center_lon:.2f}")
+        self.canvas.create_text(left + 8, top + 7, anchor="nw", text=text,
+                                fill="#9fc4d6", font=("Consolas", 8))
 
     def _stale_label(self):
         seconds = self.stale_seconds()
@@ -891,15 +1008,6 @@ class App:
                                 font=("Segoe UI", 11, "bold"), anchor="center", padding=6)
         self.banner.pack(fill="x", padx=10, pady=(0, 4))
         self.banner.pack_forget()
-
-        # постоянная полоса ошибок: связь и ключи должны быть видны сразу,
-        # а не только в журнале на последней вкладке
-        self.problem_var = tk.StringVar(value="")
-        self.problem_banner = ttk.Label(self.root, textvariable=self.problem_var,
-                                        background="#b3261e", foreground="#ffffff",
-                                        font=("Segoe UI", 11, "bold"), anchor="center",
-                                        padding=6, wraplength=1160, justify="left")
-        self._problems_shown = False
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=10, pady=4)
@@ -2073,6 +2181,15 @@ class App:
     def build_connection(self):
         tk, ttk = self.tk, self.ttk
         frame = self.tab_connection
+        # плашка ошибок — над прокручиваемой частью: её должно быть видно сразу,
+        # без прокрутки, а рядом ниже — поля ключей и кнопки «Проверить»
+        self.connection_problem_var = tk.StringVar(value="")
+        self.connection_problem = tk.Label(
+            frame, textvariable=self.connection_problem_var, background="#fdecea",
+            foreground="#a40000", font=("Segoe UI", 9, "bold"), anchor="w",
+            justify="left", wraplength=1180, padx=10, pady=8, relief="flat")
+        self.connection_problem.pack(fill="x", padx=10, pady=(8, 0))
+        self.update_connection_problems()
         inner = self.scrollable_tab(frame)
         top = ttk.Frame(inner)
         top.pack(fill="x", pady=(0, 8))
@@ -3409,7 +3526,8 @@ class App:
         if "401" in text or "403" in text:
             return "· ключ не принят"
         if "ключ" in text.lower():
-            return "· нужен ключ AISStream"
+            return ("· нужен ключ AISStream" if "aisstream" in text.lower()
+                    else "· ключ не принят сервисом")
         if not text:
             return ""
         return "· " + text.split(".")[0][:60]
@@ -3533,7 +3651,11 @@ class App:
             low = text.lower()
             if not text or not any(word in low for word in self.PROBLEM_WORDS):
                 continue
-            problems.append(f"{titles.get(key, key.upper())}: {text}")
+            # ядро подписывает статусы как «service-mt»: показываем название сервиса
+            name = str(key)
+            base = name.split("-")[-1]
+            title = titles.get(name) or titles.get(base) or name.upper()
+            problems.append(f"{title}: {text}")
         seen, unique = set(), []
         for item in problems:
             item = " ".join(str(item).split())
@@ -3543,24 +3665,33 @@ class App:
             unique.append(item)
         return unique
 
-    def update_problems(self):
-        """Красная полоса под шапкой: ошибки видно на любой вкладке."""
+    def update_connection_problems(self):
+        """Плашка на вкладке «Подключение»: что мешает связи и что с этим делать.
+
+        В главном окне красных полос нет: они перекрывали карту и списки,
+        а решать проблему всё равно на этой вкладке — рядом с ключами.
+        """
+        var = getattr(self, "connection_problem_var", None)
+        if var is None:
+            return
         problems = self.collect_problems()
         if not problems:
-            if getattr(self, "_problems_shown", False):
-                self.problem_banner.pack_forget()
-                self._problems_shown = False
-                self.problem_var.set("")
-            return
-        text = "⚠ Ошибка подключения: " + " · ".join(problems[:3])
-        if len(problems) > 3:
-            text += f" · и ещё {len(problems) - 3} — вкладка «Подключение»"
-        if not getattr(self, "_problems_shown", False):
-            self.problem_banner.pack(fill="x", padx=10, pady=(0, 4),
-                                     before=self.notebook)
-            self._problems_shown = True
-        if self.problem_var.get() != text:
-            self.problem_var.set(text)
+            text = ("✓ Ошибок нет: все включённые каналы и сервисы на связи.\n"
+                    "Если данных по судну всё равно нет, проверьте галочку канала "
+                    "и ключ ниже, затем нажмите «Проверить».")
+        else:
+            lines = [f"⚠ Ошибок подключения: {len(problems)} — из-за них данные "
+                     f"не приходят:"]
+            for index, item in enumerate(problems[:6], 1):
+                lines.append(f"  {index}. {item}")
+            if len(problems) > 6:
+                lines.append(f"  … и ещё {len(problems) - 6}")
+            lines.append("Что делать: вставьте правильный ключ в поле сервиса ниже "
+                         "и нажмите «Проверить». Ключ AISStream берётся бесплатно "
+                         "на aisstream.io, остальные — в кабинете сервиса.")
+            text = "\n".join(lines)
+        if var.get() != text:
+            var.set(text)
 
     def slow_tick(self):
         try:
@@ -3604,7 +3735,7 @@ class App:
         self.update_detail()
         self.update_track()
         self.redraw_map()
-        self.update_problems()
+        self.update_connection_problems()
         self.auto_refresh_selected()
         self.watch_foreign_feed()
 
