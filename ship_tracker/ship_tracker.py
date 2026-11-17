@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.50"
+APP_VERSION = "2026.12.51"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -3205,6 +3205,14 @@ class App:
                        f"на {path['compass']}")
         return lines
 
+    @staticmethod
+    def card_section(title, lines):
+        """Раздел карточки: пустые разделы не печатаются вовсе."""
+        body = [str(line) for line in lines if line not in (None, "")]
+        if not body:
+            return []
+        return ["", f"── {title} " + "─" * max(2, 34 - len(title))] + body
+
     def detail_report(self, mmsi):
         if not mmsi:
             return ("Кликните по судну на радаре или дважды щёлкните строку\n"
@@ -3214,45 +3222,50 @@ class App:
         vessel = self.store.vessel(mmsi)
         if not vessel:
             expected = portcalls.expected_for_mmsi(mmsi)
-            if expected:
-                lines = [
-                    expected.get("name") or mmsi,
-                    f"MMSI: {mmsi}",
-                    f"Флаг: {flags.flag_text(mmsi)}",
-                    f"Тип: {expected.get('type') or '—'}",
-                    f"Назначение: {expected.get('port') or '—'} (наш порт)",
-                    f"Заявленный ETA: {expected.get('eta') or '—'} (UTC, передал капитан)",
-                    f"Последний сигнал: {expected.get('last_heard') or '—'}",
-                    "",
-                    "Позиции нет: судно в зоне, которую живые потоки пока не "
-                    "покрывают. Список ведёт AIS-catcher (открытая сеть приёмников).",
-                    "",
-                    "Проверка в других сервисах:",
-                ]
-                for title, url in portcalls.registry_links(None, mmsi):
-                    lines.append(f"  • {title}: {url}")
-                lines.append("")
-                lines.append("Карты судов (открываются в браузере):")
-                for title, url in portcalls.tracking_links(mmsi, expected.get("name")):
-                    lines.append(f"  • {title}: {url}")
-                return "\n".join(lines)
-            return "Судно не найдено — возможно, оно ушло из района."
-        country, iso2, emoji = flags.flag_for_mmsi(mmsi)
-        lines = [
-            vessel.get("name") or mmsi,
-            f"MMSI: {mmsi}",
-            f"Флаг: {flags.flag_text(mmsi)}" + (f" ({iso2})" if iso2 else ""),
-        ]
+            if not expected:
+                return "Судно не найдено — возможно, оно ушло из района."
+            head = [str(expected.get("name") or mmsi), f"MMSI {mmsi}",
+                    flags.flag_text(mmsi)]
+            body = self.card_section("ОЖИДАЕТСЯ В ПОРТУ", [
+                f"Порт: {expected.get('port') or '—'} (наш порт)",
+                f"Тип: {expected.get('type') or '—'}",
+                f"Заявленный ETA: {expected.get('eta') or '—'} (UTC, передал капитан)",
+                f"Последний сигнал: {expected.get('last_heard') or '—'}",
+                "Позиции нет: судно в зоне, которую живые потоки пока не покрывают. "
+                "Список ведёт AIS-catcher (открытая сеть приёмников).",
+            ])
+            links = self.card_section("ССЫЛКИ", [
+                f"  • {title}: {url}"
+                for title, url in portcalls.registry_links(None, mmsi)
+            ] + [f"  • {title}: {url}"
+                 for title, url in portcalls.tracking_links(mmsi, expected.get("name"))])
+            return "\n".join(head + body + links)
+
+        # ---- шапка: кто это
+        ids = [f"MMSI {mmsi}"]
         if vessel.get("imo"):
-            lines.append(f"IMO: {vessel['imo']}")
-        lines += [
-            f"Тип: {ais_feed.type_detail(vessel.get('type_code'))} "
-            f"(код AIS {vessel.get('type_code')}, {vessel.get('type_label') or '—'})",
-            f"Назначение: {vessel.get('destination') or '—'}",
-        ]
-        lines += self.coords_lines(vessel, mmsi)
-        # история поля Destination: капитан меняет его в AIS, и порт в карточке
-        # может «переехать» — без этой строки выглядит как ошибка программы
+            ids.append(f"IMO {vessel['imo']}")
+        if vessel.get("callsign"):
+            ids.append(f"позывной {vessel['callsign']}")
+        _, iso2, _ = flags.flag_for_mmsi(mmsi)
+        head = [str(vessel.get("name") or mmsi), " · ".join(ids),
+                flags.flag_text(mmsi) + (f" ({iso2})" if iso2 else "")
+                + f" · {vessel.get('type_label') or 'тип не передан'}"]
+
+        # ---- где сейчас
+        where = list(self.coords_lines(vessel, mmsi))
+        age = core_module.position_age_hours(vessel)
+        if age is not None and age > self.core.stale_hours():
+            where.append("⚠ точка выше порога свежести: по ней нельзя судить, "
+                         "куда судно идёт сейчас")
+        if vessel.get("lat") is None or vessel.get("lon") is None:
+            where.append("Позиция неизвестна: на карту не нанесено, судно есть "
+                         "в списках и в боте")
+
+        # ---- рейс: куда и когда
+        voyage = []
+        destination = str(vessel.get("destination") or "").strip()
+        voyage.append(f"Назначение: {destination or '—'}")
         try:
             changes = self.store.destination_changes(mmsi, 5)
         except Exception:
@@ -3261,118 +3274,44 @@ class App:
             history = "; ".join(
                 f"{item['old'] or '—'} → {item['new']} ({self.fmt_time(item['at'])})"
                 for item in reversed(changes))
-            lines.append(f"  назначение менялось: {history}")
+            voyage.append(f"  менялось: {history}")
+        declared = parse_iso(vessel.get("eta_declared"))
+        if declared:
+            voyage.append(f"Срок прибытия (AIS): {fmt_moment(declared)} — передаёт "
+                          f"капитан, время в UTC")
+        else:
+            voyage.append("Срок прибытия (AIS): капитан не передавал")
+        trip = self.core.voyage(vessel)
+        if trip:
+            port_name = trip.get("port_label") or trip.get("port")
+            if trip.get("in_port"):
+                voyage.append(f"До прибытия: уже в порту {port_name}")
+            elif trip.get("hours") is not None:
+                voyage.append(f"До прибытия: {duration_text(trip['hours'])} "
+                              f"({fmt_moment(trip['eta'])}), "
+                              f"{fmt_number(trip['distance_km'])} км до {port_name}")
+            else:
+                voyage.append(f"До прибытия: скорость слишком мала для расчёта "
+                              f"({fmt_number(trip['distance_km'])} км до {port_name})")
+        target = self._targets.get(mmsi)
+        if target and target.get("eta_calc"):
+            voyage.append(f"Прибытие (расчёт): {fmt_moment(target['eta_calc'])} "
+                          f"{duration_text(target.get('eta_hours'))}, "
+                          f"{fmt_number(target.get('distance_km'))} км")
+        expected = portcalls.expected_for_mmsi(mmsi)
+        if expected:
+            voyage.append(f"Ожидается в {expected.get('port')}: ETA "
+                          f"{expected.get('eta') or '—'} (AIS-catcher, сигнал "
+                          f"{expected.get('last_heard') or '—'})")
+        voyage += self.forecast_lines(vessel)
+
+        # ---- порт и стоянка
+        berth_rows = []
         try:
             info = self.core.berth_info(mmsi)
         except Exception as error:
             info = {"berth": None, "last_stop": None, "since": None}
             self.log(f"Причал по истории: {error}")
-        berth = info.get("berth")
-        if berth:
-            spread = f", разброс {berth['spread_m']:.0f} м" if berth.get("spread_m") else ""
-            basis = " по своему треку" if berth.get("source") == "трек" else ""
-            lines.append(
-                f"Чаще всего разгружался: причал {berth['port']} "
-                f"({berth['lat']:.5f}, {berth['lon']:.5f}) — "
-                f"стоянок {berth['visits']}{spread}{basis}")
-            try:
-                spot = self.core.berth_place(berth["lat"], berth["lon"])
-            except Exception:
-                spot = None
-            if spot:
-                lines.append(f"Точка разгрузки: {self.core.place_text(spot)}")
-        else:
-            # своих точек за стоянки нет — показываем хотя бы центр порта
-            try:
-                usual = self.store.usual_port(mmsi)
-            except Exception:
-                usual = None
-            if usual and usual.get("port"):
-                port = self.core.port_by_name(usual["port"])
-                if port and port.get("lat") is not None and port.get("lon") is not None:
-                    where = f"{float(port['lat']):.4f}, {float(port['lon']):.4f}"
-                else:
-                    where = "координаты не заданы"
-                lines.append(f"Чаще всего разгружался: {usual['port']} ({where}) — "
-                             f"стоянок {usual['visits']}; точное место стоянки "
-                             f"в истории не сохранилось, это центр порта")
-            stop = info.get("last_stop")
-            if stop:
-                moment = stop.get("ended")
-                when = (f"{moment:%d.%m %H:%M}" if moment and
-                        moment.date() == datetime.now().date()
-                        else f"{moment:%d.%m %H:%M}" if moment else "—")
-                if stop.get("km") is not None and stop["km"] <= 50:
-                    distance = f", {stop['km']:.0f} км от {stop['port']}"
-                else:
-                    distance = ", вне наших портов — к разгрузке у нас не относится"
-                lines.append(
-                    f"Стоянок у наших портов в истории нет. Последняя стоянка в базе: "
-                    f"{stop['lat']:.4f}, {stop['lon']:.4f} — {when}{distance}")
-            elif not usual:
-                since = info.get("since")
-                since_text = (f"; в базе с {since[8:10]}.{since[5:7]} {since[11:16]}"
-                              if since else "")
-                lines.append("Стоянок у наших портов в истории нет"
-                             f"{since_text} — судно ещё не заходило к нам")
-        try:
-            sources_line = self.core.sources_text(mmsi)
-        except Exception:
-            sources_line = ""
-        if sources_line:
-            lines.append(sources_line)
-        try:
-            fields_line = self.core.field_sources_text(mmsi)
-        except Exception:
-            fields_line = ""
-        if fields_line:
-            lines.append(fields_line)
-        lines += [
-            f"Скорость: {fmt_number(vessel.get('sog'))} уз",
-            f"Размеры: {self.size_text(vessel)} (длина × ширина)",
-            f"Курс: {fmt_number(vessel.get('cog'))}°",
-            f"Осадка: {fmt_number(vessel.get('draft'))} м",
-            f"В порту: {vessel.get('port') or '—'}",
-            f"Обновлено: {self.fmt_time(core_module.position_stamp(vessel))}"
-            f" ({metrics.stale_note(dict(vessel, updated_at=core_module.position_stamp(vessel)),
-                                  self.core.stale_hours())})",
-        ]
-        age = core_module.position_age_hours(vessel)
-        if age is not None and age > self.core.stale_hours():
-            lines.append(f"⚠ Данные устарели: AIS не поступал {span_text(age)}. "
-                         f"Скорость, курс и позиция могут быть неактуальны — "
-                         f"расчёты ниже сделаны по последним известным данным и для "
-                         f"решения о движении сейчас не годятся.")
-        if vessel.get("lat") is None or vessel.get("lon") is None:
-            lines.append("Позиция: неизвестна — на карту не нанесено; судно есть в списках "
-                         f"и в боте (порт назначения: {vessel.get('destination') or '—'})")
-        declared = parse_iso(vessel.get("eta_declared"))
-        voyage = self.core.voyage(vessel)
-        if voyage:
-            port_name = voyage.get("port_label") or voyage.get("port")
-            if voyage.get("in_port"):
-                lines.append(f"До прибытия: уже в порту {port_name}")
-            elif voyage.get("hours") is not None:
-                lines.append(f"До прибытия: {duration_text(voyage['hours'])} "
-                             f"({fmt_moment(voyage['eta'])}), "
-                             f"{fmt_number(voyage['distance_km'])} км до {port_name}")
-            else:
-                lines.append(f"До прибытия: скорость слишком мала для расчёта "
-                             f"({fmt_number(voyage['distance_km'])} км до {port_name})")
-        lines.append(f"Срок прибытия (AIS): {fmt_moment(declared) if declared else '—'} "
-                      f"(передаёт капитан, в UTC)")
-        lines += self.forecast_lines(vessel)
-        expected = portcalls.expected_for_mmsi(mmsi)
-        if expected:
-            lines.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
-                         f"{expected.get('eta') or '—'} (AIS-catcher, последний сигнал "
-                         f"{expected.get('last_heard') or '—'})")
-        gfw_entry = portcalls.gfw_vessel(None, mmsi)
-        if gfw_entry:
-            lines.append(portcalls.gfw_profile_text(gfw_entry))
-        gfw_text = portcalls.gfw_gap_text(gfw_entry)
-        if gfw_text:
-            lines.append(gfw_text)
         stay = self.core.port_stay(vessel)
         if stay:
             stay_port = stay.get("port_label") or stay.get("port")
@@ -3380,102 +3319,77 @@ class App:
             if stay.get("current_hours") is not None:
                 parts.append(f"стоит {span_text(stay['current_hours'])}")
             if stay.get("typical_hours"):
-                source = ("по истории судна" if stay.get("scope") == "судно"
-                          else "по истории порта")
+                scope = ("по истории судна" if stay.get("scope") == "судно"
+                         else "по истории порта")
                 parts.append(f"обычно {span_text(stay['typical_hours'])} "
-                             f"({source}, визитов: {stay['visits']})")
+                             f"({scope}, визитов {stay.get('visits', 0)})")
             if stay.get("remaining_hours") is not None:
-                parts.append(f"осталось примерно {span_text(stay['remaining_hours'])}")
-            lines.append(f"Стоянка в {stay_port}: "
-                         + ("; ".join(parts) if parts else "наблюдений пока нет"))
-
-        cargo_info = self.core.cargo_estimate(vessel)
-        if cargo_info:
-            share = cargo_info.get("load_share")
-            if share is None:
-                lines.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т; "
-                             f"доля дедвейта неизвестна — полную осадку судна "
-                             f"программа ещё не видела")
-            else:
-                lines.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т "
-                             f"({round(share * 100)} % дедвейта ≈ "
-                             f"{fmt_tons(cargo_info['deadweight_t'])} т)")
-            lines.append(f"  расчёт: {fmt_number(cargo_info['length_m'])} × "
-                         f"{fmt_number(cargo_info['beam_m'])} м, Cb "
-                         f"{cargo_info['block_coefficient']:.2f}, осадка "
-                         f"{fmt_number(cargo_info['draft_m'])} из "
-                         f"{fmt_number(cargo_info['full_draft_m'])} м "
-                         f"({cargo_info['full_draft_source']}), "
-                         f"порожнее ≈ {fmt_tons(cargo_info['lightship_t'])} т")
-            if cargo_info.get("in_ballast"):
-                lines.append("  похоже, судно идёт в балласте: груза мало, "
-                             "остальное — балласт и запасы")
-        elif vessel.get("draft"):
-            lines.append("Груз (оценка): нет длины и ширины корпуса — "
-                         "судно их ещё не передавало")
-
-        kind, kind_detail = cargo.cargo_kind(vessel.get("type_code"))
-        if kind:
-            lines.append(f"Что везёт: {kind} — {kind_detail}")
-            lines.append("  (название груза AIS не передаёт: подпись по типу судна)")
-        path_lines = self.vessel_path_lines(mmsi)
-        if path_lines:
-            lines.append("Путь за сутки (по своим позициям AIS):")
-            lines += [f"  • {line}" for line in path_lines]
-        signals = self.core.vessel_signals(vessel)
-        if signals:
-            lines.append("Признаки (по наблюдениям программы):")
-            lines += [f"  • {signal}" for signal in signals]
-        math_lines = self.core.vessel_math(vessel)
-        if math_lines:
-            lines.append("Расчёты по данным наблюдений:")
-            lines += [f"  • {line}" for line in math_lines]
-        target = self._targets.get(mmsi)
-        if target and target.get("eta_calc"):
-            lines.append(f"Прибытие (расчёт): {fmt_moment(target['eta_calc'])} "
-                         f"{duration_text(target.get('eta_hours'))}, "
-                         f"{fmt_number(target.get('distance_km'))} км")
-        lines.append("")
-        # Ссылки на другие сервисы для проверки реальности судна
-        links = []
-        imo_l = vessel.get('imo') or mmsi
-        links.append(f"• VesselFinder: https://www.vesselfinder.com/vessels/details/{imo_l}")
-        links.append(f"• MarineTraffic: https://www.marinetraffic.com/en/ais/details/ships/mmsi:{mmsi}")
-        links.append(f"• MyShipTracking: https://www.myshiptracking.com/vessels?mmsi={mmsi}")
-        links.append(f"• AIS Stream: https://aisstream.io/v0/stream?mmsi={mmsi}")
-        links.append(f"• AIS Hub: https://www.aishub.net/vessels/mmsi:{mmsi}")
-        links.append(f"• Digitraffic: https://www.digitraffic.fi/en/marine-traffic/?mmsi={mmsi}")
-        links.append(f"• OpenCpn: https://www.opencpn.org/")
-        for title, url in portcalls.registry_links(vessel.get("imo"), mmsi):
-            links.append(f"• {title}: {url}")
-        lines.append("Проверка в других сервисах:")
-        for l in links:
-            lines.append(f"  {l}")
-        lines.append("")
-        lines.append("Карты судов (открываются в браузере):")
-        for title, url in portcalls.tracking_links(mmsi, vessel.get("name")):
-            lines.append(f"  • {title}: {url}")
-        lines.append("")
-        if target:
-            lines += [
-                "СТАТУС: ЦЕЛЬ",
-                f"Маршрут: {target['origin']} → {target['destination_port']}",
-                f"Вышел из порта: {self.fmt_time(target.get('departed_at'))}",
-                "",
-            ]
+                parts.append(f"осталось примерно "
+                             f"{span_text(stay['remaining_hours'])}")
+            berth_rows.append(f"Стоянка в {stay_port}: "
+                              + ("; ".join(parts) if parts else "наблюдений пока нет"))
+        if vessel.get("port"):
+            berth_rows.append(f"В порту: {vessel['port']}")
+        berth = info.get("berth")
+        if berth:
+            spread = (f", разброс {berth['spread_m']:.0f} м"
+                      if berth.get("spread_m") else "")
+            basis = " по своему треку" if berth.get("source") == "трек" else ""
+            berth_rows.append(
+                f"Чаще всего разгружался: причал {berth['port']} "
+                f"({berth['lat']:.5f}, {berth['lon']:.5f}) — стоянок "
+                f"{berth['visits']}{spread}{basis}")
+            try:
+                spot = self.core.berth_place(berth["lat"], berth["lon"])
+            except Exception:
+                spot = None
+            if spot:
+                berth_rows.append(f"Точка разгрузки: {self.core.place_text(spot)}")
         else:
-            lines += ["СТАТУС: не цель", self.explain(vessel), ""]
-        departures = self.store.departures(mmsi, 5)
+            try:
+                usual = self.store.usual_port(mmsi)
+            except Exception:
+                usual = None
+            if usual and usual.get("port"):
+                port = self.core.port_by_name(usual["port"])
+                if port and port.get("lat") is not None and port.get("lon") is not None:
+                    place = f"{float(port['lat']):.4f}, {float(port['lon']):.4f}"
+                else:
+                    place = "координаты не заданы"
+                berth_rows.append(f"Чаще всего разгружался: {usual['port']} ({place}) — "
+                                  f"стоянок {usual['visits']}; точное место стоянки "
+                                  f"в истории не сохранилось, это центр порта")
+            stop = info.get("last_stop")
+            if stop:
+                moment = stop.get("ended")
+                when = f"{moment:%d.%m %H:%M}" if moment else "—"
+                if stop.get("km") is not None and stop["km"] <= 50:
+                    distance = f", {stop['km']:.0f} км от {stop['port']}"
+                else:
+                    distance = ", вне наших портов — к разгрузке у нас не относится"
+                berth_rows.append(
+                    f"Стоянок у наших портов в истории нет. Последняя стоянка в базе: "
+                    f"{stop['lat']:.4f}, {stop['lon']:.4f} — {when}{distance}")
+            elif not usual:
+                since = info.get("since")
+                since_text = (f"; в базе с {since[8:10]}.{since[5:7]} {since[11:16]}"
+                              if since else "")
+                berth_rows.append("Стоянок у наших портов в истории нет"
+                                  f"{since_text} — судно ещё не заходило к нам")
+        try:
+            departures = self.store.departures(mmsi, 5)
+        except Exception:
+            departures = []
         if departures:
-            lines.append("Визиты в порты (время стоянки):")
+            berth_rows.append("Визиты (время стоянки):")
             for visit in departures:
                 entered = parse_iso(visit.get("entered_at"))
                 left_at = parse_iso(visit.get("left_at"))
                 left = self.fmt_time(visit.get("left_at")) if left_at else "на месте"
                 span = ""
                 if entered:
-                    end = left_at or datetime.now()
-                    span = f", {span_text((end - entered).total_seconds() / 3600)}"
+                    finish = left_at or datetime.now()
+                    span = f", {span_text((finish - entered).total_seconds() / 3600)}"
                 if left_at is None:
                     span += " (идёт)"
                 visit_cargo = visit.get("cargo_kind") or ""
@@ -3483,9 +3397,115 @@ class App:
                 if visit.get("draft_in") is not None or visit.get("draft_out") is not None:
                     drafts = (f" · осадка {fmt_number(visit.get('draft_in'))} → "
                               f"{fmt_number(visit.get('draft_out'))} м")
-                lines.append(f"  {visit['port']}: {self.fmt_time(visit.get('entered_at'))} → {left}{span}"
-                             + (f" · {visit_cargo}" if visit_cargo else "") + drafts)
-        return "\n".join(lines)
+                berth_rows.append(
+                    f"  {visit['port']}: {self.fmt_time(visit.get('entered_at'))} → "
+                    f"{left}{span}" + (f" · {visit_cargo}" if visit_cargo else "")
+                    + drafts)
+
+        # ---- само судно
+        ship = [f"Размеры: {self.size_text(vessel)}"]
+        draft_value = vessel.get("draft")
+        ship.append("Осадка: " + (f"{fmt_number(draft_value)} м" if draft_value
+                                  else "не передана"))
+        cargo_info = self.core.cargo_estimate(vessel)
+        if cargo_info:
+            share = cargo_info.get("load_share")
+            if share is None:
+                ship.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т; "
+                            f"доля дедвейта неизвестна — полную осадку судна "
+                            f"программа ещё не видела")
+            else:
+                ship.append(f"Груз (оценка): ≈ {fmt_tons(cargo_info['cargo_t'])} т "
+                            f"({round(share * 100)} % дедвейта ≈ "
+                            f"{fmt_tons(cargo_info['deadweight_t'])} т)")
+            ship.append(f"  расчёт: {fmt_number(cargo_info['length_m'])} × "
+                        f"{fmt_number(cargo_info['beam_m'])} м, Cb "
+                        f"{cargo_info['block_coefficient']:.2f}, осадка "
+                        f"{fmt_number(cargo_info['draft_m'])} из "
+                        f"{fmt_number(cargo_info['full_draft_m'])} м "
+                        f"({cargo_info['full_draft_source']}), порожнее ≈ "
+                        f"{fmt_tons(cargo_info['lightship_t'])} т")
+            if cargo_info.get("in_ballast"):
+                ship.append("  похоже, судно идёт в балласте: груза мало, "
+                            "остальное — балласт и запасы")
+        elif vessel.get("draft"):
+            ship.append("Груз (оценка): нет длины и ширины корпуса — "
+                        "судно их ещё не передавало")
+        kind, kind_detail = cargo.cargo_kind(vessel.get("type_code"))
+        if kind:
+            ship.append(f"Что везёт: {kind} — {kind_detail}")
+            ship.append("  (название груза AIS не передаёт: подпись по типу судна)")
+
+        # ---- путь и наблюдения
+        path_rows = []
+        path_lines = self.vessel_path_lines(mmsi)
+        if path_lines:
+            path_rows += [f"• {line}" for line in path_lines]
+        signals = self.core.vessel_signals(vessel)
+        if signals:
+            path_rows.append("Признаки:")
+            path_rows += [f"  • {signal}" for signal in signals]
+        math_rows = []
+        math_lines = self.core.vessel_math(vessel)
+        if math_lines:
+            math_rows += [f"• {line}" for line in math_lines]
+
+        # ---- источники
+        source_rows = []
+        try:
+            sources_line = self.core.sources_text(mmsi)
+        except Exception:
+            sources_line = ""
+        if sources_line:
+            source_rows.append(sources_line)
+        try:
+            fields_line = self.core.field_sources_text(mmsi)
+        except Exception:
+            fields_line = ""
+        if fields_line:
+            source_rows.append(fields_line)
+        gfw_entry = portcalls.gfw_vessel(None, mmsi)
+        if gfw_entry:
+            source_rows.append(portcalls.gfw_profile_text(gfw_entry))
+        gfw_text = portcalls.gfw_gap_text(gfw_entry)
+        if gfw_text:
+            source_rows.append(gfw_text)
+
+        # ---- статус
+        if target:
+            status = ["ЦЕЛЬ: идёт к нашему порту",
+                      f"Маршрут: {target['origin']} → {target['destination_port']}",
+                      f"Вышел из порта: {self.fmt_time(target.get('departed_at'))}"]
+        else:
+            status = ["Не цель: " + self.explain(vessel)]
+
+        # ---- ссылки
+        links = []
+        imo_key = vessel.get("imo") or mmsi
+        links.append(f"• VesselFinder: https://www.vesselfinder.com/vessels/details/{imo_key}")
+        links.append(f"• MarineTraffic: https://www.marinetraffic.com/en/ais/details/ships/mmsi:{mmsi}")
+        links.append(f"• MyShipTracking: https://www.myshiptracking.com/vessels?mmsi={mmsi}")
+        links.append(f"• AIS Stream: https://aisstream.io/v0/stream?mmsi={mmsi}")
+        links.append(f"• AIS Hub: https://www.aishub.net/vessels/mmsi:{mmsi}")
+        links.append("• Digitraffic: https://www.digitraffic.fi/en/marine-traffic/"
+                     f"?mmsi={mmsi}")
+        for title, url in portcalls.registry_links(vessel.get("imo"), mmsi):
+            links.append(f"• {title}: {url}")
+        maps = [f"  • {title}: {url}"
+                for title, url in portcalls.tracking_links(mmsi, vessel.get("name"))]
+
+        result = (head
+                  + self.card_section("ГДЕ СЕЙЧАС", where)
+                  + self.card_section("РЕЙС", voyage)
+                  + self.card_section("ПОРТ И СТОЯНКА", berth_rows)
+                  + self.card_section("СУДНО", ship)
+                  + self.card_section("ПУТЬ И ПРИЗНАКИ", path_rows)
+                  + self.card_section("РАСЧЁТЫ ПО НАБЛЮДЕНИЯМ", math_rows)
+                  + self.card_section("ИСТОЧНИКИ ДАННЫХ", source_rows)
+                  + self.card_section("СТАТУС", status)
+                  + self.card_section("ПРОВЕРИТЬ В ДРУГИХ СЕРВИСАХ", links)
+                  + self.card_section("КАРТЫ СУДОВ", maps))
+        return "\n".join(result)
 
     def coord_place(self, lat, lon) -> str:
         """Ближайший наш порт и расстояние до него — по текущей точке."""
@@ -3512,31 +3532,28 @@ class App:
         новая точка от любого источника появляется через секунду-две после
         записи — без нажатия «Обновить».
         """
-        head = "ТЕКУЩИЕ КООРДИНАТЫ (обновляются автоматически)"
         lat, lon = vessel.get("lat"), vessel.get("lon")
         if lat is None or lon is None:
-            return ["", head, "  нет данных AIS: позиция судна неизвестна", ""]
+            return ["нет данных AIS: позиция судна неизвестна"]
         lat, lon = float(lat), float(lon)
         stamp = parse_iso(core_module.position_stamp(vessel))
         age = core_module.position_age_hours(vessel)
         age_text = span_text(age) if age is not None else "неизвестно"
         course = fmt_number(vessel.get("cog"))
-        lines = ["", head, f"  {lat:.5f}, {lon:.5f}",
-                 f"  ход {fmt_number(vessel.get('sog'))} уз · курс {course}"
-                 + ("°" if course not in ("—", "") else "")]
+        lines = [f"{lat:.5f}, {lon:.5f} · ход {fmt_number(vessel.get('sog'))} уз · "
+                 f"курс {course}" + ("°" if course not in ("—", "") else "")]
         where = self.coord_place(lat, lon)
-        if where:
-            lines.append(f"  {where}")
-        lines.append(f"  позиция: {age_text} назад"
-                     + (f" ({stamp:%d.%m %H:%M:%S})" if stamp else ""))
+        position = f"позиция {age_text} назад"
+        if stamp:
+            position += f" ({stamp:%d.%m %H:%M:%S})"
+        lines.append(position + (f" · {where}" if where else ""))
         note = getattr(self, "_auto_state", None) or {}
         if str(note.get("mmsi")) == str(mmsi) and note.get("at"):
-            lines.append(f"  автообновление: {note['at']:%H:%M:%S} — "
+            lines.append(f"автообновление {note['at']:%H:%M:%S}: "
                          f"{note.get('text') or 'запрос отправлен'}")
         else:
-            lines.append("  автообновление: включено, раз в "
+            lines.append(f"автообновление включено, раз в "
                          f"{AUTO_REFRESH_SECONDS:.0f} с")
-        lines.append("")
         return lines
 
     def auto_refresh_selected(self, force=False):
