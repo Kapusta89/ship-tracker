@@ -187,6 +187,8 @@ def clean_marinetraffic_key(raw):
     if not text:
         return ""
     found = re.search(r"[0-9a-fA-F]{40}", text)
+    # Отладочные print с ключом убраны: ключ не должен попадать в консоль
+    # и журнал, а функция обязана вернуть результат, а не None.
     return found.group(0) if found else text
 
 
@@ -1043,21 +1045,23 @@ class MarineTrafficFeed(ServiceFeed):
         if not self.api_key:
             raise RuntimeError("не задан ключ API")
         key = clean_marinetraffic_key(self.api_key)
-        # API-ключ MarineTraffic — 40 шестнадцатеричных символов. Строка из
-        # девяти знаков (например «mt_946752») ключом быть не может: сервер
-        # отвечает «SERVICE KEY NOT FOUND», и без этой проверки причина
-        # оставалась загадкой.
-        if len(key) != MARINETRAFFIC_KEY_LENGTH or any(
-                symbol not in "0123456789abcdefABCDEF" for symbol in key):
-            raise RuntimeError(
-                f"ключ не той длины ({len(key)} симв.): нужен 40-значный ключ "
-                "из кабинета services.marinetraffic.com → API Keys. Это не "
-                "логин, не номер аккаунта и не часть адреса — ключ выглядит как "
-                "0123456789abcdef0123456789abcdef01234567")
-        data = self.request(
-            f"{MARINETRAFFIC_URL}/{key}",
-            params={"v": 2, "protocol": "jsono", "timespan": 15, "limit": 2000},
-            timeout=60)
+        # Решает сервер, а не наша проверка длины: ключ отправляем всегда.
+        # Раньше поле с ключом короче 40 знаков отсекалось до запроса, и
+        # человек, подгоняя длину, дописывал в ключ лишние символы.
+        if len(key) != MARINETRAFFIC_KEY_LENGTH:
+            self.log(f"{self.title}: в поле ключа {len(key)} символов, а ключ "
+                     "MarineTraffic обычно 40 знаков (0–9 и a–f) — пробую как есть.")
+        try:
+            data = self.request(
+                f"{MARINETRAFFIC_URL}/{key}",
+                params={"v": 2, "protocol": "jsono", "timespan": 15, "limit": 2000},
+                timeout=60)
+        except RuntimeError as error:
+            text = str(error)
+            if len(key) != MARINETRAFFIC_KEY_LENGTH:
+                text += (f" (в поле {len(key)} символов, а ключ MarineTraffic — "
+                         "40 знаков: похоже, скопирована часть ключа или чужой ключ)")
+            raise RuntimeError(text)
         if isinstance(data, dict) and data.get("errors"):
             text = service_error_text(data)
             raise RuntimeError(text or "сервер MarineTraffic вернул ошибку")

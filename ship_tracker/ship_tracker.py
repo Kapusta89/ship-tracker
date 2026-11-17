@@ -4338,6 +4338,14 @@ class App:
             self.log(f"{title}: не задан ключ API — проверка невозможна.")
             finish("нужен ключ API")
             return
+        if key == "mt":
+            # частая ошибка: в поле MarineTraffic оказывается ключ VesselFinder
+            # (или его первая часть) — сервер такой ключ не знает
+            other = (self.config.get("vf_key") or "").strip()
+            if other and len(other) >= 16 and other in api_key:
+                self.log("MarineTraffic: в поле вставлен ключ VesselFinder, а не "
+                         "MarineTraffic — их нельзя путать, сервер отвечает "
+                         "«SERVICE KEY NOT FOUND».")
         feed = services_feed.build(
             key, lambda event: None, self.log, threading.Event(),
             api_key=api_key, bboxes=self.config.get("bounding_boxes"),
