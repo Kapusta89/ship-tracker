@@ -2156,18 +2156,31 @@ class RadarCore:
             if not mmsi or mmsi in focus:
                 continue
             focus.append(mmsi)
-        updated = 0
-        for mmsi in focus[:max(1, int(limit))]:
+        # наши суда обновляются параллельно: последовательный опрос занимал
+        # время, равное сумме ответов, и свежие координаты доходили до базы
+        # по очереди. Теперь все запросы уходят одновременно, как и у источников.
+        from concurrent.futures import ThreadPoolExecutor
+
+        batch = focus[:max(1, int(limit))]
+
+        def one(mmsi):
             if self.stop_event.is_set():
-                break
+                return False
             try:
                 found = self.refresh_vessel(mmsi)
             except Exception as error:
                 self.log(f"Обновление {mmsi}: {error}")
-                continue
-            if found and found.get("fresh"):
-                updated += 1
-        return {"checked": min(len(focus), max(1, int(limit))), "updated": updated}
+                return False
+            return bool(found and found.get("fresh"))
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(batch)))) as pool:
+                results = list(pool.map(one, batch))
+        except Exception as error:
+            self.log(f"Обновление наших судов: {error}")
+            return {"checked": len(batch), "updated": 0}
+        return {"checked": len(batch),
+                "updated": sum(1 for flag in results if flag)}
 
     def bulk_refresh(self, batch=150, workers=6) -> dict:
         """Обновляет позиции очередной пачки судов — по кругу, без пропусков.

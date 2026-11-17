@@ -371,9 +371,18 @@ class ServiceFeed(threading.Thread):
         self.events += 1
         self.on_event(event)
 
-    def sleep_until_next(self):
-        """Пауза до следующего цикла; wake() сокращает её до нуля."""
-        self._wake.wait(self.interval)
+    def sleep_until_next(self, started=None):
+        """Пауза до следующего цикла; wake() сокращает её до нуля.
+
+        Интервал считается от начала цикла, а не от его конца: иначе долгий
+        ответ сервиса (например, 67 карточек Ship Radar 24 за два с половиной
+        минуты) сдвигал бы всю сетку опроса, и данные приходили бы реже
+        заявленного — 15 минут превращались бы в 17–18.
+        """
+        left = self.interval
+        if started is not None:
+            left = max(0.0, self.interval - (time.monotonic() - started))
+        self._wake.wait(left)
         self._wake.clear()
         return self.stop_event.is_set()
 
@@ -381,11 +390,18 @@ class ServiceFeed(threading.Thread):
         """Выполнить следующий цикл сейчас — для обновления при открытии."""
         self._wake.set()
 
+    # одна и та же ошибка повторяется каждый цикл: пишем её в журнал не чаще
+    # раза в 10 минут, но и не молчим сутками, как было раньше
+    fail_log_every = 600.0
+
     def fail(self, error):
         text = str(error).strip() or error.__class__.__name__
-        if text != self.last_error:
-            self.last_error = text
+        moment = time.monotonic()
+        if (text != self.last_error
+                or moment - getattr(self, "_fail_log_at", 0.0) >= self.fail_log_every):
+            self._fail_log_at = moment
             self.log(f"{self.title}: {text}")
+        self.last_error = text
         self.set_status(f"ошибка: {text[:60]}")
 
     def ok(self, count, detail=""):
@@ -398,6 +414,7 @@ class ServiceFeed(threading.Thread):
 
     def run(self):
         while not self.stop_event.is_set():
+            started = time.monotonic()
             try:
                 self.poll_once()
             except Exception as error:  # сеть, лимит, формат — ждём следующий цикл
@@ -406,7 +423,7 @@ class ServiceFeed(threading.Thread):
                 if not self.first_done.is_set():
                     self.first_count = self.events
                     self.first_done.set()
-            if self.sleep_until_next():
+            if self.sleep_until_next(started):
                 break
 
     # -------------------------------------------------------------- запросы
