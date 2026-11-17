@@ -1437,6 +1437,8 @@ CARD_KEYS = {
     "beam": ("breite", "beam", "ширина"),
     "draft": ("tiefgang", "draught", "осадка"),
     "destination": ("zielhafen", "ziel", "destination", "назначение"),
+    "speed": ("geschwindigkeit", "speed", "скорость"),
+    "course": ("kurs", "course", "курс", "heading"),
 }
 
 
@@ -1487,6 +1489,38 @@ def parse_vessel_card(html_text) -> dict:
     if values.get("destination"):
         # «IZMAIL (UAIZM)» → IZMAIL
         result["destination"] = re.split(r"[(,]", values["destination"])[0].strip()[:24]
+    # В карточке есть и сама позиция: «Lat: 45.049 / Lng: 29.797792»,
+    # «Geschwindigkeit 0.2 kn», «Letzte Position: 2026-11-17 06:09 UTC».
+    # Для судов, которых нет в других сетях (STAR 666089403), это
+    # единственная живая точка — без неё карточка давала только паспорт.
+    text = str(html_text or "")
+    coords = re.search(r"Lat:\s*(-?\d+(?:\.\d+)?)\s*/?\s*(?:Lng|Lon):\s*(-?\d+(?:\.\d+)?)",
+                       text)
+    if not coords:
+        coords = re.search(r'latitude"?\s*[:=]\s*"?(-?\d+\.\d+)"?.{0,40}?'
+                           r'longitude"?\s*[:=]\s*"?(-?\d+\.\d+)"?', text, re.S)
+    if not coords:
+        # запасной вариант: «45.0490° / 29.7978°» в тексте описания
+        coords = re.search(r"(\d{2}\.\d{3,})°\s*/\s*(\d{2}\.\d{3,})°", text)
+    if coords:
+        lat, lon = _number(coords.group(1)), _number(coords.group(2))
+        if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180                 and not (abs(lat) < 0.001 and abs(lon) < 0.001):
+            result["lat"], result["lon"] = lat, lon
+    if values.get("speed"):
+        speed = _number(values["speed"].replace("kn", "").replace(",", "."))
+        if speed is not None and 0 <= speed <= 60:
+            result["sog"] = speed
+    if values.get("course"):
+        course = _number(values["course"].replace("°", ""))
+        if course is not None and 0 <= course <= 359:
+            result["cog"] = course
+    stamp = re.search(r"Letzte Position:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})"
+                      r"(?::\d{2})?\s*UTC", text)
+    if stamp:
+        try:
+            result["seen_at"] = _time(f"{stamp.group(1)} {stamp.group(2)}", utc=True)
+        except (TypeError, ValueError):
+            pass
     # Проверка на явную ошибку в источнике: осадка больше четверти длины корпуса
     # или ширина больше его длины быть не может (у целого типа судов так бывает
     # только при опечатке вроде «18 м длина, 13 м осадка»).
@@ -1502,6 +1536,11 @@ def parse_vessel_card(html_text) -> dict:
     if beam and (beam < 2.0):
         result.pop("beam_m", None)
     return result
+
+
+# Молчащее судно перечитываем по карточке чаще, чем паспорт: сама карточка
+# обновляет позицию примерно раз в час.
+SRD_STALE_RETRY_HOURS = 1.0
 
 
 class ShipRadarDetailsFeed(ServiceFeed):
@@ -1536,14 +1575,14 @@ class ShipRadarDetailsFeed(ServiceFeed):
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _tried_recently(self, mmsi, now) -> bool:
+    def _tried_recently(self, mmsi, now, retry_hours=None) -> bool:
         """Недавняя попытка: удачная — на весь срок, ошибка — на 6 часов."""
         seen = self.attempts.get(mmsi)
         if not seen:
             return False
         if isinstance(seen, dict):
             at = float(seen.get("at") or 0)
-            limit = self.retry_hours * 3600 if seen.get("ok") else 6 * 3600
+            limit = (retry_hours or self.retry_hours) * 3600 if seen.get("ok") else 6 * 3600
         else:
             at, limit = float(seen), 6 * 3600
         return 0 < now - at < limit
@@ -1574,16 +1613,19 @@ class ShipRadarDetailsFeed(ServiceFeed):
         now = time.time()
         result = []
         for item in items:
+            stale = False
             if isinstance(item, dict):
                 mmsi = _mmsi(item.get("mmsi"))
                 name = str(item.get("name") or "")
+                stale = bool(item.get("stale"))
             else:
                 mmsi = _mmsi(item)
                 name = ""
             if not mmsi:
                 continue
             # без имени не собрать адрес карточки: сайт отвечает 403 на «x»
-            if not str(name).strip() or self._tried_recently(mmsi, now):
+            retry = SRD_STALE_RETRY_HOURS if stale else None
+            if not str(name).strip() or self._tried_recently(mmsi, now, retry):
                 continue
             result.append((mmsi, name))
             if len(result) >= self.max_per_cycle:
@@ -1618,6 +1660,17 @@ class ShipRadarDetailsFeed(ServiceFeed):
                 self.stop_event.wait(self.pause)
                 continue
             self.attempts[mmsi] = {"at": time.time(), "ok": True}
+            if card and card.get("lat") is not None and card.get("lon") is not None:
+                # точка из карточки идёт в общий поток как обычная позиция:
+                # источник подписан «srd», чтобы сверка и журнал видели,
+                # откуда она пришла
+                self.emit({"kind": "position", "mmsi": mmsi,
+                           "lat": card["lat"], "lon": card["lon"],
+                           "sog": card.get("sog"), "cog": card.get("cog"),
+                           "heading": None,
+                           "name": card.get("name") or name or "",
+                           "at": card.get("seen_at") or datetime.now(),
+                           "source": "srd"})
             if card and any(card.get(key) for key in
                             ("name", "type_text", "draft", "length_m", "beam_m",
                              "destination")):

@@ -159,5 +159,6 @@
   "dat_max_vessels": 10,
   "use_aishub": false,
   "aishub_key": "",
-  "aishub_minutes": 600
+  "aishub_minutes": 600,
+  "srd_stale_hours": 2.0
 }

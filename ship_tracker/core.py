@@ -1681,7 +1681,13 @@ class RadarCore:
             return []
         rows.sort(key=lambda row: str(row.get("position_at") or row.get("updated_at") or ""),
                   reverse=True)
+        try:
+            stale_hours = float(self.config.get("srd_stale_hours") or 2.0)
+        except (TypeError, ValueError):
+            stale_hours = 2.0
+        stale_limit = timedelta(hours=max(0.5, stale_hours))
         result = []
+        stale_rows = []
         for row in rows:
             if self.is_station_mmsi(row.get("mmsi")):
                 continue
@@ -1694,12 +1700,51 @@ class RadarCore:
                        or not row.get("imo"))
             if not str(row.get("name") or "").strip():
                 continue
-            if not missing:
+            # Молчащее отслеживаемое судно тоже идёт в список: в карточке
+            # Ship Radar 24 есть его позиция, и это единственный источник для
+            # судов, которых нет в Open Waters (например STAR 666089403).
+            moment = row.get("position_at") or row.get("updated_at")
+            fresh = True
+            stamp = None
+            try:
+                stamp = parse_iso(moment)
+                fresh = stamp is not None and (datetime.now() - stamp) < stale_limit
+            except (TypeError, ValueError):
+                fresh = True
+            # Скрытые (молчат дольше hide_after_hours) сюда не идут: их всё
+            # равно не видно на карте, и они не должны вытеснять те суда,
+            # что сейчас в окне наблюдения.
+            hidden_limit = datetime.now() - timedelta(hours=self.hide_after_hours())
+            stale = (row.get("tracked") == 1 and not fresh
+                     and stamp is not None and stamp >= hidden_limit)
+            if not missing and not stale:
                 continue
-            result.append(dict(row))
-            if len(result) >= limit:
+            entry = dict(row)
+            entry["stale"] = stale
+            if stale:
+                # молчащие суда идут первыми: их карточка — единственный
+                # источник свежей позиции, и она не должна теряться в конце
+                # списка из-за того, что позиция старая
+                mmsi = str(row.get("mmsi") or "")
+                ours = self.destination_is_ours(row.get("destination"))
+                entry["_urgent"] = 0 if mmsi in getattr(self, "pinned_mmsis", ())                     else (1 if ours else 2)
+                entry["_age"] = (datetime.now() - stamp).total_seconds() if stamp else 0.0
+                stale_rows.append(entry)
+            else:
+                result.append(entry)
+            # Просматриваем весь список: самые «молчащие» могут оказаться
+            # в самом его конце, и обрывать перебор нельзя.
+            if len(result) >= limit * 2 and len(stale_rows) >= limit * 2:
                 break
-        return result
+        # Кого давно не слышно — того и читаем первым: у самых старых позиций
+        # шансов «оживеть» больше всего.
+        # Сначала закреплённые и идущие в наши порты, потом остальные —
+        # от самых давно молчащих к свежим.
+        stale_rows.sort(key=lambda row: (row.get("_urgent", 2), -row.get("_age", 0.0)))
+        # половина списка — молчащим судам, половина — паспортам: иначе
+        # позиции вытесняли бы дочитывание типа, осадки и размеров
+        stale_quota = max(1, limit // 2)
+        return (stale_rows[:stale_quota] + result)[:limit]
 
     def stale_hours(self, vessel=None) -> float:
         """Порог устаревания в часах: общий или для конкретного судна."""
