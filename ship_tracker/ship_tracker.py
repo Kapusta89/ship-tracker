@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.48"
+APP_VERSION = "2026.12.49"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -92,6 +92,17 @@ SERVICE_BLOCKS = [
     ("AISHub", "aishub",
      "логин участника: позиции района, доступ за свой поток NMEA"),
 ]
+
+# Все подключения, с которыми работает программа, по группам: на вкладке
+# «Подключение» они идут в этом порядке, чтобы платные и бесплатные не путались.
+CONNECTION_SECTIONS = (
+    ("Сервисы по ключу API",
+     "включаются галочкой: без ключа сервис не отвечает, ключ вводится в его блоке",
+     ("vf", "vfa", "mt", "mst", "dat", "aishub", "gfw")),
+    ("Бесплатные сервисы без ключа",
+     "работают сразу после включения галочки, ключ не нужен",
+     ("srd", "mlive", "gor", "aci", "dt")),
+)
 
 SERVICE_SITES = {
     "vf": ("vesselfinder.com", "https://www.vesselfinder.com/"),
@@ -2324,65 +2335,101 @@ class App:
         ttk.Label(snap_row, text="мин (ключ не нужен)").pack(side="left", padx=(4, 8))
         ttk.Button(snap_row, text="Проверить сейчас", command=self.check_snapshot).pack(side="left")
 
-        # 4. Дополнительные подключения — каждый сервис отдельным блоком, как Open Waters
-        ttk.Separator(links, orient="horizontal").grid(
-            row=8, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 0))
-        ttk.Label(links, text="Дополнительные подключения",
-                  font=("Segoe UI", 9, "bold")).grid(
-            row=9, column=0, columnspan=3, sticky="w", padx=(8, 6), pady=(8, 2))
-        ttk.Label(links, text="Каждый сервис работает своим потоком и пишет в ту же базу.",
-                  foreground="#777").grid(row=10, column=0, columnspan=3,
-                                          sticky="w", padx=(8, 6), pady=(0, 4))
+        # 4. Отдельные соединения AISStream по MMSI — раньше были видны только
+        # припиской в строке AISStream, теперь отдельным подключением
+        ttk.Label(links, text="AISStream: слежение по MMSI",
+                  font=("Segoe UI", 9, "bold")).grid(row=8, column=0, sticky="w",
+                                                     padx=(8, 6), pady=(8, 2))
+        self.feed_status["mmsi"] = tk.StringVar(value="ждёт запуска")
+        ttk.Label(links, textvariable=self.feed_status["mmsi"], foreground="#555"
+                  ).grid(row=8, column=1, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Label(links, text="отдельные сокеты по 190 судов: наши порты, закреплённые "
+                              "и ближний трафик",
+                  foreground="#777").grid(row=9, column=0, columnspan=3, sticky="w",
+                                          padx=30, pady=(0, 4))
 
-        row = 11
-        for name, key, desc in SERVICE_BLOCKS:
-            var = getattr(self, f"var_use_{key}")
-            ttk.Checkbutton(links, text=f"{name} — {desc}", variable=var,
-                            command=lambda k=key, v=var: self._on_service_toggle(k, v)
-                            ).grid(row=row, column=0, columnspan=3, sticky="w",
-                                   padx=4, pady=(10, 0))
-            ttk.Label(links, textvariable=self.feed_status[key], foreground="#555"
-                      ).grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=30)
-            service_row = ttk.Frame(links)
-            service_row.grid(row=row + 2, column=0, columnspan=3, sticky="w",
-                             padx=30, pady=(2, 0))
-            key_var = service_key_var(self, key)
-            if key_var is not None:
-                ttk.Label(service_row, text="Ключ:").pack(side="left")
-                ttk.Entry(service_row, textvariable=key_var, width=28, show="*"
-                          ).pack(side="left", padx=(6, 0))
-            else:
-                ttk.Label(service_row, text="ключ не нужен", foreground="#777"
-                          ).pack(side="left")
-            ttk.Button(service_row, text="Проверить",
-                       command=lambda k=key: self.check_service(k)
-                       ).pack(side="left", padx=(6, 0))
-            site_name, site_url = SERVICE_SITES[key]
-            ttk.Button(service_row, text=f"Открыть {site_name}",
-                       command=lambda u=site_url: webbrowser.open(u)
-                       ).pack(side="left", padx=(6, 0))
+        # 5. Open Waters: фоновое обновление координат всех судов базы
+        ttk.Label(links, text="Open Waters: координаты всех судов",
+                  font=("Segoe UI", 9, "bold")).grid(row=10, column=0, sticky="w",
+                                                     padx=(8, 6), pady=(8, 2))
+        self.feed_status["bulk"] = tk.StringVar(value="ждёт запуска")
+        ttk.Label(links, textvariable=self.feed_status["bulk"], foreground="#555"
+                  ).grid(row=10, column=1, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Label(links, text="фоном обновляет позиции всех судов базы по кругу — "
+                              "сначала наши порты и закреплённые",
+                  foreground="#777").grid(row=11, column=0, columnspan=3, sticky="w",
+                                          padx=30, pady=(0, 4))
+
+        # 6. Сервисы по группам: платные по ключу, затем бесплатные
+        row = 12
+        blocks = {key: (name, desc) for name, key, desc in SERVICE_BLOCKS}
+        drawn = set()
+        for section_title, section_note, section_keys in CONNECTION_SECTIONS:
+            ttk.Separator(links, orient="horizontal").grid(
+                row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(14, 0))
+            ttk.Label(links, text=section_title,
+                      font=("Segoe UI", 9, "bold")).grid(
+                row=row + 1, column=0, columnspan=3, sticky="w", padx=(8, 6), pady=(8, 2))
+            ttk.Label(links, text=section_note, foreground="#777").grid(
+                row=row + 2, column=0, columnspan=3, sticky="w", padx=(8, 6), pady=(0, 4))
             row += 3
+            for key in section_keys:
+                if key not in blocks:
+                    continue
+                name, desc = blocks[key]
+                var = getattr(self, f"var_use_{key}")
+                ttk.Checkbutton(links, text=f"{name} — {desc}", variable=var,
+                                command=lambda k=key, v=var: self._on_service_toggle(k, v)
+                                ).grid(row=row, column=0, columnspan=3, sticky="w",
+                                       padx=4, pady=(10, 0))
+                ttk.Label(links, textvariable=self.feed_status[key], foreground="#555"
+                          ).grid(row=row + 1, column=0, columnspan=3, sticky="w", padx=30)
+                service_row = ttk.Frame(links)
+                service_row.grid(row=row + 2, column=0, columnspan=3, sticky="w",
+                                 padx=30, pady=(2, 0))
+                key_var = service_key_var(self, key)
+                if key_var is not None:
+                    ttk.Label(service_row, text="Ключ:").pack(side="left")
+                    ttk.Entry(service_row, textvariable=key_var, width=28, show="*"
+                              ).pack(side="left", padx=(6, 0))
+                else:
+                    ttk.Label(service_row, text="ключ не нужен", foreground="#777"
+                              ).pack(side="left")
+                ttk.Button(service_row, text="Проверить",
+                           command=lambda k=key: self.check_service(k)
+                           ).pack(side="left", padx=(6, 0))
+                site_name, site_url = SERVICE_SITES[key]
+                ttk.Button(service_row, text=f"Открыть {site_name}",
+                           command=lambda u=site_url: webbrowser.open(u)
+                           ).pack(side="left", padx=(6, 0))
+                row += 3
+                drawn.add(key)
 
-        # 5. Источники без ключа — кнопка проверки: жив ли и читается ли автоматически
+        # 7. Проверка всех источников сразу и внеочередное обновление данных
         ttk.Separator(links, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(12, 0))
-        ttk.Label(links, text="Источники без ключа — проверка",
+            row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(14, 0))
+        ttk.Label(links, text="Проверка и обновление всех подключений",
                   font=("Segoe UI", 9, "bold")).grid(
             row=row + 1, column=0, columnspan=2, sticky="w", padx=(8, 6), pady=(8, 2))
         ttk.Button(links, text="Проверить все", command=self.check_all_sources
                    ).grid(row=row + 1, column=2, sticky="e", padx=8, pady=(8, 2))
         ttk.Button(links, text="Обновить данные сейчас", command=self.refresh_sources_now
                    ).grid(row=row + 1, column=1, sticky="e", padx=8, pady=(8, 2))
-        ttk.Label(links, text="Ключ не нужен. «Проверить» показывает, жив ли источник "
-                              "и читается ли он автоматически.",
+        ttk.Label(links, text="«Проверить» у каждого подключения проверяет его отдельно; "
+                              "«Проверить все» обходит всё сразу.",
                   foreground="#777").grid(row=row + 2, column=0, columnspan=3,
                                            sticky="w", padx=8)
         row += 3
+        # статусы нужны всем источникам, даже если блок уже показан выше
         self.source_status = {}
         for source in portcalls.SOURCES:
+            self.source_status[source["key"]] = tk.StringVar(
+                value=self.source_status_text(source["key"]))
+        for source in portcalls.SOURCES:
             key = source["key"]
-            var = tk.StringVar(value=self.source_status_text(key))
-            self.source_status[key] = var
+            if key in drawn:
+                continue
+            var = self.source_status[key]
             ttk.Label(links, text=source["title"], font=("Segoe UI", 9, "bold")
                       ).grid(row=row, column=0, columnspan=3, sticky="w",
                              padx=(8, 6), pady=(8, 0))
@@ -2414,9 +2461,9 @@ class App:
             "Digitraffic и AIS-catcher работают без ключа: Digitraffic отдаёт только Балтику, "
             "AIS-catcher — ожидаемые прибытия в наши порты. "
             "Datalastic и AISHub включаются ключом (у AISHub — логин участника).\n\n"
-            "Источники без ключа (реестры и портовые администрации) в конце вкладки: "
-            "кнопка «Проверить» говорит, жив ли сайт и можно ли читать его автоматически, "
-            "«Проверить все» — обходит все сразу.\n"
+            "Все подключения собраны по группам: живые потоки и снимки сверху, "
+            "ниже — сервисы по ключу, затем бесплатные без ключа. "
+            "«Проверить» у каждого блока проверяет только его, «Проверить все» — обходит всё сразу.\n"
             "Корпоративные каналы (Spire, ORBCOMM, Kpler/MarineTraffic Enterprise, Windward) "
             "дают доступ только по договору — ключ выдаёт менеджер, поэтому галочки у них нет.\n\n"
             "• AISStream — основной живой поток (нужен бесплатный ключ, см. шаги ниже).\n"
@@ -3598,6 +3645,34 @@ class App:
         elsewhere = bool(getattr(self.core, "feed_elsewhere", False))
         service_state = getattr(self.core, "service_status", {}) or {}
         for key, var in labels.items():
+            if key == "mmsi":
+                if not running:
+                    text = ("принимает другой процесс (общая база)"
+                            if elsewhere else "не запущен")
+                elif mmsi_states:
+                    live = sum(1 for row in mmsi_states if row.get("connected"))
+                    events = sum(int(row.get("events") or 0) for row in mmsi_states)
+                    text = (f"{live} из {len(mmsi_states)} на связи, "
+                            f"сообщений {events}")
+                else:
+                    text = "отключено в настройках"
+                if var.get() != text:
+                    var.set(text)
+                continue
+            if key == "bulk":
+                enabled = bool(self.config.get("bulk_refresh_enabled", True))
+                last = getattr(self.core, "last_bulk", None) or {}
+                if not enabled:
+                    text = "выключено в настройках"
+                elif last.get("at"):
+                    text = (f"проход {last['at']:%H:%M:%S}: обновлено "
+                            f"{last.get('updated', 0)} из {last.get('checked', 0)}, "
+                            f"в базе {last.get('total', '?')}")
+                else:
+                    text = "ждёт первого прохода"
+                if var.get() != text:
+                    var.set(text)
+                continue
             if key not in ("ais", "ow", "snap"):
                 # внешние API: берём актуальный статус из ядра (в том числе
                 # если сигнал пришёл раньше, чем окно успело его показать)
@@ -4272,6 +4347,8 @@ class App:
 
     def service_status_text(self, key) -> str:
         """Что показать в статусе сервиса до запуска потока."""
+        if key in ("mmsi", "bulk"):
+            return "ждёт запуска"
         var = getattr(self, f"var_use_{key}", None)
         enabled = bool(var.get()) if var is not None else False
         if not enabled:

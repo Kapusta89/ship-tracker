@@ -2228,6 +2228,8 @@ class RadarCore:
                     batch=int(self.config.get("bulk_refresh_batch") or 150),
                     workers=int(self.config.get("bulk_refresh_workers") or 6))
                 if result.get("checked"):
+                    # итог последнего прохода показывается на вкладке «Подключение»
+                    self.last_bulk = dict(result, at=datetime.now())
                     self.log(f"Координаты: обновлено {result['updated']} из "
                              f"{result['checked']} (в базе {result.get('total', '?')}).")
             except Exception as error:
