@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.44"
+APP_VERSION = "2026.12.45"
 
 import ais_feed
 import analysis
@@ -3043,6 +3043,12 @@ class App:
             sources_line = ""
         if sources_line:
             lines.append(sources_line)
+        try:
+            fields_line = self.core.field_sources_text(mmsi)
+        except Exception:
+            fields_line = ""
+        if fields_line:
+            lines.append(fields_line)
         lines += [
             f"Скорость: {fmt_number(vessel.get('sog'))} уз",
             f"Размеры: {self.size_text(vessel)} (длина × ширина)",

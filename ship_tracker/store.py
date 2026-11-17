@@ -127,6 +127,20 @@ CREATE INDEX IF NOT EXISTS idx_quay_places_area ON quay_places (area);
 -- Последняя позиция судна в каждом источнике отдельно. Нужна, чтобы сверять
 -- источники между собой, а не верить одному: если AISStream и снимок дают
 -- точки в разных местах, это видно в карточке, а не тонет в одной строке.
+-- Свежесть каждого поля паспорта отдельно. Источники приходят в разное
+-- время: имя и тип могут быть свежими в AIS, а осадка и размеры — только
+-- в карточке Ship Radar 24. Храним значение вместе с его временем и
+-- источником, чтобы в карточку шло самое свежее по каждому полю, а не
+-- «всё от одного, кто ответил последним».
+CREATE TABLE IF NOT EXISTS vessel_fields (
+    mmsi   TEXT NOT NULL,
+    field  TEXT NOT NULL,
+    value  TEXT,
+    ts     TEXT NOT NULL,
+    source TEXT,
+    PRIMARY KEY (mmsi, field)
+);
+
 CREATE TABLE IF NOT EXISTS source_positions (
     mmsi   TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -344,6 +358,44 @@ class Store:
                      number(sog), number(cog)))
         except Exception:
             return
+
+    def save_field(self, mmsi: str, field: str, value, when=None, source="") -> bool:
+        """Запоминает значение поля, только если оно свежее сохранённого.
+
+        Возвращает True, если значение принято: старое сообщение, пришедшее
+        позже нового (обычное дело, когда источников много), не должно
+        затирать свежее.
+        """
+        if value in (None, "") or not field:
+            return False
+        stamp = iso(when)
+        text_value = str(value)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT ts, value FROM vessel_fields WHERE mmsi = ? AND field = ?",
+                (str(mmsi), field)).fetchone()
+            if row and row[0] and str(row[0]) > stamp:
+                return False
+            if row and str(row[1]) == text_value:
+                # значение не изменилось — обновляем только метку времени
+                self.conn.execute(
+                    "UPDATE vessel_fields SET ts = ?, source = ? WHERE mmsi = ? AND field = ?",
+                    (stamp, source, str(mmsi), field))
+                return True
+            self.conn.execute(
+                "INSERT INTO vessel_fields (mmsi, field, value, ts, source) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(mmsi, field) DO UPDATE SET "
+                "value = excluded.value, ts = excluded.ts, source = excluded.source",
+                (str(mmsi), field, text_value, stamp, source))
+        return True
+
+    def fields(self, mmsi) -> dict:
+        """Все поля паспорта с их временем и источником: {field: {value, ts, source}}."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT field, value, ts, source FROM vessel_fields WHERE mmsi = ?",
+                (str(mmsi),)).fetchall()
+        return {row[0]: {"value": row[1], "ts": row[2], "source": row[3]} for row in rows}
 
     def source_positions(self, mmsi) -> list:
         """Все источники, которые присылали позицию этого судна."""

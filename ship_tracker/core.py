@@ -2056,11 +2056,19 @@ class RadarCore:
             data.get("sog"), data.get("cog"), moment)
         fresh = self._accept_position(str(mmsi), data.get("lat"), data.get("lon"),
                                       data.get("sog"), data.get("cog"), moment)
-        self.store.upsert_static(
-            str(mmsi), name=data.get("name"), imo=str(data.get("imo") or "") or None,
-            callsign=data.get("callsign"), destination=data.get("destination"),
-            draft=data.get("draught"), eta_declared=data.get("eta"),
-            length_m=data.get("length"), beam_m=data.get("beam"))
+        # паспорт из прямого запроса идёт теми же полями, что и от других
+        # источников: свежесть решается по каждому полю отдельно
+        for field, value in (("name", data.get("name")),
+                             ("imo", str(data.get("imo") or "") or None),
+                             ("callsign", data.get("callsign")),
+                             ("destination", data.get("destination")),
+                             ("draft", data.get("draught")),
+                             ("eta_declared", data.get("eta")),
+                             ("length_m", data.get("length")),
+                             ("beam_m", data.get("beam"))):
+            if value not in (None, ""):
+                self.store.save_field(str(mmsi), field, value, moment, "openwaters")
+        self.store.upsert_static(str(mmsi), **self.merged_static(str(mmsi)))
         return dict(data, fresh=bool(fresh))
 
     def refresh_focus(self, limit=20) -> dict:
@@ -2493,19 +2501,28 @@ class RadarCore:
                 destination=event.get("destination"), area=True):
             return
         code = event.get("type_code")
-        self.store.upsert_static(
-            mmsi,
-            name=event.get("name") or None,
-            imo=event.get("imo") or None,
-            callsign=event.get("callsign") or None,
-            type_code=code,
-            type_label=ais_feed.type_label(code) if code is not None else None,
-            destination=event.get("destination") or None,
-            draft=event.get("draft"),
-            length_m=event.get("length_m"),
-            beam_m=event.get("beam_m"),
-            eta_declared=event.get("eta_declared") or None,
-        )
+        when = event.get("at") or datetime.now()
+        source = str(event.get("source") or "")
+        incoming = {
+            "name": event.get("name") or None,
+            "imo": event.get("imo") or None,
+            "callsign": event.get("callsign") or None,
+            "type_code": code,
+            "type_label": ais_feed.type_label(code) if code is not None else None,
+            "destination": event.get("destination") or None,
+            "draft": event.get("draft"),
+            "length_m": event.get("length_m"),
+            "beam_m": event.get("beam_m"),
+            "eta_declared": event.get("eta_declared") or None,
+        }
+        # каждое поле хранится со своим временем и источником: имя может быть
+        # свежим в AIS, а осадка и размеры — только в карточке Ship Radar 24
+        for field, value in incoming.items():
+            if value not in (None, ""):
+                self.store.save_field(mmsi, field, value, when, source)
+        # в строку судна идёт самое свежее значение каждого поля, а не то,
+        # что пришло последним
+        self.store.upsert_static(mmsi, **self.merged_static(mmsi))
         self.store.set_tracked(mmsi, True)
         after = self.store.vessel(mmsi)
         if after and before is not None:
@@ -2555,9 +2572,14 @@ class RadarCore:
             return
         if not vessel or vessel.get("tracked") != 1:
             self.store.set_tracked(mmsi, True)
-        self.store.upsert_position(
-            mmsi, lat, lon, event.get("sog"), event.get("cog"),
-            event.get("heading"), port_name, event.get("at"))
+        moment = event.get("at") or datetime.now()
+        stored_at = parse_iso((vessel or {}).get("position_at"))
+        if stored_at is None or moment >= stored_at:
+            # источник, который отвечает медленнее, не должен сдвигать судно
+            # назад: точку пишем, только если она не старше уже известной
+            self.store.upsert_position(
+                mmsi, lat, lon, event.get("sog"), event.get("cog"),
+                event.get("heading"), port_name, moment)
         # позиция каждого источника пишется отдельно: так видно, совпадают
         # ли AISStream, снимок и прямой запрос, а не «одна точка на всех»
         self.store.save_source_position(
@@ -2898,6 +2920,76 @@ class RadarCore:
         name = (self.store.vessel(mmsi) or {}).get("name") or mmsi
         self.log(f"Источники расходятся: {name} — до {worst:.1f} км "
                  f"между {len(rows[:4])} источниками.")
+
+    # Поля паспорта, для которых ведётся послойная свежесть.
+    STATIC_FIELDS = ("name", "imo", "callsign", "type_code", "type_label",
+                     "destination", "draft", "length_m", "beam_m", "eta_declared")
+    # Числовые поля: из базы они приходят строкой, обратно нужны числами.
+    NUMERIC_FIELDS = ("type_code", "draft", "length_m", "beam_m")
+
+    def merged_static(self, mmsi) -> dict:
+        """Самое свежее значение каждого поля паспорта — из любого источника."""
+        try:
+            fields = self.store.fields(mmsi)
+        except Exception:
+            return {}
+        result = {}
+        for field, record in fields.items():
+            if field not in self.STATIC_FIELDS:
+                continue
+            value = record.get("value")
+            if value in (None, ""):
+                continue
+            if field in self.NUMERIC_FIELDS:
+                try:
+                    value = float(value)
+                    value = int(value) if field == "type_code" else value
+                except (TypeError, ValueError):
+                    continue
+            result[field] = value
+        return result
+
+    def field_sources_text(self, mmsi, max_groups=3) -> str:
+        """«Имя, тип — AISStream 10:12; осадка — карточка 09:09» для карточки.
+
+        Показывает, откуда взялось каждое поле: видно, что паспорт собран из
+        нескольких источников, а не из одного случайного.
+        """
+        try:
+            fields = self.store.fields(mmsi)
+        except Exception:
+            return ""
+        if not fields:
+            return ""
+        names = {"name": "имя", "imo": "IMO", "callsign": "позывной",
+                 "type_code": "тип", "type_label": "тип", "destination": "назначение",
+                 "draft": "осадка", "length_m": "длина", "beam_m": "ширина",
+                 "eta_declared": "ETA"}
+        labels = {"aisstream": "AISStream", "openwaters": "Open Waters",
+                  "snapshot": "снимок района", "goradar": "Goradar",
+                  "mlive": "MarineTraffic.live", "srd": "карточка Ship Radar 24",
+                  "marinetraffic": "MarineTraffic", "myshiptracking": "MyShipTracking",
+                  "vesselfinder": "VesselFinder", "datalastic": "Datalastic"}
+        groups = {}
+        for field, record in fields.items():
+            if field not in names:
+                continue
+            source = str(record.get("source") or "AIS")
+            stamp = str(record.get("ts") or "")[:16]
+            item = groups.setdefault(source, {"ts": stamp, "fields": []})
+            item["ts"] = max(item["ts"], stamp)
+            item["fields"].append(names[field])
+        if len(groups) < 2:
+            return ""
+        parts = []
+        ordered = sorted(groups.items(), key=lambda pair: pair[1]["ts"], reverse=True)
+        for source, info in ordered[:max_groups]:
+            label = labels.get(source, source)
+            stamp = info.get("ts") or ""
+            when = stamp[11:16] if len(stamp) >= 16 else ""
+            parts.append(f"{', '.join(info['fields'][:4])} — {label}"
+                         + (f" {when}" if when else ""))
+        return "Поля паспорта: " + "; ".join(parts)
 
     def sources_text(self, mmsi, max_rows=4):
         """Сверка источников по судну: кто что прислал и насколько расходится.
