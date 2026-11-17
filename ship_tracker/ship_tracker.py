@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.49"
+APP_VERSION = "2026.12.50"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -1775,17 +1775,34 @@ class App:
         self.visits_tree = self.make_tree(
             frame, (("name", "Судно", 180), ("port", "Порт", 110),
                     ("arrived", "Пришёл", 130), ("left", "Ушёл", 130),
-                    ("stay", "Стоянка", 110), ("draft", "Осадка вход→выход", 150),
+                    ("stay", "Стоянка", 110), ("exit", "Выход (прогноз)", 170),
+                    ("draft", "Осадка вход→выход", 150),
                     ("cargo", "Груз", 230), ("source", "Источник", 90)))
+        # плашка под таблицей: сколько судно уже в порту и когда ждать выхода
+        self.visits_plate_var = tk.StringVar(value="")
+        self.visits_plate = tk.Label(
+            frame, textvariable=self.visits_plate_var, background="#eef4f8",
+            foreground="#1b3a4b", font=("Segoe UI", 9, "bold"), anchor="w",
+            justify="left", wraplength=1180, padx=10, pady=8, relief="flat")
+        self.visits_plate.pack(fill="x", padx=8, pady=(6, 4))
+        self.visits_tree.bind("<<TreeviewSelect>>",
+                              lambda event: self.refresh_visits())
 
     def refresh_visits(self):
         tree = getattr(self, "visits_tree", None)
         if not tree:
             return
+        # выделение строки нужно плашке — запоминаем его до перерисовки
+        chosen = None
+        selection = tree.selection()
+        if selection:
+            tags = tree.item(selection[0]).get("tags") or ()
+            chosen = str(tags[0]) if tags else None
         for item in tree.get_children():
             tree.delete(item)
         open_visits = 0
         stale_open = 0
+        details = {}
         for visit in self.store.visits(300):
             vessel = self.store.vessel(visit.get("mmsi")) or {}
             entered = parse_iso(visit.get("entered_at"))
@@ -1803,6 +1820,20 @@ class App:
                 stay = span_text((datetime.now() - entered).total_seconds() / 3600) + " (идёт)"
             else:
                 stay = "—"
+            # прогноз выхода: сколько уже стоит и сколько обычно стоит в этом порту
+            try:
+                port = self.core.port_by_name(visit.get("port"))
+                stay_info = self.core.port_stay(vessel, port) if port else None
+            except Exception:
+                stay_info = None
+            exit_text = "—"
+            if stay_info and stay_info.get("remaining_hours") is not None:
+                exit_at = datetime.now() + timedelta(hours=stay_info["remaining_hours"])
+                exit_text = (f"{exit_at:%d.%m %H:%M} "
+                             f"(через {span_text(stay_info['remaining_hours'])})")
+            details[str(visit.get("mmsi") or "")] = (
+                vessel.get("name") or f"MMSI {visit.get('mmsi')}",
+                visit.get("port"), entered, stay_info)
             draft_in = visit.get("draft_in")
             draft_out = visit.get("draft_out")
             if draft_in is None and draft_out is None:
@@ -1815,10 +1846,17 @@ class App:
                 self.fmt_time(visit.get("entered_at")),
                 "на месте",
                 stay,
+                exit_text,
                 draft,
                 visit.get("cargo_kind") or self.cargo_kind_text(vessel),
                 "история" if visit.get("source") == "track" else "наблюдение",
             ))
+        if chosen:
+            for item in tree.get_children():
+                if chosen in (tree.item(item).get("tags") or ()):
+                    tree.selection_set(item)
+                    break
+        self.update_visits_plate(details, open_visits)
         counts = self.store.counts()
         self.visits_info.set(
             f"Стоят сейчас: {open_visits} (ушли — во вкладке «История стоянок»; "
@@ -1830,6 +1868,57 @@ class App:
             f"{self.config.get('visits_backfill_days', 4)} дн."
             + ((f" Скрыто {stale_open} стоянок без позиции свежее 9 ч: судно могло "
                 f"уйти, но приёмник его больше не слышал.") if stale_open else ""))
+
+    def update_visits_plate(self, details, open_visits):
+        """Плашка: время в порту и дата выхода — по выбранной стоянке.
+
+        AIS не передаёт время стоянки, поэтому выход считается по истории:
+        сколько судно уже стоит и сколько обычно стоит в этом порту (сначала
+        по своим визитам, потом по визитам порта). Без выбранной строки
+        плашка показывает общую сводку стоянок.
+        """
+        var = getattr(self, "visits_plate_var", None)
+        if var is None:
+            return
+        tree = getattr(self, "visits_tree", None)
+        selection = tree.selection() if tree else ()
+        if selection and details:
+            tags = tree.item(selection[0]).get("tags") or ()
+            info = details.get(str(tags[0]) if tags else "")
+            if info:
+                name, port, entered, stay = info
+                parts = []
+                current = (stay or {}).get("current_hours")
+                if current is None and entered:
+                    current = max(0.0, (datetime.now() - entered).total_seconds() / 3600)
+                if current is not None:
+                    since = f" (с {entered:%d.%m %H:%M})" if entered else ""
+                    parts.append(f"в порту {port or '—'} уже "
+                                 f"{span_text(current)}{since}")
+                if stay and stay.get("remaining_hours") is not None:
+                    exit_at = datetime.now() + timedelta(
+                        hours=stay["remaining_hours"])
+                    parts.append(f"выход {exit_at:%d.%m %H:%M} "
+                                 f"(через {span_text(stay['remaining_hours'])})")
+                    if stay.get("typical_hours"):
+                        source = ("по истории судна" if stay.get("scope") == "судно"
+                                  else "по истории порта")
+                        parts.append(f"обычно стоит {span_text(stay['typical_hours'])} "
+                                     f"({source}, визитов {stay.get('visits', 0)})")
+                elif stay and stay.get("typical_hours"):
+                    parts.append(f"выход: нет прогноза (обычно стоит "
+                                 f"{span_text(stay['typical_hours'])})")
+                elif not stay:
+                    parts.append("выход: нет прогноза — мало истории стоянок")
+                text = f"{name}: " + " · ".join(parts)
+                if var.get() != text:
+                    var.set(text)
+                return
+        text = (f"Стоят сейчас: {open_visits}. Выберите строку — покажу, "
+                f"сколько судно уже в порту и когда ждать выхода "
+                f"(выход считается по истории стоянок этого судна и порта).")
+        if var.get() != text:
+            var.set(text)
 
     def load_history_stays(self):
         if getattr(self, "_history_loading", False):
