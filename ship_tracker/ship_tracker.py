@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.54"
+APP_VERSION = "2026.12.55"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -1144,6 +1144,14 @@ class App:
         self.photo_label.pack(fill="x", padx=(8, 0), pady=(0, 4))
         self.photo_note = ttk.Label(panel, text="", foreground="#777", wraplength=300)
         self.photo_note.pack(fill="x", padx=(8, 0))
+
+        detail_bar = ttk.Frame(panel)
+        detail_bar.pack(fill="x", padx=(8, 0), pady=(4, 2))
+        ttk.Button(detail_bar, text="Обновить карточку",
+                   command=self.refresh_card_click).pack(side="left")
+        self.card_note_var = tk.StringVar(value="ShipFinder, Open Waters, карточка сайта")
+        ttk.Label(detail_bar, textvariable=self.card_note_var,
+                  foreground="#555", wraplength=300).pack(side="left", padx=8)
 
         detail_box = ttk.Frame(panel)
         detail_box.pack(fill="both", expand=True, padx=(8, 0), pady=0)
@@ -3840,6 +3848,14 @@ class App:
         threading.Thread(target=self._auto_refresh_worker, args=(mmsi,),
                          daemon=True).start()
 
+    def refresh_card_click(self):
+        """Кнопка у карточки: спросить позицию по выбранному судну сейчас."""
+        if not self.selected:
+            self.card_note_var.set("судно не выбрано")
+            return
+        self.card_note_var.set("запрашиваю ShipFinder, Open Waters и карточку сайта…")
+        self.auto_refresh_selected(force=True)
+
     def _auto_refresh_worker(self, mmsi):
         text = ""
         try:
@@ -3850,6 +3866,12 @@ class App:
         finally:
             self._auto_busy = False
             self._auto_state = {"mmsi": mmsi, "at": datetime.now(), "text": text}
+            try:
+                stamp = datetime.now().strftime("%H:%M:%S")
+                self.root.after(0, lambda: self.card_note_var.set(
+                    f"{stamp}: {text}" if text else "ответа нет"))
+            except Exception:
+                pass
 
     def forecast_lines(self, vessel):
         """Блок карточки: прогноз пути на 3 суток вперёд.

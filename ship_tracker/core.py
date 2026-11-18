@@ -2239,6 +2239,40 @@ class RadarCore:
             self.log(f"Карточка {mmsi}: {error}")
             return None
 
+    def refresh_shipfinder(self, mmsi) -> dict | None:
+        """Разовая позиция с публичной карты ShipFinder — по кнопке.
+
+        Нужна для «молчащих» судов: AIS от них не приходит, Open Waters их не
+        знает, а карточка ShipFinder отдаёт последнюю известную точку, курс,
+        скорость, осадку и назначение. Время сайта может уходить вперёд —
+        shipfinder_position уже заменяет будущее текущим.
+        """
+        mmsi = str(mmsi or "").strip()
+        if not mmsi.isdigit():
+            return None
+        found = services_feed.shipfinder_position(mmsi, timeout=20)
+        if not found:
+            return None
+        moment = found.get("at") or datetime.now()
+        try:
+            self.store.save_source_position(
+                mmsi, "shipfinder", found.get("lat"), found.get("lon"),
+                found.get("sog"), found.get("cog"), moment)
+        except Exception:
+            pass
+        updated = self._accept_position(
+            mmsi, found.get("lat"), found.get("lon"), found.get("sog"),
+            found.get("cog"), moment, "shipfinder")
+        for field, value in (("destination", found.get("destination")),
+                             ("draft", found.get("draft")),
+                             ("eta_declared", found.get("eta"))):
+            if value:
+                try:
+                    self.store.save_field(mmsi, field, value, moment, "shipfinder")
+                except Exception:
+                    pass
+        return dict(found, updated=bool(updated))
+
     def refresh_vessel_now(self, mmsi) -> dict:
         """Обновляет одно судно прямо сейчас: Open Waters, затем карточка сайта.
 
@@ -2262,6 +2296,22 @@ class RadarCore:
         elif not parts:
             parts.append("Open Waters: судна нет в базе")
         if not fresh:
+            found = None
+            try:
+                found = self.refresh_shipfinder(mmsi)
+            except Exception as error:
+                parts.append(f"ShipFinder: ошибка ({error})")
+            if found and found.get("lat") is not None:
+                point = (f"{float(found['lat']):.5f}, {float(found['lon']):.5f}")
+                stamp = found.get("at")
+                when = f" от {stamp:%d.%m %H:%M}" if stamp else ""
+                if found.get("updated"):
+                    parts.append(f"ShipFinder: позиция обновлена ({point}{when})")
+                    fresh = True
+                else:
+                    parts.append(f"ShipFinder: координаты подтверждены ({point}{when})")
+            elif found is None:
+                parts.append("ShipFinder: позиции нет")
             row = self.store.vessel(mmsi) or {}
             name = str(row.get("name") or "")
             card = self.refresh_card(mmsi, name)
