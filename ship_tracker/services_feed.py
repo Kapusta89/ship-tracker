@@ -1180,7 +1180,9 @@ class GfwFeed(ServiceFeed):
                            "callsign": profile.get("callsign") or "",
                            "type_code": profile.get("type_code"),
                            "type_label": profile.get("type_label") or "",
-                           "length_m": profile.get("length_m")})
+                           "length_m": profile.get("length_m"),
+                           "at": datetime.now(),
+                           "source": "gfw"})
             except Exception as error:
                 errors += 1
                 if errors == 1:

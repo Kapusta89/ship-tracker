@@ -157,6 +157,22 @@ FIELDS = ("name", "imo", "callsign", "type_code", "type_label", "destination", "
           "length_m", "beam_m",
           "eta_declared")
 
+# При равном времени поля выигрывает более надёжный источник: живой AIS и
+# официальный снимок важнее карточек-агрегаторов, а пустое имя источника —
+# это старые записи, они уступают всем.
+SOURCE_PRIORITY = {
+    "aisstream": 0, "openwaters": 1, "snapshot": 2, "shipfinder": 3,
+    "srd": 4, "vesselfinder": 5, "marinetraffic": 5, "myshiptracking": 5,
+    "datalastic": 5, "aishub": 5, "goradar": 6, "mlive": 6,
+    "gfw": 7, "ais-catcher": 7, "": 9,
+}
+
+# Значения Destination, которые не являются портом: их нельзя показывать как
+# пункт назначения и нельзя позволять им затирать настоящий порт.
+JUNK_DESTINATIONS = ("", "-", "—", "–", "N/A", "NA", "NONE", "NULL", "UNKNOWN",
+                     "TBN", "TBA", "FOR ORDERS", "ORDERS", "OFFSHORE", "SEA",
+                     "AT SEA", "HIGH SEAS", "0")
+
 # Колонки, добавленные позже: старые базы дополняются при открытии.
 MIGRATIONS = {
     "vessels": (("eta_declared", "TEXT"), ("length_m", "REAL"), ("beam_m", "REAL"),
@@ -210,9 +226,43 @@ class Store:
             "UPDATE vessels SET position_at = COALESCE("
             " (SELECT MAX(p.ts) FROM positions p WHERE p.mmsi = vessels.mmsi),"
             " updated_at) WHERE position_at IS NULL OR position_at = ''")
+        # Служебные значения AIS и мусор от агрегаторов не должны выглядеть
+        # данными: чистим их при открытии базы, дальше это делает валидация.
+        self.conn.execute("UPDATE vessels SET sog = NULL WHERE sog >= 102.2 OR sog < 0")
+        self.conn.execute("UPDATE vessels SET cog = NULL "
+                          "WHERE cog < 0 OR cog >= 360")
+        self.conn.execute("UPDATE vessels SET heading = NULL "
+                          "WHERE heading < 0 OR heading >= 360 OR heading = 511")
+        self.conn.execute("UPDATE vessels SET draft = NULL "
+                          "WHERE draft <= 0 OR draft > 30")
+        self.conn.execute("UPDATE vessels SET length_m = NULL "
+                          "WHERE length_m < 5 OR length_m > 500")
+        self.conn.execute("UPDATE vessels SET beam_m = NULL "
+                          "WHERE beam_m < 2 OR beam_m > 80")
+        self.conn.execute("UPDATE vessels SET type_code = NULL "
+                          "WHERE type_code < 20 OR type_code > 99")
+        # IMO из части источников приходит 9-значным с нулями на конце
+        self.conn.execute("UPDATE vessels SET imo = SUBSTR(TRIM(imo), 1, 7) "
+                          "WHERE LENGTH(TRIM(imo)) = 9 AND SUBSTR(TRIM(imo), 8, 2) = '00'")
+        self.conn.execute("UPDATE vessel_fields SET value = SUBSTR(TRIM(value), 1, 7) "
+                          "WHERE field = 'imo' AND LENGTH(TRIM(value)) = 9 "
+                          "AND SUBSTR(TRIM(value), 8, 2) = '00'")
+        marks = ", ".join("?" for _ in JUNK_DESTINATIONS)
+        self.conn.execute(
+            f"UPDATE vessels SET destination = NULL WHERE UPPER(TRIM("
+            f"COALESCE(destination, ''))) IN ({marks})", JUNK_DESTINATIONS)
+        self.conn.execute(
+            f"DELETE FROM vessel_fields WHERE field = 'destination' AND "
+            f"UPPER(TRIM(value)) IN ({marks})", JUNK_DESTINATIONS)
+        self.conn.execute("DELETE FROM vessel_fields WHERE field = 'draft' "
+                          "AND (CAST(value AS REAL) <= 0 OR CAST(value AS REAL) > 30)")
+        self.conn.execute("DELETE FROM vessel_fields WHERE field IN ('length_m', 'beam_m') "
+                          "AND (CAST(value AS REAL) <= 0 OR CAST(value AS REAL) > 500)")
+        self.conn.execute("DELETE FROM vessel_fields WHERE field = 'type_code' "
+                          "AND (CAST(value AS INTEGER) < 20 OR CAST(value AS INTEGER) > 99)")
 
     # ------------------------------------------------------------------ суда
-    def upsert_static(self, mmsi: str, **values):
+    def upsert_static(self, mmsi: str, touch=True, **values):
         """Сохраняет статические данные судна, не затирая известное пустыми полями."""
         now = iso()
         data = {key: values[key] for key in FIELDS if values.get(key) not in (None, "")}
@@ -241,9 +291,16 @@ class Store:
                     f"INSERT INTO vessels ({', '.join(columns)}) VALUES ({placeholders})", params)
             elif data:
                 assignments = ", ".join(f"{key} = ?" for key in data)
-                self.conn.execute(
-                    f"UPDATE vessels SET {assignments}, updated_at = ? WHERE mmsi = ?",
-                    [*data.values(), now, mmsi])
+                if touch:
+                    self.conn.execute(
+                        f"UPDATE vessels SET {assignments}, updated_at = ? WHERE mmsi = ?",
+                        [*data.values(), now, mmsi])
+                else:
+                    # сверка при старте не должна делать все суда «только что
+                    # обновлёнными» и переставлять списки
+                    self.conn.execute(
+                        f"UPDATE vessels SET {assignments} WHERE mmsi = ?",
+                        [*data.values(), mmsi])
             if draft:
                 # диапазон осадок нужен для оценки груза: полная осадка
                 # судна — это максимум того, что оно передавало
@@ -325,11 +382,11 @@ class Store:
                        lon = CASE WHEN {fresh} THEN excluded.lon ELSE vessels.lon END,
                        sog = CASE WHEN {fresh} THEN COALESCE(excluded.sog, vessels.sog)
                                   ELSE vessels.sog END,
-                       cog = CASE WHEN {fresh} THEN COALESCE(excluded.cog, vessels.cog)
-                                  ELSE vessels.cog END,
-                       heading = CASE WHEN {fresh} THEN COALESCE(excluded.heading, vessels.heading)
+                       cog = CASE WHEN {fresh} THEN excluded.cog ELSE vessels.cog END,
+                       heading = CASE WHEN {fresh} THEN excluded.heading
                                       ELSE vessels.heading END,
-                       port = CASE WHEN {fresh} THEN excluded.port ELSE vessels.port END,
+                       port = CASE WHEN {fresh} THEN excluded.port
+                                   ELSE vessels.port END,
                        position_at = CASE WHEN {fresh} THEN excluded.position_at
                                           ELSE vessels.position_at END,
                        updated_at = excluded.updated_at""",
@@ -372,12 +429,23 @@ class Store:
         text_value = str(value)
         with self._lock, self.conn:
             row = self.conn.execute(
-                "SELECT ts, value FROM vessel_fields WHERE mmsi = ? AND field = ?",
+                "SELECT ts, value, source FROM vessel_fields WHERE mmsi = ? AND field = ?",
                 (str(mmsi), field)).fetchone()
             if row and row[0] and str(row[0]) > stamp:
                 return False
-            if row and str(row[1]) == text_value:
-                # значение не изменилось — обновляем только метку времени
+            if row and row[0] and str(row[0]) == stamp:
+                if str(row[1]) == text_value:
+                    # значение не изменилось — обновляем только метку времени
+                    self.conn.execute(
+                        "UPDATE vessel_fields SET ts = ?, source = ? "
+                        "WHERE mmsi = ? AND field = ?",
+                        (stamp, source, str(mmsi), field))
+                    return True
+                # время одно — решает надёжность источника
+                if (SOURCE_PRIORITY.get(str(source), 9)
+                        > SOURCE_PRIORITY.get(str(row[2] or ""), 9)):
+                    return False
+            elif row and str(row[1]) == text_value:
                 self.conn.execute(
                     "UPDATE vessel_fields SET ts = ?, source = ? WHERE mmsi = ? AND field = ?",
                     (stamp, source, str(mmsi), field))

@@ -96,6 +96,78 @@ def clean_motion(sog=None, cog=None, heading=None):
     return speed, course, direction
 
 
+JUNK_DESTINATIONS = {"", "-", "—", "–", "N/A", "NA", "NONE", "NULL", "UNKNOWN",
+                     "TBN", "TBA", "FOR ORDERS", "ORDERS", "OFFSHORE", "SEA",
+                     "AT SEA", "HIGH SEAS", "0"}
+
+
+def valid_static_field(field, value):
+    """Проверяет паспортное поле и возвращает очищенное значение или None.
+
+    Агрегаторы присылают «—» вместо назначения, осадку 40 м и тип 0. Такие
+    значения нельзя пускать в базу: они вытесняют настоящие данные и выглядят
+    как факт. Диапазоны проверяются для каждого поля отдельно.
+    """
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    upper = " ".join(text.upper().split())
+    if field == "destination":
+        if upper in JUNK_DESTINATIONS or len(text) < 2 or len(text) > 40:
+            return None
+        return text
+    if field == "name":
+        if upper in {"-", "—", "UNKNOWN", "N/A", "NO NAME", "NONAME", "TEST",
+                     "DEMO", "EXAMPLE", "SAMPLE"} or len(text) > 60:
+            return None
+        return text
+    if field == "imo":
+        digits = "".join(ch for ch in text if ch.isdigit())
+        # часть источников дополняет 7-значный IMO нулями до 9 знаков
+        while len(digits) > 7 and digits.endswith("0"):
+            digits = digits[:-1]
+        return digits if len(digits) == 7 and digits != "0000000" else None
+    if field == "callsign":
+        if upper in {"-", "—", "N/A", "NA", "UNKNOWN", "0", "NONE"}:
+            return None
+        return text if 2 <= len(text) <= 12 else None
+    if field == "type_code":
+        try:
+            code = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return code if 20 <= code <= 99 else None
+    if field == "type_label":
+        if upper in {"-", "—", "UNKNOWN", "N/A", "NONE"}:
+            return None
+        return text if len(text) <= 40 else None
+    if field == "draft":
+        try:
+            draft = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(draft, 2) if 0 < draft <= 30 else None
+    if field == "length_m":
+        try:
+            length = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(length, 1) if 5 <= length <= 500 else None
+    if field == "beam_m":
+        try:
+            beam = float(value)
+        except (TypeError, ValueError):
+            return None
+        return round(beam, 1) if 2 <= beam <= 80 else None
+    if field == "eta_declared":
+        if upper in JUNK_DESTINATIONS:
+            return None
+        return text if len(text) <= 30 else None
+    return text
+
+
 class AppError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
 
@@ -989,6 +1061,8 @@ class RadarCore:
         # продолжают Open Waters, ShipFinder и карточки сайта
         threading.Thread(target=self._failover_worker, daemon=True,
                          name="source-failover").start()
+        threading.Thread(target=self.reconcile_vessels, daemon=True,
+                         name="reconcile-vessels").start()
         # Все каналы стартуют здесь же, каждый в своём потоке: ни один не ждёт
         # ответа другого, поэтому подключения работают одновременно.
         live = [feed for feed in self.feeds if not getattr(feed, "service", False)]
@@ -2272,14 +2346,22 @@ class RadarCore:
         updated = self._accept_position(
             mmsi, found.get("lat"), found.get("lon"), found.get("sog"),
             found.get("cog"), moment, "shipfinder")
+        saved = False
         for field, value in (("destination", found.get("destination")),
                              ("draft", found.get("draft")),
                              ("eta_declared", found.get("eta"))):
-            if value:
+            cleaned = valid_static_field(field, value)
+            if cleaned is not None:
                 try:
-                    self.store.save_field(mmsi, field, value, moment, "shipfinder")
+                    saved = self.store.save_field(
+                        mmsi, field, cleaned, moment, "shipfinder") or saved
                 except Exception:
                     pass
+        if saved:
+            try:
+                self.store.upsert_static(mmsi, **self.merged_static(mmsi))
+            except Exception:
+                pass
         return dict(found, updated=bool(updated))
 
     def refresh_vessel_now(self, mmsi) -> dict:
@@ -2450,9 +2532,10 @@ class RadarCore:
             for field, value in (("destination", found.get("destination")),
                                  ("draft", found.get("draft")),
                                  ("eta_declared", found.get("eta"))):
-                if value:
+                cleaned = valid_static_field(field, value)
+                if cleaned is not None:
                     try:
-                        self.store.save_field(mmsi, field, value, moment, "shipfinder")
+                        self.store.save_field(mmsi, field, cleaned, moment, "shipfinder")
                     except Exception:
                         pass
             self.stop_event.wait(0.8)
@@ -2648,6 +2731,36 @@ class RadarCore:
             if self.stop_event.wait(60):
                 break
 
+    def reconcile_vessels(self, limit=3000) -> int:
+        """Приводит строки судов к самым свежим допустимым значениям полей.
+
+        Даже если раньше в базу попал мусор или старое значение обошло
+        послойную проверку, при старте строка собирается заново из журнала
+        полей: у каждого поля своё время и источник, побеждает свежайшее.
+        """
+        try:
+            rows = self.store.vessels(limit)
+        except Exception:
+            return 0
+        changed = 0
+        for row in rows:
+            mmsi = str(row.get("mmsi") or "")
+            if not mmsi:
+                continue
+            values = self.merged_static(mmsi)
+            if not values:
+                continue
+            if all(str(row.get(field)) == str(value) for field, value in values.items()):
+                continue
+            try:
+                self.store.upsert_static(mmsi, touch=False, **values)
+                changed += 1
+            except Exception:
+                continue
+        if changed:
+            self.log(f"Данные судов сверены с источниками: обновлено {changed}.")
+        return changed
+
     def bulk_refresh(self, batch=150, workers=6) -> dict:
         """Обновляет позиции очередной пачки судов — по кругу, без пропусков.
 
@@ -2773,9 +2886,17 @@ class RadarCore:
             if found and self._accept_position(mmsi, found.get("lat"), found.get("lon"),
                                                found.get("sog"), found.get("cog"),
                                                found.get("at"), "vesselapi"):
-                self.store.upsert_static(mmsi, draft=found.get("draft"),
-                                         destination=found.get("destination"),
-                                         eta_declared=found.get("eta"))
+                values = {}
+                for field, value in (("draft", found.get("draft")),
+                                     ("destination", found.get("destination")),
+                                     ("eta_declared", found.get("eta"))):
+                    cleaned = valid_static_field(field, value)
+                    if cleaned is not None:
+                        values[field] = cleaned
+                        self.store.save_field(mmsi, field, cleaned,
+                                              found.get("at"), "vesselapi")
+                if values:
+                    self.store.upsert_static(mmsi, **self.merged_static(mmsi))
                 self.log(f"AIS-поиск: {name} найден заново в VesselAPI.")
                 return "VesselAPI"
         return None
@@ -3069,8 +3190,9 @@ class RadarCore:
         # каждое поле хранится со своим временем и источником: имя может быть
         # свежим в AIS, а осадка и размеры — только в карточке Ship Radar 24
         for field, value in incoming.items():
-            if value not in (None, ""):
-                self.store.save_field(mmsi, field, value, when, source)
+            cleaned = valid_static_field(field, value)
+            if cleaned is not None:
+                self.store.save_field(mmsi, field, cleaned, when, source)
         # в строку судна идёт самое свежее значение каждого поля, а не то,
         # что пришло последним
         self.store.upsert_static(mmsi, **self.merged_static(mmsi))
@@ -3145,12 +3267,17 @@ class RadarCore:
 
         if event.get("name"):
             existing = self.store.vessel(mmsi)
-            if existing and not existing.get("name"):
-                self.store.upsert_static(mmsi, name=event["name"])
+            name = valid_static_field("name", event.get("name"))
+            if name and existing and not existing.get("name"):
+                self.store.save_field(mmsi, "name", name, moment, source)
+                self.store.upsert_static(mmsi, **self.merged_static(mmsi))
         # снимок отдаёт назначение вместе с позицией: без него далёкое судно
         # в базе есть, но в списках не считается «идущим в наш порт»
         if event.get("destination") and not (vessel or {}).get("destination"):
-            self.store.upsert_static(mmsi, destination=event["destination"])
+            destination = valid_static_field("destination", event.get("destination"))
+            if destination:
+                self.store.save_field(mmsi, "destination", destination, moment, source)
+                self.store.upsert_static(mmsi, **self.merged_static(mmsi))
 
         if not allowed:
             # точка-скачок не идёт ни в трек, ни в геозоны: иначе судно
@@ -3500,8 +3627,10 @@ class RadarCore:
             if field not in self.STATIC_FIELDS:
                 continue
             value = record.get("value")
-            if value in (None, ""):
+            cleaned = valid_static_field(field, value)
+            if cleaned is None:
                 continue
+            value = cleaned
             if field in self.NUMERIC_FIELDS:
                 try:
                     value = float(value)
