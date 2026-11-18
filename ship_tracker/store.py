@@ -260,6 +260,20 @@ class Store:
                           "AND (CAST(value AS REAL) <= 0 OR CAST(value AS REAL) > 500)")
         self.conn.execute("DELETE FROM vessel_fields WHERE field = 'type_code' "
                           "AND (CAST(value AS INTEGER) < 20 OR CAST(value AS INTEGER) > 99)")
+        # Стоянка не может закончиться раньше, чем началась: такие записи —
+        # след запоздавшей точки из трека. Удаляем их, а не показываем.
+        self.conn.execute("DELETE FROM port_visits WHERE left_at IS NOT NULL "
+                          "AND julianday(left_at) < julianday(entered_at)")
+        # Один и тот же заход мог записаться дважды из разных процессов.
+        self.conn.execute("DELETE FROM port_visits WHERE id NOT IN ("
+                          "SELECT MIN(id) FROM port_visits GROUP BY mmsi, port, "
+                          "entered_at, COALESCE(left_at, ''))")
+        # Двух одновременно открытых стоянок у судна быть не может: оставляем
+        # последнюю, остальные — дубли того же захода.
+        self.conn.execute("DELETE FROM port_visits WHERE left_at IS NULL AND id NOT IN ("
+                          "SELECT MAX(id) FROM port_visits WHERE left_at IS NULL GROUP BY mmsi)")
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_port_visits_once "
+                          "ON port_visits(mmsi, port, entered_at, COALESCE(left_at, ''))")
 
     # ------------------------------------------------------------------ суда
     def upsert_static(self, mmsi: str, touch=True, **values):
@@ -600,29 +614,51 @@ class Store:
         return [dict(row) for row in rows]
 
     def close_visit_by_id(self, visit_id, when):
-        """Закрывает открытую стоянку временем ухода из трека."""
+        """Закрывает открытую стоянку временем ухода из трека.
+
+        Уход раньше входа — признак запоздавшей точки: такую стоянку не
+        закрываем, иначе в истории появляется «пришёл в ноябре, ушёл в октябре».
+        """
         with self._lock, self.conn:
             cur = self.conn.execute(
-                "UPDATE port_visits SET left_at = ? WHERE id = ? AND left_at IS NULL",
-                (iso(when), int(visit_id)))
+                "UPDATE port_visits SET left_at = ? WHERE id = ? AND left_at IS NULL "
+                "AND julianday(?) >= julianday(entered_at)",
+                (iso(when), int(visit_id), iso(when)))
             return cur.rowcount
 
     def start_visit(self, mmsi: str, port: str, lat, lon, when=None, draft=None,
-                    cargo_kind=None, source="live"):
+                    cargo_kind=None, source="live") -> bool:
         now = iso(when)
         with self._lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT port, entered_at FROM port_visits "
+                "WHERE mmsi = ? AND left_at IS NULL", (mmsi,)).fetchall()
+            for row in rows:
+                # запоздавшая точка не должна перебивать более новый заход
+                if str(row["entered_at"] or "") > now:
+                    return False
+                if (str(row["port"] or "").upper() == str(port).upper()
+                        and str(row["entered_at"] or "") == now):
+                    return False
             self.conn.execute(
-                "UPDATE port_visits SET left_at = ? WHERE mmsi = ? AND left_at IS NULL", (now, mmsi))
+                "UPDATE port_visits SET left_at = ? WHERE mmsi = ? AND left_at IS NULL "
+                "AND julianday(entered_at) <= julianday(?)", (now, mmsi, now))
             self.conn.execute(
                 "INSERT INTO port_visits (mmsi, port, entered_at, lat, lon, draft_in, "
                 "cargo_kind, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (mmsi, port, now, lat, lon, draft, cargo_kind, source))
+        return True
 
     def import_visit(self, mmsi: str, port: str, entered_at, left_at=None, draft_in=None,
                      draft_out=None, cargo_kind=None, source="track") -> bool:
         """Добавляет визит, найденный по истории трека, если такого ещё нет."""
         entered = iso(entered_at)
         left = iso(left_at) if left_at else None
+        # уход раньше входа или вход из будущего — не данные, а ошибка времени
+        if left and left < entered:
+            return False
+        if entered > iso(datetime.now() + timedelta(minutes=5)):
+            return False
         with self._lock, self.conn:
             # Тот же заход мог быть записан по живому AIS или с другого трека:
             # новый визит не добавляется, если его интервал пересекается с уже
@@ -738,7 +774,8 @@ class Store:
         with self._lock, self.conn:
             cur = self.conn.execute(
                 "UPDATE port_visits SET left_at = ?, draft_out = COALESCE(?, draft_out) "
-                "WHERE mmsi = ? AND left_at IS NULL", (now, draft_out, mmsi))
+                "WHERE mmsi = ? AND left_at IS NULL "
+                "AND julianday(?) >= julianday(entered_at)", (now, draft_out, mmsi, now))
             return cur.rowcount > 0
 
     def last_departure(self, mmsi: str, window_hours: float = 96):

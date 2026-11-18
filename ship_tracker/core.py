@@ -3284,6 +3284,11 @@ class RadarCore:
             # «входило» в порт и выходило из него за одну секунду
             self.stats["skipped"] = self.stats.get("skipped", 0) + 1
             return
+        if stored_at is not None and moment < stored_at:
+            # источник опоздал: точка старая, значит не может ни двигать трек,
+            # ни открывать/закрывать стоянку задним числом
+            self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+            return
 
         last_stored = self._last_stored.get(mmsi)
         interval = float(self.config.get("position_interval_seconds") or 15)
@@ -3376,8 +3381,12 @@ class RadarCore:
                 self.log(f"{name}: вход в порт {port_name}."
                          + (f" Осадка {draft:g} м — груз: {kind}." if draft and kind else ""))
         elif visit:
-            self.store.close_visit(mmsi, when, draft_out=draft)
-            self.log(f"{name}: вышел из порта {visit['port']}.")
+            entered = parse_iso(visit.get("entered_at"))
+            if entered is not None and when < entered:
+                # уход раньше входа невозможен: это запоздавшая точка
+                return
+            if self.store.close_visit(mmsi, when, draft_out=draft):
+                self.log(f"{name}: вышел из порта {visit['port']}.")
 
     # ------------------------------------------------------------- фильтр
     def evaluate(self, mmsi: str):
