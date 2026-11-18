@@ -2535,6 +2535,16 @@ class App:
                    command=lambda: webbrowser.open("https://overpass-api.de/")).grid(
             row=row, column=2, sticky="e", padx=8, pady=(2, 0))
         row += 1
+        vesselapi_state = ("ключ задан" if str(self.config.get("vesselapi_key") or "").strip()
+                           else "ключ не задан")
+        ttk.Label(links,
+                  text=f"VesselAPI — поиск судов, пропавших из AIS ({vesselapi_state})",
+                  font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
+                                             sticky="w", padx=(16, 6), pady=(2, 0))
+        ttk.Button(links, text="Открыть сайт",
+                   command=lambda: webbrowser.open("https://vesselapi.com/")).grid(
+            row=row, column=2, sticky="e", padx=8, pady=(2, 0))
+        row += 1
         telegram_state = ("настроен" if self.config.get("telegram_token")
                           and self.config.get("telegram_chat_id") else "не настроен")
         ttk.Label(links,
