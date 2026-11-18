@@ -3062,6 +3062,70 @@ class RadarCore:
                 self.log(f"Ошибка обработки сообщения: {error}")
             self._housekeeping()
 
+    def reconcile_open_visits(self, stale_hours=24.0) -> int:
+        """Закрывает стоянки, которые уже не подтверждаются координатами.
+
+        Судно могло уйти, пока не было связи, или вообще исчезнуть из списка.
+        Держать такую стоянку открытой нельзя: карточка показывает «на месте»,
+        хотя последняя точка была в море. Временем ухода становится последняя
+        точка внутри порта (или последняя известная точка судна).
+        """
+        ports = [port for port in (self.config.get("ports") or [])
+                 if port.get("lat") is not None and port.get("lon") is not None]
+        try:
+            limit = timedelta(hours=float(stale_hours))
+        except (TypeError, ValueError):
+            limit = timedelta(hours=24)
+        moment = datetime.now()
+        closed = 0
+        for visit in self.store.open_visits():
+            mmsi = str(visit.get("mmsi") or "")
+            entered = parse_iso(visit.get("entered_at"))
+            if not mmsi or entered is None:
+                continue
+            vessel = self.store.vessel(mmsi) or {}
+            lat, lon = vessel.get("lat"), vessel.get("lon")
+            seen = parse_iso(vessel.get("position_at") or vessel.get("updated_at"))
+            fresh = bool(lat is not None and lon is not None and seen
+                         and moment - seen <= limit)
+            if fresh and ports:
+                here = geo.port_at(lat, lon, ports)
+                if (here and str(here.get("name") or "").upper()
+                        == str(visit.get("port") or "").upper()):
+                    continue
+            # последняя точка, где судно действительно было в этом порту
+            last_inside = None
+            stop = seen if seen and seen > entered else moment
+            try:
+                points = self.store.positions_between(mmsi, visit.get("entered_at"), stop)
+            except Exception:
+                points = []
+            for point in points:
+                if not ports or point.get("lat") is None:
+                    continue
+                hit = geo.port_at(point["lat"], point["lon"], ports)
+                if (hit and str(hit.get("name") or "").upper()
+                        == str(visit.get("port") or "").upper()):
+                    last_inside = parse_iso(point.get("ts")) or last_inside
+            when = last_inside
+            if when is None and fresh:
+                when = seen
+            if when is None:
+                # связи нет дольше суток: подтвердить стоянку нечем
+                if moment - entered <= limit:
+                    continue
+                when = entered
+            if when is None or when < entered:
+                when = entered
+            try:
+                if self.store.close_visit_by_id(visit.get("id"), when):
+                    closed += 1
+            except Exception as error:
+                self.log(f"Сверка стоянок: {mmsi} — {error}")
+        if closed:
+            self.log(f"Сверка стоянок: закрыто {closed} без подтверждения координатами.")
+        return closed
+
     def _housekeeping(self):
         now = time.monotonic()
         if now - self._last_housekeeping < 300:
@@ -3078,6 +3142,10 @@ class RadarCore:
             if stations:
                 self.store.purge_vessels(stations)
                 self.log(f"Убраны служебные объекты AIS: {len(stations)}.")
+            try:
+                self.reconcile_open_visits()
+            except Exception as error:
+                self.log(f"Сверка стоянок: {error}")
             forgotten = self.store.forget_vessels(self.config.get("forget_vessels_hours") or 24)
             if forgotten:
                 self.log(f"Убрано из списка судов без связи: {forgotten}.")
@@ -3948,17 +4016,32 @@ class RadarCore:
         except Exception:
             entry = {}
         history = entry.get("port_visits") or {}
+        moment = datetime.now()
+
+        def plausible(item):
+            """Заход с уходом раньше входа или из будущего не показываем."""
+            if not isinstance(item, dict):
+                return False
+            if not str(item.get("port") or "").strip():
+                return False
+            start = parse_iso(item.get("start") or item.get("entered_at"))
+            end = parse_iso(item.get("end") or item.get("left_at"))
+            if start and start > moment + timedelta(hours=1):
+                return False
+            if start and end and end < start:
+                return False
+            return True
+
         visits = []
         for visit in history.get("visits") or []:
-            name = str((visit or {}).get("port") or "").strip()
-            if name:
-                visits.append(dict(visit, port=name))
+            if plausible(visit):
+                visits.append(dict(visit, port=str(visit.get("port")).strip()))
         history_source = "GFW"
         if not visits:
             cached = self.portcalls_history(mmsi)
-            visits = [dict(item, port=item.get("port"))
+            visits = [dict(item, port=str(item.get("port")).strip())
                       for item in (cached.get("visits") or [])
-                      if str((item or {}).get("port") or "").strip()]
+                      if plausible(item)]
             if visits:
                 history_source = "MarineTraffic.live"
         counts = {}

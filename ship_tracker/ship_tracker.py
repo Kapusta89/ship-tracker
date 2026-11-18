@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.58"
+APP_VERSION = "2026.12.59"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -3462,6 +3462,8 @@ class App:
             for visit in visits[:6]:
                 start = str(visit.get("start") or "")[:10]
                 end = str(visit.get("end") or "")[:10]
+                if not end and start:
+                    end = "на месте"
                 span = ""
                 if visit.get("hours"):
                     try:
