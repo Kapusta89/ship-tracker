@@ -164,6 +164,11 @@ DEFAULT_CONFIG = {
     "sfp_minutes": 5,
     "sfp_limit": 12,
     "sfp_stale_minutes": 5,
+    # Резерв, когда живой AIS молчит: альтернативные источники опрашиваются
+    # чаще и по большему числу судов, пока данные не вернутся.
+    "failover_minutes": 8,
+    "failover_poll_minutes": 3,
+    "failover_limit": 40,
     "use_gfw": False,
     "gfw_key": "",
     "gfw_minutes": 60,
@@ -980,6 +985,10 @@ class RadarCore:
             # история заходов: второй ресурс для конечного назначения
             threading.Thread(target=self._portcalls_worker, daemon=True,
                              name="portcalls-history").start()
+        # Резерв: если живой AIS замолчал, постоянную передачу данных
+        # продолжают Open Waters, ShipFinder и карточки сайта
+        threading.Thread(target=self._failover_worker, daemon=True,
+                         name="source-failover").start()
         # Все каналы стартуют здесь же, каждый в своём потоке: ни один не ждёт
         # ответа другого, поэтому подключения работают одновременно.
         live = [feed for feed in self.feeds if not getattr(feed, "service", False)]
@@ -2563,6 +2572,80 @@ class RadarCore:
             except Exception as error:
                 self.log(f"Порты заходов: {error}")
             if self.stop_event.wait(2 * 3600):
+                break
+
+    # ------------------------------------------- резерв при молчании AIS
+    def failover_state(self) -> dict:
+        return {"active": bool(getattr(self, "_failover_active", False)),
+                "silence": self.feed_silence_minutes(),
+                "since": getattr(self, "_failover_started", None),
+                "last": getattr(self, "_failover_last", 0.0)}
+
+    def check_failover(self) -> bool:
+        """Переключает постоянную передачу на альтернативы при тишине AIS."""
+        try:
+            limit_minutes = float(self.config.get("failover_minutes") or 8)
+        except (TypeError, ValueError):
+            limit_minutes = 8.0
+        silence = self.feed_silence_minutes()
+        alive = [feed for feed in self.ais_feeds() if feed.is_alive()]
+        # «Нет живых потоков» — тоже поломка, но при только что стартовавшей
+        # программе данных ещё нет: ждём тот же порог тишины.
+        if silence < max(2.0, limit_minutes):
+            if getattr(self, "_failover_active", False):
+                self._failover_active = False
+                minutes = 0.0
+                started = getattr(self, "_failover_started", None)
+                if started:
+                    minutes = (datetime.now() - started).total_seconds() / 60.0
+                self.log(f"Живой AIS вернулся — резерв выключен "
+                         f"(молчал ≈ {minutes:.0f} мин).")
+            return False
+        if not getattr(self, "_failover_active", False):
+            self._failover_active = True
+            self._failover_started = datetime.now()
+            self.log(f"Живой AIS молчит {silence:.0f} мин (потоков живо: "
+                     f"{len(alive)}) — включаю резерв: Open Waters, ShipFinder "
+                     f"и карточки сайта.")
+        try:
+            every = float(self.config.get("failover_poll_minutes") or 3) * 60.0
+        except (TypeError, ValueError):
+            every = 180.0
+        if time.time() - getattr(self, "_failover_last", 0.0) < every:
+            return True
+        self._failover_last = time.time()
+        threading.Thread(target=self._failover_refresh, daemon=True,
+                         name="failover-refresh").start()
+        return True
+
+    def _failover_refresh(self):
+        """Внеочередной опрос альтернативных источников позиций."""
+        asked = 0
+        try:
+            asked = self.refresh_all_sources()
+        except Exception as error:
+            self.log(f"Резерв: источники не проснулись ({error})")
+        try:
+            self.refresh_focus(limit=30)
+        except Exception as error:
+            self.log(f"Резерв: Open Waters — {error}")
+        limit = int(self.config.get("failover_limit") or 40)
+        try:
+            result = self.refresh_live_positions(limit=limit)
+            self.log(f"Резерв: ShipFinder проверил {result['checked']} судов, "
+                     f"новых позиций {result['updated']}; источников разбужено {asked}.")
+        except Exception as error:
+            self.log(f"Резерв: ShipFinder — {error}")
+
+    def _failover_worker(self):
+        if self.stop_event.wait(60):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.check_failover()
+            except Exception as error:
+                self.log(f"Резерв источников: {error}")
+            if self.stop_event.wait(60):
                 break
 
     def bulk_refresh(self, batch=150, workers=6) -> dict:

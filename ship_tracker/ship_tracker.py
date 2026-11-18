@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.55"
+APP_VERSION = "2026.12.56"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -4004,6 +4004,10 @@ class App:
         else:
             conn = f"поток: переподключение {self.short_error(state.get('error'))}".strip()
         conn += " · живой AIS: реальные суда"
+        failover = self.core.failover_state()
+        if failover.get("active"):
+            conn += (f" · резерв: Open Waters/ShipFinder "
+                     f"({failover.get('silence', 0):.0f} мин тишины)")
         self.conn_var.set(conn)
         self.update_feed_status()
         self.stats_var.set(
