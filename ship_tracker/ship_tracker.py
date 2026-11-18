@@ -22,6 +22,7 @@
 """
 
 import argparse
+import concurrent.futures
 import math
 import os
 import queue
@@ -83,6 +84,8 @@ SERVICE_BLOCKS = [
     ("MarineTraffic.live", "mlive", "бесплатно, без ключа: карта судов района"),
     ("Ship Radar 24: карточки", "srd",
      "бесплатно, без ключа: тип, осадка, размеры и назначение судов"),
+    ("ShipFinder: координаты в моменте", "sfp",
+     "бесплатно, без ключа: позиция, курс и рейс по MMSI"),
     ("AIS-catcher: ожидаемые прибытия", "aci",
      "бесплатно, без ключа: суда, идущие в наши порты"),
     ("Global Fishing Watch", "gfw",
@@ -101,7 +104,7 @@ CONNECTION_SECTIONS = (
      ("vf", "vfa", "mt", "mst", "dat", "aishub", "gfw")),
     ("Бесплатные сервисы без ключа",
      "работают сразу после включения галочки, ключ не нужен",
-     ("srd", "mlive", "gor", "aci", "dt")),
+     ("srd", "mlive", "gor", "aci", "dt", "sfp")),
 )
 
 SERVICE_SITES = {
@@ -113,6 +116,7 @@ SERVICE_SITES = {
     "gor": ("goradar.ru", "https://goradar.ru/"),
     "mlive": ("marinetraffic.live", "https://marinetraffic.live/"),
     "srd": ("карточки судов marinetraffic.live", "https://marinetraffic.live/"),
+    "sfp": ("shipfinder.com", "https://www.shipfinder.com/"),
     "aci": ("AIS-catcher", "https://www.aiscatcher.org/port/UAIZM?tab=expected"),
     "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
     "dat": ("Datalastic API", "https://datalastic.com/ais-data-api/"),
@@ -945,6 +949,7 @@ class App:
         self.build()
         self.enable_clipboard()
         self.core.start()
+        self.start_photos_auto()
         self.start_bot()
         self.root.after(250, self.drain)
         self.root.after(600, self.fast_tick)
@@ -2343,6 +2348,7 @@ class App:
         self.var_use_gor = tk.BooleanVar(value=bool(self.config.get("use_gor", True)))
         self.var_use_mlive = tk.BooleanVar(value=bool(self.config.get("use_mlive", True)))
         self.var_use_srd = tk.BooleanVar(value=bool(self.config.get("use_srd", True)))
+        self.var_use_sfp = tk.BooleanVar(value=bool(self.config.get("use_sfp", True)))
         self.var_use_aci = tk.BooleanVar(value=bool(self.config.get("use_aci", True)))
         self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
         self.var_use_dat = tk.BooleanVar(value=bool(self.config.get("use_dat", False)))
@@ -2360,7 +2366,7 @@ class App:
             "aci": tk.StringVar(), "gfw": tk.StringVar(),
             "dat": tk.StringVar(), "aishub": tk.StringVar(),
             "gor": tk.StringVar(), "mlive": tk.StringVar(),
-            "srd": tk.StringVar(),
+            "srd": tk.StringVar(), "sfp": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -2508,6 +2514,15 @@ class App:
                   foreground="#777").grid(row=row + 2, column=0, columnspan=3,
                                           sticky="w", padx=8, pady=(0, 4))
         row += 3
+        self.var_photos_auto = tk.BooleanVar(value=bool(self.config.get("photos_auto", True)))
+        ttk.Checkbutton(links, text="обновлять фото автоматически",
+                        variable=self.var_photos_auto,
+                        command=self._on_photos_auto).grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=8)
+        self.photo_auto_var = tk.StringVar(value=self.photos_auto_text())
+        ttk.Label(links, textvariable=self.photo_auto_var, foreground="#555").grid(
+            row=row + 1, column=0, columnspan=3, sticky="w", padx=30, pady=(0, 4))
+        row += 2
         self.photo_status = {}
         for key, title, site in photos.PROVIDERS:
             var = tk.StringVar(value="не проверялся")
@@ -3243,6 +3258,101 @@ class App:
 
     def photo_status_text(self, key) -> str:
         return getattr(self, "_photo_checked", {}).get(key, "не проверялся")
+
+    # ------------------------------------------- автообновление фотографий
+    def photos_auto_text(self) -> str:
+        try:
+            minutes = float(self.config.get("photos_minutes") or 15)
+        except (TypeError, ValueError):
+            minutes = 15
+        batch = int(self.config.get("photos_batch") or 25)
+        state = "включено" if self.config.get("photos_auto", True) else "выключено"
+        return (f"автообновление {state}: каждые {minutes:g} мин до {batch} судов"
+                f" · добавлено за сеанс {getattr(self, '_photos_added', 0)}")
+
+    def _on_photos_auto(self):
+        self.config["photos_auto"] = bool(self.var_photos_auto.get())
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as error:
+            self.log(f"Настройки фото: {error}")
+        self.log("Фото: автообновление " + ("включено." if self.config["photos_auto"]
+                                             else "выключено."))
+        self.photo_auto_var.set(self.photos_auto_text())
+
+    def start_photos_auto(self):
+        self._photos_added = 0
+        self._photos_checked = 0
+        threading.Thread(target=self._photos_auto_worker, daemon=True,
+                         name="photos-auto").start()
+
+    def _photos_auto_worker(self):
+        if self.core.stop_event.wait(120):
+            return
+        while not self.core.stop_event.is_set():
+            try:
+                if self.config.get("photos_auto", True):
+                    self._photos_auto_pass()
+            except Exception as error:
+                self.log(f"Автообновление фото: {error}")
+            try:
+                minutes = float(self.config.get("photos_minutes") or 15)
+            except (TypeError, ValueError):
+                minutes = 15
+            if self.core.stop_event.wait(max(300.0, minutes * 60.0)):
+                break
+
+    def _photos_auto_pass(self):
+        """Добирает снимки для судов без фото, не блокируя окно."""
+        batch = max(1, int(self.config.get("photos_batch") or 25))
+        todo = []
+        for row in self.store.vessels(3000):
+            mmsi = str(row.get("mmsi") or "")
+            if not mmsi:
+                continue
+            path = PHOTO_DIR / f"{mmsi}.jpg"
+            try:
+                if path.exists() and path.stat().st_size >= photos.MIN_IMAGE_BYTES:
+                    continue
+                # свежая пометка «фото нет»: повторять запрос раньше TTL незачем,
+                # иначе проход тратит места на уже проверенных и не доходит до новых
+                missing = PHOTO_DIR / f"{mmsi}.none"
+                if (missing.exists()
+                        and time.time() - missing.stat().st_mtime < photos.MISSING_TTL):
+                    continue
+            except OSError:
+                continue
+            todo.append(row)
+        if not todo:
+            return
+        picked = todo[:batch]
+
+        def grab(row):
+            if self.core.stop_event.is_set():
+                return None
+            try:
+                path, _source = photos.fetch_with_source(
+                    str(row.get("mmsi")), row.get("imo"), PHOTO_DIR,
+                    timeout=8, name=row.get("name"))
+                return path
+            except Exception:
+                return None
+
+        # четыре параллельных запроса: чужие сайты отвечают медленно,
+        # последовательный проход растягивался на десятки минут
+        added = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for path in pool.map(grab, picked):
+                if path:
+                    added += 1
+        self._photos_added += added
+        self._photos_checked += len(picked)
+        text = self.photos_auto_text()
+        try:
+            self.root.after(0, lambda: self.photo_auto_var.set(text))
+        except Exception:
+            pass
+        self.log(f"Фото: авто-проход — проверено {len(picked)}, добавлено {added}.")
 
     def check_photo_sources(self):
         """Проверяет каждый фото-источник отдельно, не блокируя окно."""
@@ -4510,6 +4620,8 @@ class App:
         self.config["use_gor"] = bool(getattr(self, "var_use_gor", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_mlive"] = bool(getattr(self, "var_use_mlive", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_srd"] = bool(getattr(self, "var_use_srd", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_sfp"] = bool(getattr(self, "var_use_sfp", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["photos_auto"] = bool(getattr(self, "var_photos_auto", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_aci"] = bool(getattr(self, "var_use_aci", __import__("tkinter").BooleanVar(value=True)).get())
         self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dat"] = bool(getattr(self, "var_use_dat", __import__("tkinter").BooleanVar(value=False)).get())
@@ -4928,6 +5040,15 @@ class App:
         if services_feed.needs_key(key) and not api_key:
             self.log(f"{title}: не задан ключ API — проверка невозможна.")
             finish("нужен ключ API")
+            return
+        if key == "sfp":
+            try:
+                result = self.core.refresh_live_positions(limit=2)
+                text = f"обновлено {result['updated']} из {result['checked']}"
+            except Exception as error:
+                text = f"ошибка: {str(error)[:60]}"
+            self.log(f"{title}: {text}.")
+            finish(text)
             return
         if key == "mt":
             # частая ошибка: в поле MarineTraffic оказывается ключ VesselFinder

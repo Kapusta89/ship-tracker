@@ -159,6 +159,11 @@ DEFAULT_CONFIG = {
     # карточки судов Ship Radar 24: тип, осадка, размеры, позывной, назначение
     "use_srd": True,
     "srd_minutes": 15,
+    # ShipFinder: публичная карта без ключа, точечно по нашим судам
+    "use_sfp": True,
+    "sfp_minutes": 5,
+    "sfp_limit": 12,
+    "sfp_stale_minutes": 5,
     "use_gfw": False,
     "gfw_key": "",
     "gfw_minutes": 60,
@@ -968,6 +973,9 @@ class RadarCore:
         threading.Thread(target=self._approach_worker, daemon=True,
                          name="approach-scan").start()
         self._start_services()
+        if config.get("use_sfp", True):
+            threading.Thread(target=self._live_web_worker, daemon=True,
+                             name="live-web").start()
         # Все каналы стартуют здесь же, каждый в своём потоке: ни один не ждёт
         # ответа другого, поэтому подключения работают одновременно.
         live = [feed for feed in self.feeds if not getattr(feed, "service", False)]
@@ -2305,6 +2313,109 @@ class RadarCore:
             return {"checked": len(batch), "updated": 0}
         return {"checked": len(batch),
                 "updated": sum(1 for flag in results if flag)}
+
+    # ------------------------------------------- координаты «в моменте» (ShipFinder)
+    def live_web_candidates(self, limit=12, stale_minutes=5.0) -> list:
+        """Суда, которым полезно уточнить позицию на внешней карте.
+
+        Свежие позиции не трогаем: внешняя карта нужна там, где AIS молчит.
+        Закреплённые суда идут первыми, затем идущие в наши порты.
+        """
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 12
+        cutoff = datetime.now() - timedelta(minutes=max(1.0, float(stale_minutes or 5)))
+        pinned = set(str(item) for item in (self.pinned_mmsis or ()))
+        fresh = datetime.now() - timedelta(minutes=2)
+
+        def priority(row):
+            mmsi = str(row.get("mmsi") or "")
+            if mmsi in pinned:
+                return 0
+            if self.destination_is_ours(row.get("destination")):
+                return 1
+            if row.get("port"):
+                return 2
+            if row.get("tracked"):
+                return 3
+            return 9
+
+        picked = []
+        for row in self.store.vessels(3000):
+            mmsi = str(row.get("mmsi") or "")
+            if not mmsi:
+                continue
+            rank = priority(row)
+            moment = parse_iso(row.get("position_at"))
+            if moment is not None and moment >= fresh:
+                continue
+            if moment is not None and moment >= cutoff and rank != 0:
+                continue
+            picked.append((rank, moment, row))
+        picked.sort(key=lambda item: (item[0],
+                                      -(item[1].timestamp() if item[1] else 0)))
+        return [row for _rank, _moment, row in picked[:limit]]
+
+    def refresh_live_positions(self, limit=None) -> dict:
+        """Точечно обновляет координаты наших судов на публичной карте."""
+        if limit is None:
+            limit = int(self.config.get("sfp_limit") or 12)
+        stale = float(self.config.get("sfp_stale_minutes") or 5)
+        rows = self.live_web_candidates(limit=limit, stale_minutes=stale)
+        checked = 0
+        updated = 0
+        for row in rows:
+            if self.stop_event.is_set():
+                break
+            mmsi = str(row.get("mmsi"))
+            found = services_feed.shipfinder_position(mmsi)
+            checked += 1
+            if not found:
+                continue
+            moment = found.get("at") or datetime.now()
+            try:
+                self.store.save_source_position(
+                    mmsi, "shipfinder", found.get("lat"), found.get("lon"),
+                    found.get("sog"), found.get("cog"), moment)
+            except Exception:
+                pass
+            if self._accept_position(mmsi, found.get("lat"), found.get("lon"),
+                                     found.get("sog"), found.get("cog"),
+                                     moment, "shipfinder"):
+                updated += 1
+            for field, value in (("destination", found.get("destination")),
+                                 ("draft", found.get("draft")),
+                                 ("eta_declared", found.get("eta"))):
+                if value:
+                    try:
+                        self.store.save_field(mmsi, field, value, moment, "shipfinder")
+                    except Exception:
+                        pass
+            self.stop_event.wait(0.8)
+        if checked:
+            stamp = datetime.now().strftime("%H:%M")
+            self._set_service_status("sfp", f"обновлено {updated} из {checked} · {stamp}")
+            if updated:
+                self.log(f"ShipFinder: свежие координаты у {updated} из {checked} судов.")
+        return {"checked": checked, "updated": updated}
+
+    def _live_web_worker(self):
+        """Каждые N минут уточняет позиции наших судов на публичной карте."""
+        try:
+            minutes = float(self.config.get("sfp_minutes") or 5)
+        except (TypeError, ValueError):
+            minutes = 5
+        if self.stop_event.wait(75):
+            return
+        while not self.stop_event.is_set():
+            try:
+                if self.config.get("use_sfp", True):
+                    self.refresh_live_positions()
+            except Exception as error:
+                self.log(f"ShipFinder: {error}")
+            if self.stop_event.wait(max(120.0, minutes * 60.0)):
+                break
 
     def bulk_refresh(self, batch=150, workers=6) -> dict:
         """Обновляет позиции очередной пачки судов — по кругу, без пропусков.

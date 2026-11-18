@@ -461,11 +461,14 @@ def report(vessel, track_rows, visits=None, stay=None, voyage=None,
             sog = vessel.get("sog")
             hours = travel_hours(voyage["distance_km"], sog)
             if hours is not None and hours > 0:
+                # ETA может быть не рассчитана: без неё строка всё равно полезна
+                eta_note = (f"ETA {voyage['eta']:%d.%m %H:%M}. "
+                            if voyage.get("eta") else "")
                 lines.append(
                     f"До {port_label}: {fmt(voyage['distance_km'])} км "
                     f"({fmt(nm(voyage['distance_km']))} мор. миль) по прямой при "
                     f"{fmt(sog)} уз → T = D/V = {analysis.span_text(hours)}; "
-                    f"ETA {voyage['eta']:%d.%m %H:%M}. Задержки, течение и изменение "
+                    f"{eta_note}Задержки, течение и изменение "
                     f"скорости не учтены.")
             else:
                 lines.append(f"До {port_label}: {fmt(voyage['distance_km'])} км, но "

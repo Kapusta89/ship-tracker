@@ -85,6 +85,7 @@ SERVICE_TITLES = {
     "gor": "Goradar (карта судов)",
     "mlive": "MarineTraffic.live (карта судов)",
     "srd": "Ship Radar 24 (карточки судов)",
+    "sfp": "ShipFinder (координаты в моменте)",
 }
 
 DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
@@ -114,6 +115,83 @@ MAP_HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+
+# ShipFinder — публичная карта без ключа. В карточке судна есть строка
+# «The current position ... is in 45-03.867 N, 29-49.928 E reported at ...»,
+# а также курс, скорость, осадка, назначение, ETA и статус. Часы сайта уходят
+# вперёд, поэтому время в будущем заменяется текущим: координата остаётся
+# последней известной, но не блокирует свежие данные.
+SHIPFINDER_URL = "https://www.shipfinder.com/ship/detail/mmsi/{mmsi}"
+_SF_POSITION = re.compile(
+    r'is in\s*(?:<[^>]+>\s*)*(\d{1,3})-(\d{1,2}\.\d+)\s*([NS])\s*,\s*'
+    r'(\d{1,3})-(\d{1,2}\.\d+)\s*([EW])')
+_SF_REPORTED = re.compile(
+    r'reported at\s*(?:<[^>]+>\s*)*(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)')
+
+
+def _sf_value(html, field):
+    found = re.search(r'id="ais-' + field + r'"[^>]*>\s*([^<]+)', html)
+    return found.group(1).strip() if found else None
+
+
+def _sf_number(text):
+    try:
+        return float(re.sub(r"[^0-9.\-]", "", text or ""))
+    except ValueError:
+        return None
+
+
+def _sf_degrees(degrees, minutes, hemi):
+    value = float(degrees) + float(minutes) / 60.0
+    return -value if hemi in ("S", "W") else value
+
+
+def shipfinder_position(mmsi, timeout=15) -> dict | None:
+    """Позиция и рейс судна с публичной карты ShipFinder (без ключа)."""
+    import requests
+
+    mmsi = str(mmsi or "").strip()
+    if not mmsi.isdigit():
+        return None
+    try:
+        response = requests.get(SHIPFINDER_URL.format(mmsi=mmsi),
+                                headers=MAP_HEADERS, timeout=timeout)
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    html = response.text or ""
+    found = _SF_POSITION.search(html)
+    if not found:
+        return None
+    lat = _sf_degrees(found.group(1), found.group(2), found.group(3))
+    lon = _sf_degrees(found.group(4), found.group(5), found.group(6))
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    moment = None
+    stamp = _SF_REPORTED.search(html)
+    if stamp:
+        try:
+            moment = datetime.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            moment = None
+    now = datetime.now()
+    if moment is None or moment > now:
+        moment = now
+    return {
+        "mmsi": mmsi,
+        "lat": round(lat, 6),
+        "lon": round(lon, 6),
+        "sog": _sf_number(_sf_value(html, "_sog")),
+        "cog": _sf_number(_sf_value(html, "course_f")),
+        "draft": _sf_number(_sf_value(html, "_draught")),
+        "destination": _sf_value(html, "dest"),
+        "eta": _sf_value(html, "_eta"),
+        "status": _sf_value(html, "shipStatus"),
+        "at": moment,
+        "source": "shipfinder",
+    }
 
 
 def _grid_boxes(bboxes, step=2.0, max_cells=64):
