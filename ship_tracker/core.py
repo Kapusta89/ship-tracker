@@ -50,6 +50,51 @@ MIN_SOURCE_POLL_SECONDS = 15.0
 # Позиция старше этого возраста не показывается вообще: это уже не обстановка
 MAX_VIEW_AGE_HOURS = 9.0
 
+# Предел правдоподобной скорости судна: быстрее этого — не судно, а ошибка
+# источника (чужая точка, перепутанный MMSI). 60 узлов с большим запасом
+# больше любого судна в нашем районе.
+MAX_SPEED_KNOTS = 60.0
+# Служебные значения AIS: 102.3 узла — «скорость не передана», COG 360 и
+# heading 511 — «курса нет». В карточке они выглядели как «курс -1°».
+NO_SPEED_KNOTS = 102.2
+NO_HEADING = 511
+
+
+def valid_coordinates(lat, lon) -> bool:
+    """Диапазон координат и отсев пустой точки (0, 0)."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return False
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return False
+    if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+        return False
+    return True
+
+
+def clean_motion(sog=None, cog=None, heading=None):
+    """Убирает служебные значения AIS, оставляя None вместо «не передано»."""
+    def number(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    speed = number(sog)
+    if speed is not None and (speed < 0 or speed >= NO_SPEED_KNOTS):
+        speed = None
+    course = number(cog)
+    if course is not None and not (0.0 <= course < 360.0):
+        course = None
+    direction = number(heading)
+    if direction is not None and (direction == NO_HEADING
+                                  or not (0.0 <= direction < 360.0)):
+        direction = None
+    return speed, course, direction
+
 
 class AppError(Exception):
     """Ошибка, которую можно показать пользователю как есть."""
@@ -2019,17 +2064,95 @@ class RadarCore:
             if self.stop_event.wait(120):
                 break
 
-    def _accept_position(self, mmsi, lat, lon, sog=None, cog=None, moment=None) -> bool:
-        """Пишет найденную в источнике позицию, если она новее сохранённой."""
+    def _accept_position(self, mmsi, lat, lon, sog=None, cog=None, moment=None,
+                         source=None) -> bool:
+        """Пишет позицию источника, если она новее и правдоподобна."""
         if lat is None or lon is None or moment is None:
             return False
+        if not valid_coordinates(lat, lon):
+            self._reject_position(mmsi, lat, lon, source, "координаты вне диапазона")
+            return False
+        sog, cog, _heading = clean_motion(sog, cog)
         vessel = self.store.vessel(mmsi) or {}
         stored = parse_iso(vessel.get("position_at"))
         if stored is not None and moment <= stored:
             return False
+        if not self._position_allowed(mmsi, lat, lon, moment, source):
+            return False
         self.store.upsert_position(mmsi, lat, lon, sog=sog, cog=cog, when=moment)
         self.store.add_position(mmsi, lat, lon, sog, cog, moment)
         return True
+
+    def _position_allowed(self, mmsi, lat, lon, moment, source=None) -> bool:
+        """Диапазон координат и предел скорости перехода между точками.
+
+        Ошибка источника (чужая точка, перепутанный MMSI) уводит судно на
+        десятки километров за секунду. Такая точка не должна попадать на
+        радар; исключение — если её подтверждает другой источник рядом по
+        времени: значит, судно действительно там (например, сменило район).
+        """
+        if not valid_coordinates(lat, lon):
+            self._reject_position(mmsi, lat, lon, source, "координаты вне диапазона")
+            return False
+        vessel = self.store.vessel(mmsi) or {}
+        stored = parse_iso(vessel.get("position_at"))
+        if stored is None or vessel.get("lat") is None or vessel.get("lon") is None:
+            return True
+        try:
+            elapsed = max(0.0, (moment - stored).total_seconds())
+            km = geo.haversine_km(float(vessel["lat"]), float(vessel["lon"]),
+                                  float(lat), float(lon))
+        except (TypeError, ValueError):
+            return True
+        allowed = max(2.0, MAX_SPEED_KNOTS * 1.852 * (elapsed / 3600.0) + 1.0)
+        if km <= allowed:
+            return True
+        if self._confirmed_elsewhere(mmsi, lat, lon, moment, source):
+            self.log(f"Точка {mmsi}: переход {km:.0f} км за {elapsed:.0f} с "
+                     f"подтверждён другим источником.")
+            return True
+        self._reject_position(mmsi, lat, lon, source,
+                              f"скачок {km:.0f} км за {elapsed:.0f} с")
+        return False
+
+    def _confirmed_elsewhere(self, mmsi, lat, lon, moment, source=None,
+                             km=5.0, minutes=15.0) -> bool:
+        """Есть ли рядом по времени и месту точка другого источника."""
+        try:
+            rows = self.store.source_positions(mmsi)
+        except Exception:
+            return False
+        for row in rows:
+            if source and row.get("source") == source:
+                continue
+            try:
+                other = parse_iso(row.get("ts"))
+                other_lat = float(row["lat"])
+                other_lon = float(row["lon"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if other is None or abs((other - moment).total_seconds()) > minutes * 60:
+                continue
+            try:
+                if geo.haversine_km(float(lat), float(lon), other_lat, other_lon) <= km:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    def _reject_position(self, mmsi, lat, lon, source, reason):
+        """Пишет отброшенную точку в журнал, но не чаще раза в 10 минут."""
+        now = time.monotonic()
+        cache = getattr(self, "_position_rejects", None)
+        if cache is None:
+            cache = self._position_rejects = {}
+        if now - cache.get(mmsi, 0.0) < 600:
+            return
+        if len(cache) > 20000:
+            cache.clear()
+        cache[mmsi] = now
+        name = (self.store.vessel(mmsi) or {}).get("name") or mmsi
+        self.log(f"Точка {name} ({source or 'источник'}) отброшена: {reason}.")
 
     def refresh_vessel(self, mmsi) -> dict | None:
         """Срочно обновляет одно судно по прямому запросу к Open Waters.
@@ -2051,11 +2174,12 @@ class RadarCore:
                           if parsed.tzinfo else parsed)
             except ValueError:
                 moment = parse_iso(seen)
+        sog, cog, _heading = clean_motion(data.get("sog"), data.get("cog"))
         self.store.save_source_position(
             str(mmsi), "openwaters", data.get("lat"), data.get("lon"),
-            data.get("sog"), data.get("cog"), moment)
+            sog, cog, moment)
         fresh = self._accept_position(str(mmsi), data.get("lat"), data.get("lon"),
-                                      data.get("sog"), data.get("cog"), moment)
+                                      sog, cog, moment, "openwaters")
         # паспорт из прямого запроса идёт теми же полями, что и от других
         # источников: свежесть решается по каждому полю отдельно
         for field, value in (("name", data.get("name")),
@@ -2293,7 +2417,8 @@ class RadarCore:
             moment = last.get("at")
             if moment is not None and (stored is None or moment > stored):
                 if self._accept_position(mmsi, last.get("lat"), last.get("lon"),
-                                         last.get("sog"), None, moment):
+                                         last.get("sog"), None, moment,
+                                         "openwaters"):
                     self.log(f"AIS-поиск: {name} найден заново в треке Open Waters.")
                     return "Open Waters"
         key = str(self.config.get("vesselapi_key") or "").strip()
@@ -2305,7 +2430,7 @@ class RadarCore:
                 found = None
             if found and self._accept_position(mmsi, found.get("lat"), found.get("lon"),
                                                found.get("sog"), found.get("cog"),
-                                               found.get("at")):
+                                               found.get("at"), "vesselapi"):
                 self.store.upsert_static(mmsi, draft=found.get("draft"),
                                          destination=found.get("destination"),
                                          eta_declared=found.get("eta"))
@@ -2657,18 +2782,23 @@ class RadarCore:
         if not vessel or vessel.get("tracked") != 1:
             self.store.set_tracked(mmsi, True)
         moment = event.get("at") or datetime.now()
+        source = event.get("source") or "aisstream"
+        # служебные значения AIS (102.3 узла, COG -1, heading 511) — это
+        # «не передано», а не данные: в карточке они выглядели как курс -1°
+        sog, cog, heading = clean_motion(event.get("sog"), event.get("cog"),
+                                         event.get("heading"))
+        event["sog"], event["cog"], event["heading"] = sog, cog, heading
         stored_at = parse_iso((vessel or {}).get("position_at"))
-        if stored_at is None or moment >= stored_at:
+        allowed = self._position_allowed(mmsi, lat, lon, moment, source)
+        if allowed and (stored_at is None or moment >= stored_at):
             # источник, который отвечает медленнее, не должен сдвигать судно
             # назад: точку пишем, только если она не старше уже известной
             self.store.upsert_position(
-                mmsi, lat, lon, event.get("sog"), event.get("cog"),
-                event.get("heading"), port_name, moment)
+                mmsi, lat, lon, sog, cog, heading, port_name, moment)
         # позиция каждого источника пишется отдельно: так видно, совпадают
         # ли AISStream, снимок и прямой запрос, а не «одна точка на всех»
         self.store.save_source_position(
-            mmsi, event.get("source") or "aisstream", lat, lon,
-            event.get("sog"), event.get("cog"), event.get("at"))
+            mmsi, source, lat, lon, sog, cog, event.get("at"))
         self._log_source_conflict(mmsi, lat, lon)
 
         if event.get("name"):
@@ -2679,6 +2809,12 @@ class RadarCore:
         # в базе есть, но в списках не считается «идущим в наш порт»
         if event.get("destination") and not (vessel or {}).get("destination"):
             self.store.upsert_static(mmsi, destination=event["destination"])
+
+        if not allowed:
+            # точка-скачок не идёт ни в трек, ни в геозоны: иначе судно
+            # «входило» в порт и выходило из него за одну секунду
+            self.stats["skipped"] = self.stats.get("skipped", 0) + 1
+            return
 
         last_stored = self._last_stored.get(mmsi)
         interval = float(self.config.get("position_interval_seconds") or 15)

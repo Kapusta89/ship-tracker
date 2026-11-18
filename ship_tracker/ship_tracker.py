@@ -39,7 +39,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.52"
+APP_VERSION = "2026.12.53"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2373,7 +2373,8 @@ class App:
         links.columnconfigure(1, weight=1)
 
         # 1. AISStream — основной поток
-        ttk.Label(links, text="AISStream", font=("Segoe UI", 9, "bold")).grid(
+        ttk.Label(links, text="AISStream — районный поток",
+                  font=("Segoe UI", 9, "bold")).grid(
             row=0, column=0, sticky="w", padx=(8, 6), pady=(6, 2))
         self.feed_status["ais"] = tk.StringVar(value="не запущен")
         ttk.Label(links, textvariable=self.feed_status["ais"], foreground="#555"
@@ -2392,7 +2393,7 @@ class App:
                         variable=self.var_use_area).pack(side="left", padx=(12, 0))
 
         # 2. Open Waters — второй живой поток
-        ttk.Checkbutton(links, text="Open Waters AIS — второй живой поток (совместим с AISStream)",
+        ttk.Checkbutton(links, text="Open Waters AIS — второй живой поток (openwaters.io)",
                         variable=self.var_use_ow).grid(row=2, column=0, columnspan=2,
                                                        sticky="w", padx=4, pady=(10, 0))
         self.feed_status["ow"] = tk.StringVar(value="не запущен")
@@ -2411,7 +2412,7 @@ class App:
 
 
         # 3. Снимок района — последние известные позиции всех судов вокруг портов
-        ttk.Checkbutton(links, text="Снимок района — все известные суда вокруг наших портов",
+        ttk.Checkbutton(links, text="Open Waters — снимок района (все суда вокруг портов)",
                         variable=self.var_use_snapshot).grid(row=5, column=0, columnspan=3,
                                                              sticky="w", padx=4, pady=(10, 0))
         self.feed_status["snap"] = tk.StringVar(value="не запущен")
@@ -2426,7 +2427,7 @@ class App:
 
         # 4. Отдельные соединения AISStream по MMSI — раньше были видны только
         # припиской в строке AISStream, теперь отдельным подключением
-        ttk.Label(links, text="AISStream: слежение по MMSI",
+        ttk.Label(links, text="AISStream — слежение по MMSI",
                   font=("Segoe UI", 9, "bold")).grid(row=8, column=0, sticky="w",
                                                      padx=(8, 6), pady=(8, 2))
         self.feed_status["mmsi"] = tk.StringVar(value="ждёт запуска")
@@ -2438,7 +2439,7 @@ class App:
                                           padx=30, pady=(0, 4))
 
         # 5. Open Waters: фоновое обновление координат всех судов базы
-        ttk.Label(links, text="Open Waters: координаты всех судов",
+        ttk.Label(links, text="Open Waters — координаты всех судов базы",
                   font=("Segoe UI", 9, "bold")).grid(row=10, column=0, sticky="w",
                                                      padx=(8, 6), pady=(8, 2))
         self.feed_status["bulk"] = tk.StringVar(value="ждёт запуска")
@@ -2494,7 +2495,58 @@ class App:
                 row += 3
                 drawn.add(key)
 
-        # 7. Проверка всех источников сразу и внеочередное обновление данных
+        # 7. Фотографии судов: каждый источник отдельной строкой со своим статусом
+        ttk.Separator(links, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(14, 0))
+        ttk.Label(links, text="Фотографии судов",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=row + 1, column=0, columnspan=2, sticky="w", padx=(8, 6), pady=(8, 2))
+        ttk.Button(links, text="Проверить фото-источники",
+                   command=self.check_photo_sources).grid(
+            row=row + 1, column=2, sticky="e", padx=8, pady=(8, 2))
+        ttk.Label(links, text="ищутся по очереди: снимок берётся у первого ответившего",
+                  foreground="#777").grid(row=row + 2, column=0, columnspan=3,
+                                          sticky="w", padx=8, pady=(0, 4))
+        row += 3
+        self.photo_status = {}
+        for key, title, site in photos.PROVIDERS:
+            var = tk.StringVar(value="не проверялся")
+            self.photo_status[key] = var
+            ttk.Label(links, text=title, font=("Segoe UI", 9)).grid(
+                row=row, column=0, sticky="w", padx=(16, 6), pady=(2, 0))
+            ttk.Label(links, textvariable=var, foreground="#555").grid(
+                row=row, column=1, sticky="w", pady=(2, 0))
+            ttk.Button(links, text="Открыть сайт",
+                       command=lambda u=site: webbrowser.open(u)).grid(
+                row=row, column=2, sticky="e", padx=8, pady=(2, 0))
+            row += 1
+
+        # 8. Служебные сервисы, которыми программа тоже пользуется
+        ttk.Separator(links, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(14, 0))
+        ttk.Label(links, text="Служебные сервисы",
+                  font=("Segoe UI", 9, "bold")).grid(
+            row=row + 1, column=0, columnspan=3, sticky="w", padx=(8, 6), pady=(8, 2))
+        row += 2
+        ttk.Label(links, text="OpenStreetMap Overpass API — причалы, краны и верфи",
+                  font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
+                                             sticky="w", padx=(16, 6), pady=(2, 0))
+        ttk.Button(links, text="Открыть сайт",
+                   command=lambda: webbrowser.open("https://overpass-api.de/")).grid(
+            row=row, column=2, sticky="e", padx=8, pady=(2, 0))
+        row += 1
+        telegram_state = ("настроен" if self.config.get("telegram_token")
+                          and self.config.get("telegram_chat_id") else "не настроен")
+        ttk.Label(links,
+                  text=f"Telegram Bot API — уведомления и команды ({telegram_state})",
+                  font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
+                                             sticky="w", padx=(16, 6), pady=(2, 0))
+        ttk.Button(links, text="Открыть сайт",
+                   command=lambda: webbrowser.open("https://core.telegram.org/bots/api")
+                   ).grid(row=row, column=2, sticky="e", padx=8, pady=(2, 0))
+        row += 1
+
+        # 9. Проверка всех источников сразу и внеочередное обновление данных
         ttk.Separator(links, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="ew", padx=8, pady=(14, 0))
         ttk.Label(links, text="Проверка и обновление всех подключений",
@@ -2557,8 +2609,12 @@ class App:
             "дают доступ только по договору — ключ выдаёт менеджер, поэтому галочки у них нет.\n\n"
             "• AISStream — основной живой поток (нужен бесплатный ключ, см. шаги ниже).\n"
             "• Open Waters AIS — второй живой поток, тот же протокол; токен бесплатный на openwaters.io.\n"
-            "• Снимок района — раз в N минут забирает последние известные позиции всех судов "
-            "вокруг ваших портов, поэтому карта не пустует после запуска и при обрывах связи.\n\n"
+            "• Open Waters — снимок района: раз в N минут забирает последние известные "
+            "позиции всех судов "
+            "вокруг ваших портов, поэтому карта не пустует после запуска и при обрывах связи.\n"
+            "• Фотографии судов — VesselFinder, MyShipTracking, MarineTraffic, ShipSpotting, "
+            "FleetMon и Wikimedia Commons: у каждого свой статус, снимок берётся у первого "
+            "ответившего.\n\n"
             "Как получить ключ AISStream (бесплатно):\n"
             "1. Откройте aisstream.io и войдите через GitHub.\n"
             "2. Нажмите Create API key и скопируйте ключ.\n"
@@ -3140,21 +3196,22 @@ class App:
         self._photo_for = mmsi
         vessel = self.store.vessel(mmsi) or {}
         self.clear_photo("фото: загружаю...")
-        threading.Thread(target=self._photo_worker, args=(mmsi, vessel.get("imo")),
+        threading.Thread(target=self._photo_worker,
+                         args=(mmsi, vessel.get("imo"), vessel.get("name")),
                          daemon=True, name=f"photo-{mmsi}").start()
 
-    def _photo_worker(self, mmsi, imo):
+    def _photo_worker(self, mmsi, imo, name=None):
         try:
-            path = photos.fetch(mmsi, imo, PHOTO_DIR)
+            path, source = photos.fetch_with_source(mmsi, imo, PHOTO_DIR, name=name)
         except Exception:
-            path = None
-        self.events.put(("photo", (mmsi, path)))
+            path, source = None, None
+        self.events.put(("photo", (mmsi, path, source)))
 
-    def show_photo(self, mmsi, path):
+    def show_photo(self, mmsi, path, source=None):
         if mmsi != self.selected:
             return
         if not path:
-            self.clear_photo("фото: у VesselFinder нет снимка этого судна")
+            self.clear_photo("фото: нет ни в одном из фото-источников")
             return
         try:
             from PIL import Image, ImageTk
@@ -3172,7 +3229,46 @@ class App:
         # У метки с картинкой width/height задаются в пикселях, а не в знаках.
         self.photo_label.configure(image=self._photo_image, text="",
                                    width=width, height=height)
-        self.photo_note.configure(text="фото: VesselFinder")
+        self.photo_note.configure(text=f"фото: {source or 'источник'}")
+
+    def photo_status_text(self, key) -> str:
+        return getattr(self, "_photo_checked", {}).get(key, "не проверялся")
+
+    def check_photo_sources(self):
+        """Проверяет каждый фото-источник отдельно, не блокируя окно."""
+        if getattr(self, "_photo_busy", False):
+            self.log("Проверка фото-источников уже идёт — подождите.")
+            return
+        self._photo_busy = True
+        for var in getattr(self, "photo_status", {}).values():
+            var.set("проверяю…")
+        threading.Thread(target=self._check_photo_worker, daemon=True).start()
+
+    def _check_photo_worker(self):
+        try:
+            results = photos.check_sources()
+        except Exception as error:
+            results = [{"key": key, "title": title, "ok": False,
+                        "detail": str(error)[:60]}
+                       for key, title, _ in photos.PROVIDERS]
+        finally:
+            self._photo_busy = False
+        checked = getattr(self, "_photo_checked", None)
+        if checked is None:
+            checked = self._photo_checked = {}
+        for item in results:
+            key = item.get("key")
+            state = "отвечает" if item.get("ok") else "не отвечает"
+            detail = item.get("detail") or ""
+            text = state + (f" — {detail}" if detail and not item.get("ok") else "")
+            checked[key] = text
+            var = getattr(self, "photo_status", {}).get(key)
+            if var is not None:
+                try:
+                    self.root.after(0, lambda v=var, t=text: v.set(t))
+                except Exception:
+                    pass
+            self.log(f"Фото {item.get('title') or key}: {text}.")
 
     def clear_photo(self, note=""):
         self._photo_image = None
