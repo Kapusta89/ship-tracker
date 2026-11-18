@@ -40,7 +40,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.53"
+APP_VERSION = "2026.12.54"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -89,7 +89,7 @@ SERVICE_BLOCKS = [
     ("AIS-catcher: ожидаемые прибытия", "aci",
      "бесплатно, без ключа: суда, идущие в наши порты"),
     ("Global Fishing Watch", "gfw",
-     "бесплатный токен: профиль судна и разрывы AIS"),
+     "бесплатный токен: профиль, разрывы AIS и порты заходов"),
     ("Datalastic", "dat",
      "API по ключу: позиция и рейс по MMSI, 1 кредит за судно"),
     ("AISHub", "aishub",
@@ -3429,6 +3429,51 @@ class App:
             return []
         return ["", f"── {title} " + "─" * max(2, 34 - len(title))] + body
 
+    def destination_lines(self, vessel):
+        """Что известно о конечном пункте: заявка, история заходов и расчёт."""
+        try:
+            info = self.core.destination_analysis(vessel)
+        except Exception as error:
+            return [f"анализ недоступен: {error}"]
+        rows = [f"Заявлено судном: {info.get('declared') or '—'}"]
+        port = info.get("declared_port") or {}
+        if port:
+            rows.append(f"  это наш порт: {port.get('label') or port.get('name')}")
+        elif info.get("guess"):
+            target = info["guess"]
+            name = target["port"].get("label") or target["port"].get("name")
+            rows.append(f"По курсу и скорости похоже на {name}: "
+                        f"{fmt_number(target.get('km'))} км, отклонение "
+                        f"{fmt_number(target.get('offset'))}°")
+        if info.get("next_port"):
+            rows.append(f"Следующий порт (GFW): {info['next_port']}")
+        visits = info.get("visits") or []
+        source = info.get("history_source") or "GFW"
+        if visits:
+            rows.append(f"Заходы по данным {source} (конечный порт захода):")
+            for visit in visits[:6]:
+                start = str(visit.get("start") or "")[:10]
+                end = str(visit.get("end") or "")[:10]
+                span = ""
+                if visit.get("hours"):
+                    try:
+                        span = f", {span_text(float(visit['hours']))}"
+                    except (TypeError, ValueError):
+                        span = ""
+                rows.append(f"  • {visit.get('port')}: {start} → {end}{span}")
+            usual = info.get("usual")
+            if usual:
+                rows.append(f"Чаще всего ходит в {usual[0]} — {usual[1]} из "
+                            f"{len(visits)} учтённых заходов")
+        else:
+            rows.append("Истории заходов пока нет: GFW обновляется раз в час, "
+                        "MarineTraffic.live — раз в два часа")
+        if info.get("error"):
+            rows.append(f"GFW: {info['error']}")
+        if info.get("checked"):
+            rows.append(f"GFW проверен: {str(info['checked']).replace('T', ' ')[:16]}")
+        return rows
+
     def detail_report(self, mmsi):
         if not mmsi:
             return ("Кликните по судну на радаре или дважды щёлкните строку\n"
@@ -3710,9 +3755,11 @@ class App:
         maps = [f"  • {title}: {url}"
                 for title, url in portcalls.tracking_links(mmsi, vessel.get("name"))]
 
+        destination_rows = self.destination_lines(vessel)
         result = (head
                   + self.card_section("ГДЕ СЕЙЧАС", where)
                   + self.card_section("РЕЙС", voyage)
+                  + self.card_section("НАЗНАЧЕНИЕ И ЗАХОДЫ", destination_rows)
                   + self.card_section("ПОРТ И СТОЯНКА", berth_rows)
                   + self.card_section("СУДНО", ship)
                   + self.card_section("ПУТЬ И ПРИЗНАКИ", path_rows)

@@ -23,7 +23,7 @@ import base64
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -36,6 +36,9 @@ GFW_SEARCH_URL = "https://gateway.api.globalfishingwatch.org/v3/vessels/search"
 GFW_EVENTS_URL = "https://gateway.api.globalfishingwatch.org/v3/events"
 GFW_IDENTITY_DATASET = "public-global-vessel-identity:latest"
 GFW_GAPS_DATASET = "public-global-gaps-events:latest"
+# Порт-заходы: в каждом событии есть якорная стоянка и её topDestination —
+# порт, который GFW считает конечным для этого захода.
+GFW_PORT_VISITS_DATASET = "public-global-port-visits-events:latest"
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -403,6 +406,64 @@ def gfw_gap_text(entry) -> str:
     if where:
         parts.append(f"в точке {where}")
     return " ".join(parts)
+
+
+def gfw_port_visits(token, vessel_id, days=365, limit=10, timeout=45) -> dict:
+    """Порт-заходы судна из GFW: где был, сколько стоял и куда шёл.
+
+    В событии port_visit GFW указывает якорную стоянку, её topDestination —
+    порт, который система считает конечным для этого захода, — и уверенность.
+    Собираем последние заходы: карточка показывает не только заявленный
+    Destination, но и фактическую историю, по которой видно, куда судно
+    обычно приходит.
+    """
+    import requests
+
+    token = clean_gfw_token(token)
+    vessel_id = str(vessel_id or "").strip()
+    if not token or not vessel_id:
+        return {}
+    today = datetime.now().date()
+    start = (today - timedelta(days=max(7, int(days or 365)))).isoformat()
+    response = requests.get(
+        GFW_EVENTS_URL,
+        params={"datasets[0]": GFW_PORT_VISITS_DATASET,
+                "vessels[0]": vessel_id, "start-date": start,
+                "end-date": today.isoformat(), "limit": limit, "offset": 0},
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/json"},
+        timeout=timeout)
+    if response.status_code in (401, 403):
+        raise RuntimeError("токен GFW не принят")
+    response.raise_for_status()
+    entries = (response.json() or {}).get("entries") or []
+    visits = []
+    next_port = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        visit = entry.get("port_visit") or {}
+        port = None
+        for key in ("endAnchorage", "intermediateAnchorage", "startAnchorage"):
+            anchorage = visit.get(key) or {}
+            port = (_clean(anchorage.get("topDestination"))
+                    or _clean(anchorage.get("name")))
+            if port:
+                break
+        if not port:
+            continue
+        visits.append({
+            "port": port,
+            "start": str(entry.get("start") or "")[:19].replace("T", " "),
+            "end": str(entry.get("end") or "")[:19].replace("T", " "),
+            "hours": visit.get("durationHrs"),
+            "confidence": visit.get("confidence"),
+        })
+        vessel = entry.get("vessel") or {}
+        next_port = next_port or _clean(vessel.get("nextPort"))
+    visits.sort(key=lambda item: item.get("start") or "", reverse=True)
+    return {"visits": visits, "next_port": next_port,
+            "checked": datetime.now().isoformat(timespec="seconds")}
 
 
 # --------------------------------------------------------------- реестры

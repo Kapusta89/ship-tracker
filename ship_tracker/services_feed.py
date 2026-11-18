@@ -194,6 +194,63 @@ def shipfinder_position(mmsi, timeout=15) -> dict | None:
     }
 
 
+# История порт-заходов с MarineTraffic.live: у судна видно, в какие порты
+# оно реально заходило, когда пришло и ушло. Бесплатно, без ключа; сайт
+# иногда отвечает 403/таймаутом, поэтому запрос повторяется и кэшируется.
+SHIPRADAR_PORTCALLS_URL = "https://marinetraffic.live/bridge/vessels/portcalls"
+SHIPRADAR_PORTCALLS_PATH = Path(__file__).resolve().parent / "data" / "portcalls.json"
+
+
+def shipradar_portcalls(mmsi, days=180, timeout=25, retries=2) -> dict | None:
+    """Последние заходы судна: порт, страна, приход, уход, длительность."""
+    import requests
+
+    mmsi = str(mmsi or "").strip()
+    if not mmsi.isdigit():
+        return None
+    headers = dict(MAP_HEADERS)
+    headers["Referer"] = "https://marinetraffic.live/"
+    headers["Accept"] = "application/json, text/plain, */*"
+    data = None
+    for attempt in range(max(1, int(retries) + 1)):
+        try:
+            response = requests.get(SHIPRADAR_PORTCALLS_URL,
+                                    params={"mmsi": mmsi, "days": int(days)},
+                                    headers=headers, timeout=timeout)
+        except requests.RequestException:
+            response = None
+        if response is not None and response.status_code == 200:
+            try:
+                payload = response.json() or {}
+            except ValueError:
+                payload = {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                break
+            data = None
+        if attempt < retries:
+            time.sleep(2.0)
+    if not isinstance(data, dict):
+        return None
+    visits = []
+    for row in data.get("ports") or []:
+        if not isinstance(row, dict):
+            continue
+        name = ais_feed.clean_text(row.get("port_name"))
+        if not name:
+            continue
+        visits.append({
+            "port": name,
+            "country": ais_feed.clean_text(row.get("country_name")),
+            "start": str(row.get("arrival") or "")[:19].replace("T", " "),
+            "end": str(row.get("departure") or "")[:19].replace("T", " "),
+            "hours": row.get("duration_h"),
+        })
+    visits.sort(key=lambda item: item.get("start") or "", reverse=True)
+    return {"visits": visits[:10],
+            "checked": datetime.now().isoformat(timespec="seconds")}
+
+
 def _grid_boxes(bboxes, step=2.0, max_cells=64):
     """Район подписки → сетка клеток: публичные карты отдают порцию судов на запрос."""
     cells = []
@@ -1104,6 +1161,13 @@ class GfwFeed(ServiceFeed):
                 record = dict(known.get(mmsi) or {})
                 record.update(profile)
                 record["gap"] = self.last_gap(profile["id"])
+                try:
+                    record["port_visits"] = portcalls.gfw_port_visits(
+                        self.api_key, profile["id"], days=365)
+                except Exception as error:
+                    # история заходов — дополнение: без неё профиль и разрывы
+                    # всё равно сохраняются
+                    record["port_visits_error"] = str(error)[:80]
                 record["checked"] = datetime.now().isoformat(timespec="seconds")
                 known[mmsi] = record
                 found += 1
@@ -1127,7 +1191,10 @@ class GfwFeed(ServiceFeed):
         portcalls.save_gfw(cache, self.cache_path)
         if found == 0 and errors:
             raise RuntimeError("профили не получены (проверьте токен GFW)")
-        self.ok(found, f"с разрывами AIS {gaps}")
+        visited = sum(
+            1 for record in known.values()
+            if ((record or {}).get("port_visits") or {}).get("visits"))
+        self.ok(found, f"с разрывами AIS {gaps}, с заходами {visited}")
 
 
 class MarineTrafficFeed(ServiceFeed):

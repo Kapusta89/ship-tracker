@@ -34,6 +34,7 @@ output.txt
 # Кэши внешних источников (обновляются на каждом компьютере)
 **/data/expected.json
 **/data/gfw.json
+**/data/portcalls.json
 
 # Кэш проверки источников без ключа и журнал отправленных уведомлений
 **/data/sources.json

@@ -976,6 +976,10 @@ class RadarCore:
         if config.get("use_sfp", True):
             threading.Thread(target=self._live_web_worker, daemon=True,
                              name="live-web").start()
+        if config.get("use_srd", True):
+            # история заходов: второй ресурс для конечного назначения
+            threading.Thread(target=self._portcalls_worker, daemon=True,
+                             name="portcalls-history").start()
         # Все каналы стартуют здесь же, каждый в своём потоке: ни один не ждёт
         # ответа другого, поэтому подключения работают одновременно.
         live = [feed for feed in self.feeds if not getattr(feed, "service", False)]
@@ -2417,6 +2421,100 @@ class RadarCore:
             if self.stop_event.wait(max(120.0, minutes * 60.0)):
                 break
 
+    # ------------------------------------------- история порт-заходов (кэш)
+    def _load_portcalls(self) -> dict:
+        try:
+            data = json.loads(services_feed.SHIPRADAR_PORTCALLS_PATH
+                              .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_portcalls(self, data) -> None:
+        path = services_feed.SHIPRADAR_PORTCALLS_PATH
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
+
+    def portcalls_history(self, mmsi) -> dict:
+        """Заходы судна из кэша MarineTraffic.live (обновляет фоновый поток)."""
+        return self._load_portcalls().get(str(mmsi or "")) or {}
+
+    def portcall_candidates(self, limit=25) -> list:
+        """Наши и закреплённые суда: для них важна история конечных портов."""
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 25
+        pinned = set(str(item) for item in (self.pinned_mmsis or ()))
+
+        def rank(row):
+            mmsi = str(row.get("mmsi") or "")
+            if mmsi in pinned:
+                return 0
+            if self.destination_is_ours(row.get("destination")):
+                return 1
+            if row.get("tracked"):
+                return 2
+            if row.get("port"):
+                return 3
+            return 9
+
+        rows = []
+        for row in self.store.vessels(3000):
+            if not str(row.get("mmsi") or "") or not row.get("name"):
+                continue
+            moment = parse_iso(row.get("position_at"))
+            rows.append((rank(row), -(moment.timestamp() if moment else 0), row))
+        rows.sort(key=lambda item: (item[0], item[1]))
+        return [row for _rank, _moment, row in rows[:limit]]
+
+    def refresh_portcalls(self, limit=25, ttl_hours=24) -> dict:
+        """Догружает историю заходов для наших судов и складывает в кэш."""
+        cache = self._load_portcalls()
+        now = time.time()
+        checked = updated = 0
+        for row in self.portcall_candidates(limit):
+            if self.stop_event.is_set():
+                break
+            mmsi = str(row.get("mmsi"))
+            item = cache.get(mmsi) or {}
+            try:
+                fetched = float(item.get("fetched") or 0)
+            except (TypeError, ValueError):
+                fetched = 0
+            if fetched and now - fetched < ttl_hours * 3600:
+                continue
+            data = services_feed.shipradar_portcalls(mmsi)
+            checked += 1
+            if not data:
+                continue
+            data["fetched"] = now
+            cache[mmsi] = data
+            updated += 1
+            self.stop_event.wait(1.0)
+        if updated:
+            self._save_portcalls(cache)
+            self.log(f"Порты заходов: обновлено {updated} из {checked} судов.")
+        return {"checked": checked, "updated": updated}
+
+    def _portcalls_worker(self):
+        """Раз в два часа обновляет историю заходов наших судов."""
+        if self.stop_event.wait(45):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self.refresh_portcalls()
+            except Exception as error:
+                self.log(f"Порты заходов: {error}")
+            if self.stop_event.wait(2 * 3600):
+                break
+
     def bulk_refresh(self, batch=150, workers=6) -> dict:
         """Обновляет позиции очередной пачки судов — по кругу, без пропусков.
 
@@ -3556,6 +3654,61 @@ class RadarCore:
                             break
                 return port
         return None
+
+    def destination_analysis(self, vessel) -> dict:
+        """Куда судно идёт на самом деле: заявка, история заходов и курс.
+
+        Заявленный Destination не всегда правдив («FOR ORDERS», чужой порт),
+        поэтому он сверяется с историей порт-заходов GFW: там у каждого
+        захода указан конечный порт. Если и истории нет — остаётся расчёт
+        по курсу и скорости (forecast.guess_target).
+        """
+        vessel = vessel or {}
+        mmsi = str(vessel.get("mmsi") or "")
+        ports = self.config.get("ports") or []
+        declared = str(vessel.get("destination") or "").strip()
+        try:
+            declared_port = forecast.target_port(vessel, ports)
+        except Exception:
+            declared_port = None
+        entry = {}
+        try:
+            entry = portcalls.gfw_vessel(None, mmsi) or {}
+        except Exception:
+            entry = {}
+        history = entry.get("port_visits") or {}
+        visits = []
+        for visit in history.get("visits") or []:
+            name = str((visit or {}).get("port") or "").strip()
+            if name:
+                visits.append(dict(visit, port=name))
+        history_source = "GFW"
+        if not visits:
+            cached = self.portcalls_history(mmsi)
+            visits = [dict(item, port=item.get("port"))
+                      for item in (cached.get("visits") or [])
+                      if str((item or {}).get("port") or "").strip()]
+            if visits:
+                history_source = "MarineTraffic.live"
+        counts = {}
+        for visit in visits:
+            counts[visit["port"]] = counts.get(visit["port"], 0) + 1
+        usual = max(counts.items(), key=lambda pair: pair[1]) if counts else None
+        guess = None
+        if declared_port is None:
+            try:
+                guess = forecast.guess_target(vessel, ports)
+            except Exception:
+                guess = None
+            if guess and usual and (guess["port"].get("name") or "").upper() == usual[0].upper():
+                # расчёт по курсу совпал с фактической историей — это сильнее
+                guess = dict(guess, confirmed_by_history=True)
+        return {"declared": declared, "declared_port": declared_port,
+                "usual": usual, "visits": visits, "guess": guess,
+                "next_port": history.get("next_port"),
+                "checked": history.get("checked"),
+                "history_source": history_source,
+                "error": entry.get("port_visits_error") or ""}
 
     def voyage(self, vessel):
         """Сколько судну ещё идти до порта назначения.
