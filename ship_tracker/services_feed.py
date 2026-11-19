@@ -22,6 +22,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+import sys
 from pathlib import Path
 
 import ais_feed
@@ -108,7 +109,9 @@ MARINETRAFFIC_LIVE_URL = "https://marinetraffic.live/bridge/vessels/nearby"
 # Карточка судна на том же сайте (HTML): тип, позывной, размеры, осадка,
 # порт назначения. Позиции берём JSON-мостом, а паспорт — отсюда.
 SHIPRADAR_CARD_URL = "https://marinetraffic.live/vessels/{slug}/{mmsi}/"
-SHIPRADAR_STATE = Path(__file__).resolve().parent / "data" / "shipradar_cards.json"
+BASE_DIR = (Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
+SHIPRADAR_STATE = BASE_DIR / "data" / "shipradar_cards.json"
 MAP_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
@@ -198,7 +201,7 @@ def shipfinder_position(mmsi, timeout=15) -> dict | None:
 # оно реально заходило, когда пришло и ушло. Бесплатно, без ключа; сайт
 # иногда отвечает 403/таймаутом, поэтому запрос повторяется и кэшируется.
 SHIPRADAR_PORTCALLS_URL = "https://marinetraffic.live/bridge/vessels/portcalls"
-SHIPRADAR_PORTCALLS_PATH = Path(__file__).resolve().parent / "data" / "portcalls.json"
+SHIPRADAR_PORTCALLS_PATH = BASE_DIR / "data" / "portcalls.json"
 
 
 def shipradar_portcalls(mmsi, days=180, timeout=25, retries=2) -> dict | None:

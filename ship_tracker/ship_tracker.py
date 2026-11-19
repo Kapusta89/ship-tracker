@@ -34,13 +34,14 @@ import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = (Path(sys.executable).resolve().parent
+           if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.59"
+APP_VERSION = "2026.12.60"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2047,7 +2048,7 @@ class App:
                 draft = "—"
             else:
                 draft = f"{fmt_number(draft_in)} → {fmt_number(draft_out)} м"
-            tree.insert("", "end", tags=(str(visit.get("mmsi")),), values=(
+            tree.insert("", "end", tags=(str(visit.get("mmsi") or ""),), values=(
                 vessel.get("name") or f"MMSI {visit.get('mmsi')}",
                 visit.get("port"),
                 self.fmt_time(visit.get("entered_at")),
@@ -5006,6 +5007,9 @@ class App:
         бот уже запущен — руками или прошлым окном — data/bot.lock у него,
         и новый процесс молча выйдет: второго поллера не будет.
         """
+        if getattr(sys, "frozen", False):
+            self.log("Сборка exe: Telegram-бот запускается отдельно, не из окна.")
+            return
         if not self.config.get("telegram_commands"):
             self.stop_bot_process()
             return

@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 # Спецификация PyInstaller для Ship Tracker.
 
 # Если вашей системы нет PyInstaller, установите его:
@@ -8,12 +9,12 @@ block_cipher = None
 
 a = Analysis(
     ['ship_tracker/ship_tracker.py'],
-    pathex=[],
+    pathex=[os.path.abspath('ship_tracker')],
     binaries=[],
-    datas=[
-        ('ship_tracker/data', 'ship_tracker/data'),  # конфиги и база
-    ],
+    datas=[],  # данные лежат рядом с exe в папке data, а не внутри сборки
     hiddenimports=[
+        'ais_feed', 'analysis', 'cargo', 'core', 'flags', 'forecast', 'geo',
+        'metrics', 'photos', 'places', 'portcalls', 'services_feed', 'store',
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
@@ -44,7 +45,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='Ship Tracker',
+    name='ship_tracker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

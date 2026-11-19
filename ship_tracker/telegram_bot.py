@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -36,7 +37,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = (Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
 CONFIG_PATH = BASE_DIR / "data" / "config.json"
 DB_PATH = BASE_DIR / "data" / "ship_tracker.db"
 PHOTO_DIR = BASE_DIR / "data" / "photos"

@@ -40,3 +40,6 @@ output.txt
 **/data/sources.json
 **/data/aci_seen.json
 **/data/map.png
+
+# готовая сборка приложения (exe + данные)
+ship_tracker.exe/

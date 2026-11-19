@@ -18,6 +18,7 @@ import json
 import math
 import queue
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -37,7 +38,8 @@ import portcalls
 import services_feed
 from store import Store, parse_iso
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = (Path(sys.executable).resolve().parent
+           if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
 DATA_DIR = APP_DIR / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 DB_PATH = DATA_DIR / "ship_tracker.db"
@@ -3114,7 +3116,12 @@ class RadarCore:
                 # связи нет дольше суток: подтвердить стоянку нечем
                 if moment - entered <= limit:
                     continue
-                when = entered
+                try:
+                    if self.store.delete_visit(visit.get("id")):
+                        closed += 1
+                except Exception as error:
+                    self.log(f"Сверка стоянок: {mmsi} — {error}")
+                continue
             if when is None or when < entered:
                 when = entered
             try:

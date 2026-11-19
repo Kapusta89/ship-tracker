@@ -24,9 +24,12 @@ import json
 import re
 import time
 from datetime import datetime, timedelta, timezone
+import sys
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+BASE_DIR = (Path(sys.executable).resolve().parent
+            if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
+DATA_DIR = BASE_DIR / "data"
 EXPECTED_PATH = DATA_DIR / "expected.json"
 GFW_PATH = DATA_DIR / "gfw.json"
 SOURCES_PATH = DATA_DIR / "sources.json"

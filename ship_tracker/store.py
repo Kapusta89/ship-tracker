@@ -261,9 +261,9 @@ class Store:
         self.conn.execute("DELETE FROM vessel_fields WHERE field = 'type_code' "
                           "AND (CAST(value AS INTEGER) < 20 OR CAST(value AS INTEGER) > 99)")
         # Стоянка не может закончиться раньше, чем началась: такие записи —
-        # след запоздавшей точки из трека. Удаляем их, а не показываем.
+        # след запоздавшей точки из трека. Нулевые стоянки — шум геозоны.
         self.conn.execute("DELETE FROM port_visits WHERE left_at IS NOT NULL "
-                          "AND julianday(left_at) < julianday(entered_at)")
+                          "AND julianday(left_at) <= julianday(entered_at)")
         # Один и тот же заход мог записаться дважды из разных процессов.
         self.conn.execute("DELETE FROM port_visits WHERE id NOT IN ("
                           "SELECT MIN(id) FROM port_visits GROUP BY mmsi, port, "
@@ -613,6 +613,12 @@ class Store:
                 "SELECT * FROM port_visits WHERE left_at IS NULL").fetchall()
         return [dict(row) for row in rows]
 
+    def delete_visit(self, visit_id) -> bool:
+        """Удаляет стоянку, которую нечем подтвердить (судна уже нет в базе)."""
+        with self._lock, self.conn:
+            cur = self.conn.execute("DELETE FROM port_visits WHERE id = ?", (int(visit_id),))
+            return cur.rowcount > 0
+
     def close_visit_by_id(self, visit_id, when):
         """Закрывает открытую стоянку временем ухода из трека.
 
@@ -654,8 +660,8 @@ class Store:
         """Добавляет визит, найденный по истории трека, если такого ещё нет."""
         entered = iso(entered_at)
         left = iso(left_at) if left_at else None
-        # уход раньше входа или вход из будущего — не данные, а ошибка времени
-        if left and left < entered:
+        # уход раньше входа, вход из будущего или нулевая стоянка — не данные
+        if left and left <= entered:
             return False
         if entered > iso(datetime.now() + timedelta(minutes=5)):
             return False
