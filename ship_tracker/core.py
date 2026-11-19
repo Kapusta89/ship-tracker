@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import net
 import places
 import requests
 
@@ -37,6 +38,9 @@ import metrics
 import portcalls
 import services_feed
 from store import Store, parse_iso
+
+# Повторы запросов при обрывах DNS/TLS — общий сетевой слой.
+net.install()
 
 APP_DIR = (Path(sys.executable).resolve().parent
            if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
@@ -691,7 +695,7 @@ def telegram_call(token, method, payload=None, params=None, timeout=30):
     if not (token or "").strip():
         raise TelegramError("Не задан токен бота.")
     try:
-        response = requests.post(
+        response = net.post_connect_retry(
             TELEGRAM_API.format(token=token.strip(), method=method),
             json=payload, params=params, timeout=timeout)
     except requests.RequestException as error:

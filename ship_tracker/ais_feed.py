@@ -344,6 +344,10 @@ def describe_error(error) -> tuple:
     if status:
         return f"сервер AISStream ответил HTTP {status}", status
     text = str(error) or error.__class__.__name__
+    if "handshake" in text.lower():
+        # сервер под нагрузкой отвечает на рукопожатие дольше обычного:
+        # это не отказ ключа — соединение просто повторяется
+        return ("сервер медленно отвечает на подключение — повторяю", None)
     return text, None
 
 
@@ -356,7 +360,9 @@ def open_stream(url):
     """
     from websockets.sync.client import connect
 
-    options = dict(compression="deflate", open_timeout=20, max_size=8 * 1024 * 1024)
+    # Рукопожатие AISStream под нагрузкой занимает до 20 секунд, а три
+    # соединения на аккаунт конкурируют друг с другом — ждём с запасом.
+    options = dict(compression="deflate", open_timeout=45, max_size=8 * 1024 * 1024)
     try:
         return connect(url, ping_interval=20, ping_timeout=20, **options)
     except TypeError:
@@ -449,6 +455,10 @@ class AISStreamFeed(threading.Thread):
             return
 
         backoff = 2.0
+        # Три соединения на аккаунт стартуют одновременно, и сервер не всегда
+        # успевает завершить все рукопожатия: разводим старты во времени.
+        if self.stop_event.wait(random.uniform(0.0, 3.0)):
+            return
         while not self.stop_event.is_set():
             opened_at = time.monotonic()
             events_before = self.events

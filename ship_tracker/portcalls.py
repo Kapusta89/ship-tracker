@@ -103,8 +103,13 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None, retries=1) -> dict:
             response.raise_for_status()
             entry["vessels"] = parse_expected_page(response.text)
             if not entry["vessels"] and "expected-table" not in response.text:
-                # вместо страницы порта пришла заглушка (Cloudflare, ошибка сайта)
-                entry["error"] = "страница без таблицы Expected"
+                # Пустая страница — не сбой: сайт сам пишет, что судов с таким
+                # назначением сейчас нет. Ошибкой считаем только чужую заглушку.
+                if ("place-empty" in response.text
+                        or "No recently heard" in response.text):
+                    entry["empty"] = True
+                else:
+                    entry["error"] = "страница без таблицы Expected"
         except Exception as error:                     # сеть, Cloudflare, формат
             status = getattr(getattr(error, "response", None), "status_code", None)
             if status == 404:

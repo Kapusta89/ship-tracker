@@ -41,7 +41,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.60"
+APP_VERSION = "2026.12.61"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -53,6 +53,7 @@ import flags
 import forecast
 import geo
 import metrics
+import net
 import photos
 import portcalls
 import services_feed
@@ -61,6 +62,10 @@ from core import (AppError, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
                   norm, parse_chat_ids, port_matches, save_config, send_telegram, split_list,
                   telegram_call)
 from store import Store, parse_iso
+
+# Все HTTP-запросы повторяются при обрывах DNS и TLS: разовый сбой сети
+# больше не выглядит как отказ сервиса и не даёт ложную «ошибку».
+net.install()
 
 AIRSTREAM_SITE = "https://aisstream.io"
 

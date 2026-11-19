@@ -43,3 +43,6 @@ output.txt
 
 # готовая сборка приложения (exe + данные)
 ship_tracker.exe/
+
+# Промежуточные файлы PyInstaller
+build_exe/

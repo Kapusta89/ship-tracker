@@ -27,7 +27,11 @@ from pathlib import Path
 
 import ais_feed
 import geo
+import net
 import portcalls
+
+# Повторы при обрывах DNS/TLS для всех запросов внешних сервисов.
+net.install()
 
 # VesselAPI — единственный источник без подписки, но с бесплатным тарифом
 # (150 запросов в месяц без карты): отдаёт позицию, ход, курс, осадку,
@@ -534,16 +538,25 @@ class ServiceFeed(threading.Thread):
 
     def fail(self, error):
         text = str(error).strip() or error.__class__.__name__
+        # Сбой сети (DNS, TLS, таймаут) повторы уже отработали: если он
+        # разовый, не пугаем «ошибкой» — следующий цикл обычно проходит.
+        transient = net.is_transient(error)
+        streak = (getattr(self, "_transient_streak", 0) + 1) if transient else 0
+        self._transient_streak = streak
         moment = time.monotonic()
         if (text != self.last_error
                 or moment - getattr(self, "_fail_log_at", 0.0) >= self.fail_log_every):
             self._fail_log_at = moment
             self.log(f"{self.title}: {text}")
         self.last_error = text
-        self.set_status(f"ошибка: {text[:60]}")
+        if transient and streak < 3:
+            self.set_status("переподключение (сбой сети)")
+        else:
+            self.set_status(f"ошибка: {text[:60]}")
 
     def ok(self, count, detail=""):
         self.last_error = ""
+        self._transient_streak = 0
         tail = f", {detail}" if detail else ""
         self.set_status(f"подключен, судов {count}{tail}")
         if count != self.last_count:
@@ -1769,6 +1782,12 @@ class ShipRadarDetailsFeed(ServiceFeed):
             session.headers.update({"User-Agent": MAP_HEADERS["User-Agent"],
                                     "Accept-Language": "ru,en;q=0.8",
                                     "Referer": MARINETRAFFIC_LIVE_HOME})
+            # главная страница ставит cookies сайта: без них карточки судов
+            # иногда отвечают 403 «доступ запрещён»
+            try:
+                session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
+            except Exception as error:
+                self.log(f"{self.title}: главная страница не открылась ({error})")
             self.session = session
         return self.session
 
