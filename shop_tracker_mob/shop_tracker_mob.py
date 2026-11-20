@@ -22,8 +22,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DEFAULT_PORT = 8080
+
+
+def log_line(text: str) -> None:
+    """Пишет строку в shop_tracker_mob.log рядом с exe (как в основных копиях)."""
+    try:
+        with (app_dir() / "shop_tracker_mob.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {text}\n")
+    except OSError:
+        pass
 
 
 def app_dir() -> Path:
@@ -258,7 +267,7 @@ footer { text-align: center; font-size: 12px; color: #5f7690; margin-top: 16px; 
   <div class="count" id="count"></div>
 </header>
 <main id="list"></main>
-<footer>Данные с компьютера по Wi-Fi · обновление каждые 20 с</footer>
+<footer>Данные с компьютера по Wi-Fi · обновление каждые 20 с · v{{VERSION}}</footer>
 <script>
 const list = document.getElementById('list');
 const statusEl = document.getElementById('status');
@@ -386,6 +395,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def log_error(self, fmt, *args):
+        """Ошибки HTTP — в файл: консоль можно закрыть, а причину надо видеть."""
+        try:
+            log_line("HTTP: " + (fmt % args))
+        except Exception:
+            pass
+
     def send_bytes(self, body: bytes, content_type: str, status: int = 200):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -398,7 +414,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/":
-            self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            page = PAGE.replace("{{VERSION}}", APP_VERSION)
+            self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/manifest.webmanifest":
             self.send_bytes(json.dumps(MANIFEST).encode("utf-8"),
@@ -459,6 +476,15 @@ def lan_addresses() -> list[str]:
 
 
 def main() -> int:
+    # тяжёлое падение (сегфолт, память) не оставляет Python-ошибки:
+    # faulthandler пишет трассировку в crash.log рядом с exe
+    try:
+        import faulthandler
+
+        crash_log = (app_dir() / "crash.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=crash_log)
+    except (OSError, ImportError):
+        pass
     # консоль Windows по умолчанию в cp866: без этого адрес и подписи
     # печатаются «кракозябрами», и ссылку для телефона не прочитать
     try:
@@ -496,6 +522,7 @@ def main() -> int:
         print("Не удалось занять порт: закройте другое приложение и повторите.", flush=True)
         return 1
 
+    log_line(f"{APP_NAME} {APP_VERSION}: старт, база {data.database or 'не найдена'}")
     print(f"{APP_NAME} {APP_VERSION}", flush=True)
     print(f"База: {data.database or 'не найдена — покажу пустой список'}", flush=True)
     print(f"Порт: {server.server_address[1]}", flush=True)
@@ -511,7 +538,11 @@ def main() -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception as error:
+        log_line(f"Сервер остановлен ошибкой: {type(error).__name__}: {error}")
+        raise
     finally:
+        log_line(f"{APP_NAME} {APP_VERSION}: остановлен")
         server.server_close()
     return 0
 
