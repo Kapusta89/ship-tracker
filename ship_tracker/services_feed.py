@@ -91,6 +91,10 @@ SERVICE_TITLES = {
     "mlive": "MarineTraffic.live (карта судов)",
     "srd": "Ship Radar 24 (карточки судов)",
     "sfp": "ShipFinder (координаты в моменте)",
+    "mo": "Maritime Optima (паспорт судна)",
+    "sa": "ShipAtlas (рейс судна)",
+    "mlink": "MarineLink (справочник типов)",
+    "sn": "ShipNext (каталог судов)",
 }
 
 DIGITRAFFIC_URL = "https://meri.digitraffic.fi/api/ais/v1/locations"
@@ -2016,10 +2020,12 @@ PROVIDERS = {
     "mlive": MarineTrafficLiveFeed,
     "srd": ShipRadarDetailsFeed,
 }
+# "mo", "sa", "mlink", "sn" регистрирует сам services_optima: он наследует
+# ServiceFeed и дописывает себя в PROVIDERS в конце своего импорта.
 
 
 def needs_key(key):
-    return key in ("vf", "vfa", "mt", "mst", "gfw", "dat", "aishub")
+    return key in ("vf", "vfa", "mt", "mst", "gfw", "dat", "aishub", "sn")
 
 
 def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=None,
@@ -2036,3 +2042,9 @@ def build(key, on_event, log, stop_event, api_key="", bboxes=None, on_status=Non
                     max_vessels=max_vessels, state_path=state_path,
                     ports=ports, lookahead_minutes=lookahead_minutes,
                     max_records=max_records, cache_path=cache_path, days=days)
+
+
+# Четыре новых источника живут отдельным модулем: он наследует ServiceFeed и
+# сам дописывает себя в PROVIDERS, поэтому подключается в самом конце файла —
+# когда базовый класс и таблица провайдеров уже определены.
+import services_optima  # noqa: E402,F401  (порядок импорта важен)

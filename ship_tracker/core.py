@@ -245,6 +245,16 @@ DEFAULT_CONFIG = {
     "sfp_minutes": 5,
     "sfp_limit": 12,
     "sfp_stale_minutes": 5,
+    # Новые источники: публичные карточки Maritime Optima (то же приложение,
+    # что ShipAtlas), справочник типов MarineLink и каталог ShipNext по токену
+    "use_mo": True,
+    "mo_minutes": 30,
+    "use_sa": True,
+    "sa_minutes": 40,
+    "use_mlink": True,
+    "use_sn": False,
+    "sn_key": "",
+    "sn_minutes": 60,
     # Резерв, когда живой AIS молчит: альтернативные источники опрашиваются
     # чаще и по большему числу судов, пока данные не вернутся.
     "failover_minutes": 8,
@@ -1158,7 +1168,7 @@ class RadarCore:
         self.service_status = {}
         started = []
         for key in ("vf", "vfa", "mt", "mst", "dt", "aci", "gfw", "dat", "aishub",
-                    "gor", "mlive", "srd"):
+                    "gor", "mlive", "srd", "mo", "sa", "mlink", "sn"):
             if not config.get(f"use_{key}"):
                 continue
             title = services_feed.SERVICE_TITLES.get(key, key)
@@ -1175,7 +1185,7 @@ class RadarCore:
                 api_key=api_key,
                 bboxes=config.get("bounding_boxes"),
                 on_status=self._set_service_status,
-                vessels=(self.enrich_candidates if key == "srd"
+                vessels=(self.enrich_candidates if key in ("srd", "mo", "sa", "mlink")
                          else self.profile_candidates if key == "gfw"
                          else self.tracked_mmsis),
                 minutes=config.get(f"{key}_minutes"),

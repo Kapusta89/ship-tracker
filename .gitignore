@@ -57,3 +57,9 @@ shop_tracker_mob/android/build/
 build_mob/
 build_mob.log
 build_exe.log
+
+# Служебный каталог агента
+.continue/
+.tmp/
+**/data/maritimeoptima.json
+**/data/shipatlas.json

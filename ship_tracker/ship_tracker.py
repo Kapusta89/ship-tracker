@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.70"
+APP_VERSION = "2026.12.71"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -77,7 +77,7 @@ PHOTO_DIR = DATA_DIR / "photos"
 SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "vfa": "var_vf_key",
                       "mt": "var_mt_key", "mst": "var_mst_key",
                       "gfw": "var_gfw_token", "dat": "var_dat_key",
-                      "aishub": "var_aishub_key"}
+                      "aishub": "var_aishub_key", "sn": "var_sn_key"}
 
 # Дополнительные подключения: название, ключ настройки, описание и сайт с ключом.
 SERVICE_BLOCKS = [
@@ -101,6 +101,14 @@ SERVICE_BLOCKS = [
      "API по ключу: позиция и рейс по MMSI, 1 кредит за судно"),
     ("AISHub", "aishub",
      "логин участника: позиции района, доступ за свой поток NMEA"),
+    ("Maritime Optima: карточки", "mo",
+     "бесплатно, без ключа: флаг, тип, постройка, размеры, осадка, позывной"),
+    ("ShipAtlas: рейс судна", "sa",
+     "бесплатно, без ключа: куда идёт, район, статус и свежесть AIS"),
+    ("MarineLink: справочник", "mlink",
+     "бесплатно, без ключа: тип судна по спискам справочника"),
+    ("ShipNext: каталог судов", "sn",
+     "токен аккаунта shipnext.com: каталог судов и их данные"),
 ]
 
 # Все подключения, с которыми работает программа, по группам: на вкладке
@@ -108,10 +116,10 @@ SERVICE_BLOCKS = [
 CONNECTION_SECTIONS = (
     ("Сервисы по ключу API",
      "включаются галочкой: без ключа сервис не отвечает, ключ вводится в его блоке",
-     ("vf", "vfa", "mt", "mst", "dat", "aishub", "gfw")),
+     ("vf", "vfa", "mt", "mst", "dat", "aishub", "gfw", "sn")),
     ("Бесплатные сервисы без ключа",
      "работают сразу после включения галочки, ключ не нужен",
-     ("srd", "mlive", "gor", "aci", "dt", "sfp")),
+     ("srd", "mlive", "gor", "aci", "dt", "sfp", "mo", "sa", "mlink")),
 )
 
 SERVICE_SITES = {
@@ -128,6 +136,11 @@ SERVICE_SITES = {
     "gfw": ("Global Fishing Watch API", "https://globalfishingwatch.org/our-apis/"),
     "dat": ("Datalastic API", "https://datalastic.com/ais-data-api/"),
     "aishub": ("AISHub", "https://www.aishub.net/join-us"),
+    "mo": ("maritimeoptima.com", "https://maritimeoptima.com/public/"),
+    "sa": ("ShipAtlas (Maritime Optima)", "https://maritimeoptima.com/public/"),
+    "mlink": ("справочник судов marinelink",
+              "http://directory.marinelink.com/ships/"),
+    "sn": ("shipnext.com", "https://shipnext.com/"),
 }
 
 
@@ -2409,6 +2422,10 @@ class App:
         self.var_use_gfw = tk.BooleanVar(value=bool(self.config.get("use_gfw", False)))
         self.var_use_dat = tk.BooleanVar(value=bool(self.config.get("use_dat", False)))
         self.var_use_aishub = tk.BooleanVar(value=bool(self.config.get("use_aishub", False)))
+        self.var_use_mo = tk.BooleanVar(value=bool(self.config.get("use_mo", True)))
+        self.var_use_sa = tk.BooleanVar(value=bool(self.config.get("use_sa", True)))
+        self.var_use_mlink = tk.BooleanVar(value=bool(self.config.get("use_mlink", True)))
+        self.var_use_sn = tk.BooleanVar(value=bool(self.config.get("use_sn", False)))
         # Ключи API сервисов, которым они нужны
         self.var_vf_key = tk.StringVar(value=self.config.get("vf_key", ""))
         self.var_mt_key = tk.StringVar(value=self.config.get("mt_key", ""))
@@ -2416,6 +2433,7 @@ class App:
         self.var_gfw_token = tk.StringVar(value=self.config.get("gfw_key", ""))
         self.var_dat_key = tk.StringVar(value=self.config.get("dat_key", ""))
         self.var_aishub_key = tk.StringVar(value=self.config.get("aishub_key", ""))
+        self.var_sn_key = tk.StringVar(value=self.config.get("sn_key", ""))
         self.feed_status.update({
             "vf": tk.StringVar(), "vfa": tk.StringVar(), "mt": tk.StringVar(),
             "mst": tk.StringVar(), "dt": tk.StringVar(),
@@ -2423,6 +2441,8 @@ class App:
             "dat": tk.StringVar(), "aishub": tk.StringVar(),
             "gor": tk.StringVar(), "mlive": tk.StringVar(),
             "srd": tk.StringVar(), "sfp": tk.StringVar(),
+            "mo": tk.StringVar(), "sa": tk.StringVar(),
+            "mlink": tk.StringVar(), "sn": tk.StringVar(),
         })
         for key in self.feed_status:
             self.feed_status[key].set(self.service_status_text(key))
@@ -4826,6 +4846,10 @@ class App:
         self.config["use_gfw"] = bool(getattr(self, "var_use_gfw", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_dat"] = bool(getattr(self, "var_use_dat", __import__("tkinter").BooleanVar(value=False)).get())
         self.config["use_aishub"] = bool(getattr(self, "var_use_aishub", __import__("tkinter").BooleanVar(value=False)).get())
+        self.config["use_mo"] = bool(getattr(self, "var_use_mo", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_sa"] = bool(getattr(self, "var_use_sa", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_mlink"] = bool(getattr(self, "var_use_mlink", __import__("tkinter").BooleanVar(value=True)).get())
+        self.config["use_sn"] = bool(getattr(self, "var_use_sn", __import__("tkinter").BooleanVar(value=False)).get())
         # Ключи API внешних сервисов
         for key, field in SERVICE_KEY_FIELDS.items():
             var = getattr(self, field, None)
@@ -5279,7 +5303,9 @@ class App:
             key, lambda event: None, self.log, threading.Event(),
             api_key=api_key, bboxes=self.config.get("bounding_boxes"),
             ports=self.config.get("ports"),
-            vessels=(self.core.enrich_candidates if key == "srd" else None),
+            vessels=(self.core.enrich_candidates
+                     if key in ("srd", "mo", "sa", "mlink")
+                     else self.core.tracked_mmsis if key == "sn" else None),
             # проверка не должна тратить много кредитов: только 5 записей
             max_records=5)
         if feed is None:

@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from mobile_page import PAGE
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
 
@@ -723,6 +723,14 @@ class Data:
         add("MarineTraffic.live", bool(config.get("use_mlive", True)), None, "")
         add("Ship Radar", bool(config.get("use_srd", True)), None, "")
         add("ShipFinder", bool(config.get("use_sfp", True)), None, "")
+        add("Maritime Optima", bool(config.get("use_mo", True)), None,
+            "паспорт судна с публичной карточки")
+        add("ShipAtlas", bool(config.get("use_sa", True)), None,
+            "рейс и статус судна с публичной карточки")
+        add("MarineLink", bool(config.get("use_mlink", True)), None,
+            "тип судна из открытого справочника")
+        add("ShipNext", bool(config.get("use_sn", False)), "sn_key",
+            "каталог судов по токену аккаунта")
         add("Telegram-бот", has("telegram_token"), "telegram_token", "")
 
         desktop_version = "—"

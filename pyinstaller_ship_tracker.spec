@@ -14,7 +14,8 @@ a = Analysis(
     datas=[],  # данные лежат рядом с exe в папке data, а не внутри сборки
     hiddenimports=[
         'ais_feed', 'analysis', 'cargo', 'core', 'flags', 'forecast', 'geo',
-        'metrics', 'net', 'photos', 'places', 'portcalls', 'services_feed', 'store',
+        'metrics', 'net', 'photos', 'places', 'portcalls', 'services_feed',
+        'services_optima', 'store',
         'tkinter',
         'tkinter.ttk',
         'tkinter.messagebox',
