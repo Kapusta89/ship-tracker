@@ -41,7 +41,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.66"
+APP_VERSION = "2026.12.67"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2632,6 +2632,10 @@ class App:
         buttons.grid(row=5, column=1, sticky="w", pady=(16, 0))
         ttk.Button(buttons, text="Сохранить и перезапустить",
                    command=self.save_and_restart).pack(side="left")
+        # отдельная кнопка: перезапуск всех каналов без записи настроек
+        # (нужна, когда ключи уже сохранены, а потоки «залипли»)
+        ttk.Button(buttons, text="Перезапустить все подключения",
+                   command=self.restart_connections).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Проверить ключ AISStream",
                    command=self.check_key).pack(side="left", padx=(8, 0))
 
@@ -4817,6 +4821,20 @@ class App:
         self.core.stop()
         self.core.start()
         self.log("Поток AIS перезапущен.")
+
+    def restart_connections(self):
+        """Перезапускает все подключения: живые потоки и сервисы.
+
+        Настройки не трогает — их сохраняет соседняя кнопка. Нужно, когда
+        канал «залип» (нет сообщений, но и ошибки нет): соединения рвутся
+        и открываются заново с теми же ключами.
+        """
+        if not self.core.running():
+            self.start_core()
+            self.log("Все подключения запущены.")
+            return
+        self.restart_core()
+        self.log("Все подключения перезапущены: живые потоки и сервисы.")
 
     def start_core(self):
         try:
