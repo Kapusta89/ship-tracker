@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.67"
+APP_VERSION = "2026.12.69"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -961,6 +962,9 @@ class App:
         self.root.after(600, self.fast_tick)
         self.root.after(2500, self.slow_tick)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        # Ошибка в обработчике кнопки не должна молча убивать окно:
+        # раньше приложение просто исчезало, а в журнале не было причины.
+        self.root.report_callback_exception = self._log_callback_exception
         if not (config.get("api_key") or "").strip():
             self.log("Ключ AISStream не задан: откройте вкладку «Подключение» и вставьте ключ "
                      "(бесплатно на aisstream.io).")
@@ -995,10 +999,33 @@ class App:
             pass
 
     def append_log(self, message):
+        stamp = f"[{datetime.now():%H:%M:%S}] {message}"
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"[{datetime.now():%H:%M:%S}] {message}\n")
+        self.log_text.insert("end", stamp + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        # тот же журнал — в файл: окно закрывается, а причину надо увидеть
+        try:
+            path = DATA_DIR / "app.log"
+            if path.exists() and path.stat().st_size > 2_000_000:
+                path.replace(DATA_DIR / "app.log.1")
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now():%Y-%m-%d} {stamp}\n")
+        except OSError:
+            pass
+
+    def _log_callback_exception(self, exc, value, tb):
+        """Ошибка в обработчике Tk: пишем в файл и в журнал, окно не теряем."""
+        text = "".join(traceback.format_exception(exc, value, tb))
+        try:
+            with (DATA_DIR / "errors.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] Ошибка в окне:\n{text}\n")
+        except OSError:
+            pass
+        try:
+            self.log(f"Ошибка в окне: {value}")
+        except Exception:
+            pass
 
     def show_banner(self, alert):
         self.banner.configure(
@@ -4015,7 +4042,58 @@ class App:
             except Exception:
                 pass
 
+    def _watchdog(self):
+        """Сторож: поднимает приём заново, если потоки встали или база молчит.
+
+        Молчаливая остановка потока выглядит как «старые данные»: окно живо,
+        но новые позиции не приходят. Раз в минуту проверяем живость потоков
+        и свежесть базы; перезапуск — не чаще раза в 10 минут.
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_watchdog_at", 0.0) < 60:
+            return
+        self._watchdog_at = now
+        born = getattr(self, "_watchdog_born", None)
+        if born is None:
+            # первые минуты после запуска база ещё наполняется — не мешаем
+            self._watchdog_born = now
+            return
+        if now - born < 180:
+            return
+        if getattr(self.core, "feed_elsewhere", False):
+            return
+        alive = False
+        try:
+            alive = self.core.running()
+        except Exception:
+            alive = False
+        silence = 0.0
+        try:
+            silence = self.core.feed_silence_minutes()
+        except Exception:
+            silence = 0.0
+        if alive and silence < 15.0:
+            return
+        if now - getattr(self, "_watchdog_restart_at", -1e9) < 600:
+            return
+        self._watchdog_restart_at = now
+        reason = ("потоки AIS остановились" if not alive
+                  else f"в базу не приходят позиции {silence:.0f} мин")
+        # пишем напрямую в файл: если приложение всё же завершится,
+        # строка останется и будет видна причина
+        self.append_log(f"Сторож: {reason} — перезапускаю подключения.")
+        try:
+            with (DATA_DIR / "watchdog.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {reason}\n")
+        except OSError:
+            pass
+        try:
+            self.restart_core()
+        except Exception as error:
+            self.log(f"Сторож: перезапуск не удался ({error}).")
+
     def _fast_tick(self):
+        self._watchdog()
         state = self.core.feed_state()
         if getattr(self.core, "feed_elsewhere", False) and not self.core.running():
             conn = "поток: принимает другой процесс · данные из общей базы"
@@ -5535,6 +5613,15 @@ def refresh_mmsi_cli(args) -> int:
 
 
 def main():
+    # жёсткие падения (сегфолт, исчерпание памяти) не оставляют Python-ошибки:
+    # faulthandler пишет трассировку в data/crash.log, и причина не теряется
+    try:
+        import faulthandler
+
+        crash_log = (DATA_DIR / "crash.log").open("a", encoding="utf-8")
+        faulthandler.enable(file=crash_log)
+    except (OSError, ImportError):
+        pass
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
