@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
 
@@ -44,6 +44,11 @@ def log_line(text: str) -> None:
 
 
 def find_database() -> Path | None:
+    """Берёт самую свежую базу из копий Ship Tracker.
+
+    Ключи и подключения живут в варианте, который запускается через run.bat,
+    поэтому телефон показывает данные той копии, что обновляется сейчас.
+    """
     base = app_dir()
     candidates = [
         base / "data" / "ship_tracker.db",
@@ -51,10 +56,10 @@ def find_database() -> Path | None:
         base.parent / "ship_tracker.exe" / "data" / "ship_tracker.db",
         base.parent / "ship_tracker" / "data" / "ship_tracker.db",
     ]
-    for path in candidates:
-        if path.exists():
-            return path
-    return None
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
 
 
 def find_config(database: Path | None) -> dict:

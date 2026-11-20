@@ -139,7 +139,9 @@ public class MainActivity extends Activity {
 
         TextView hint = new TextView(this);
         hint.setText("Приложение показывает суда с компьютера: он должен быть включён, "
-                + "Ship Tracker Mobile запущен, телефон — в той же Wi-Fi сети.");
+                + "Ship Tracker Mobile запущен, телефон — в той же Wi-Fi сети. "
+                + "Ключи и подключения к источникам данных настраиваются в версии "
+                + "Ship Tracker, которая запускается через run.bat.");
         hint.setTextSize(14);
         hint.setTextColor(Color.parseColor("#7d95ad"));
         hint.setPadding(0, dp(8), 0, dp(18));

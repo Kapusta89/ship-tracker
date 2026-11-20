@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.69"
+APP_VERSION = "2026.12.70"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2336,6 +2336,20 @@ class App:
             foreground="#a40000", font=("Segoe UI", 9, "bold"), anchor="w",
             justify="left", wraplength=1180, padx=10, pady=8, relief="flat")
         self.connection_problem.pack(fill="x", padx=10, pady=(8, 0))
+        # Собранная копия поставляется без ключей: все подключения задаются в
+        # варианте, который запускается через run.bat. Пользователь может ввести
+        # свои ключи и здесь — тогда копия работает отдельно.
+        if getattr(sys, "frozen", False):
+            tk.Label(
+                frame,
+                text=("Эта копия без ключей: подключения настраиваются в варианте, "
+                      "который запускается через run.bat (папка ship_tracker). "
+                      "Поля ниже пустые — вставьте свои ключи, если нужна "
+                      "отдельная копия."),
+                background="#e8f2fd", foreground="#0b4a8f",
+                font=("Segoe UI", 9), anchor="w", justify="left",
+                wraplength=1180, padx=10, pady=8, relief="flat").pack(
+                    fill="x", padx=10, pady=(6, 0))
         self.update_connection_problems()
         inner = self.scrollable_tab(frame)
         top = ttk.Frame(inner)
