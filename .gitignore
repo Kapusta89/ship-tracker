@@ -47,6 +47,15 @@ ship_tracker.exe/
 # Промежуточные файлы PyInstaller
 build_exe/
 
+# Мобильная версия: собранный exe и локальные журналы не храним в репозитории
+shop_tracker_mob/*.exe
+shop_tracker_mob/*.log
+shop_tracker_mob/*.lock
+shop_tracker_mob/build/
+shop_tracker_mob/*.idsig
+shop_tracker_mob/android/build/
+build_mob/
+build_mob.log
 build_exe.log
 
 # Служебный каталог агента
