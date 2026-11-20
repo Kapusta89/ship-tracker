@@ -609,7 +609,10 @@ class MmsiWatchFeed(AISStreamFeed):
             if text.isdigit() and text not in seen:
                 seen.add(text)
                 result.append(text)
-        return result
+        # Сервер AISStream принимает не больше 50 MMSI в FiltersShipMMSI
+        # (в токене это поле `mmsis`). На 190 судах соединение открывалось
+        # и тут же закрывалось без причины, поэтому список жёстко ограничен.
+        return result[:50]
 
     def subscription(self) -> dict:
         mmsis = self.mmsis()

@@ -993,7 +993,7 @@ class RadarCore:
                     watch = ais_feed.MmsiWatchFeed(
                         api_key,
                         (lambda slot=index, slots=count:
-                         self.watch_mmsis(190, slot, slots)),
+                         self.watch_mmsis(50, slot, slots)),
                         config.get("message_types"),
                         self._receive, self.log, self.stop_event,
                         stream_url=ais_feed.STREAM_URL,
@@ -1008,8 +1008,8 @@ class RadarCore:
                     self.log(f"Слежение по MMSI, соединение {index + 1}: "
                              f"не удалось запустить ({error})")
             if started:
-                self.log(f"Слежение по MMSI: соединений {started}, по 190 MMSI — "
-                         f"до {started * 190} судов (AISStream занято "
+                self.log(f"Слежение по MMSI: соединений {started}, по 50 MMSI — "
+                         f"до {started * 50} судов (AISStream занято "
                          f"{slots_used + started} из {slots_total}); список "
                          f"пересобирается каждые {refresh_minutes:g} мин — идущие "
                          f"к нашим портам поднимаются выше стоящих.")
@@ -1220,10 +1220,10 @@ class RadarCore:
     def watch_mmsis(self, limit=190, part=0, parts=1):
         """Суда для глобального слежения по MMSI — одна доля списка.
 
-        AISStream принимает до 200 MMSI в одной подписке (`FiltersShipMMSI`),
+        AISStream принимает 50 MMSI в одной подписке (`FiltersShipMMSI`),
         поэтому список делится на несколько соединений: каждое берёт свою
-        долю `part` из `parts` (без пересечений), и три подписки по 190
-        покрывают до 570 судов. В список входят и суда, связанные с нашими
+        долю `part` из `parts` (без пересечений), и три подписки по 50
+        покрывают до 150 судов. В список входят и суда, связанные с нашими
         портами (они остаются на связи за пределами прямоугольников), и весь
         трафик района — чтобы в слежении был не только узкий круг.
         """
@@ -1308,7 +1308,8 @@ class RadarCore:
             return 5 if in_area(row) else 6   # стоящие в районе и всё остальное
 
         ordered.sort(key=rank)
-        # Общий объём на все соединения: 190 на каждое, дальше делим по кругу —
+        # Общий объём на все соединения: 50 на каждое (лимит сервера),
+        # дальше делим по кругу —
         # так при потере одного соединения пропадает только его доля.
         capacity = max(1, limit) * max(1, parts)
         result = []

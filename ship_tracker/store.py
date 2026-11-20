@@ -688,12 +688,25 @@ class Store:
         Уход раньше входа — признак запоздавшей точки: такую стоянку не
         закрываем, иначе в истории появляется «пришёл в ноябре, ушёл в октябре».
         """
+        stamp = iso(when)
         with self._lock, self.conn:
+            # OR IGNORE: закрытый заход с такими же полями уже может быть в
+            # истории (дубль из старой базы), и обычный UPDATE падал на
+            # уникальном индексе вместо того, чтобы просто убрать копию.
             cur = self.conn.execute(
-                "UPDATE port_visits SET left_at = ? WHERE id = ? AND left_at IS NULL "
-                "AND julianday(?) >= julianday(entered_at)",
-                (iso(when), int(visit_id), iso(when)))
-            return cur.rowcount
+                "UPDATE OR IGNORE port_visits SET left_at = ? WHERE id = ? "
+                "AND left_at IS NULL AND julianday(?) >= julianday(entered_at)",
+                (stamp, int(visit_id), stamp))
+            if cur.rowcount:
+                return cur.rowcount
+            still_open = self.conn.execute(
+                "SELECT 1 FROM port_visits WHERE id = ? AND left_at IS NULL",
+                (int(visit_id),)).fetchone()
+            if still_open:
+                self.conn.execute("DELETE FROM port_visits WHERE id = ?",
+                                  (int(visit_id),))
+                return 1
+            return 0
 
     def start_visit(self, mmsi: str, port: str, lat, lon, when=None, draft=None,
                     cargo_kind=None, source="live") -> bool:
