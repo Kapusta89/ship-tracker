@@ -41,7 +41,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.61"
+APP_VERSION = "2026.12.64"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2179,7 +2179,8 @@ class App:
             eta = row.get("eta") or "—"
             if eta_hours is not None and eta_hours < -12:
                 eta += f" (прошёл {span_text(abs(eta_hours))} назад)"
-            stale_row = hours is not None and hours > self.stale_limit_hours()
+            stale_row = portcalls.expected_is_stale(
+                row, self.expected_fresh_hours())
             if stale_row:
                 stale_rows += 1
                 # сигнал старше порога — и ETA, и порт уже ничего не значат
@@ -2209,7 +2210,7 @@ class App:
             info += f" Нет страницы у AIS-catcher: {', '.join(missing)}."
         if stale_rows and self.stale_visible():
             info += (f" Серым — {stale_rows} судов без сигнала AIS дольше "
-                     f"{self.stale_limit_hours():g} ч: их ETA уже не значит ничего.")
+                     f"{self.expected_fresh_hours():g} ч: их ETA уже не значит ничего.")
         elif stale_rows:
             info += self.hidden_stale_note(stale_rows)
         if cache.get("stale"):
@@ -3554,8 +3555,10 @@ class App:
             voyage.append(f"  менялось: {history}")
         declared = parse_iso(vessel.get("eta_declared"))
         if declared:
+            expired = declared < datetime.now() - timedelta(hours=6)
+            note = (" — срок прошёл, капитан его не обновил" if expired else "")
             voyage.append(f"Срок прибытия (AIS): {fmt_moment(declared)} — передаёт "
-                          f"капитан, время в UTC")
+                          f"капитан, время в UTC{note}")
         else:
             voyage.append("Срок прибытия (AIS): капитан не передавал")
         trip = self.core.voyage(vessel)
@@ -3577,9 +3580,16 @@ class App:
                           f"{fmt_number(target.get('distance_km'))} км")
         expected = portcalls.expected_for_mmsi(mmsi)
         if expected:
-            voyage.append(f"Ожидается в {expected.get('port')}: ETA "
-                          f"{expected.get('eta') or '—'} (AIS-catcher, сигнал "
-                          f"{expected.get('last_heard') or '—'})")
+            heard = expected.get("last_heard") or "—"
+            eta = expected.get("eta") or "—"
+            if portcalls.expected_is_stale(expected, self.expected_fresh_hours()):
+                # сигнал недельной давности и ETA месячной давности нельзя
+                # показывать как действующее ожидание: судно уже ушло
+                voyage.append(f"Ожидание в {expected.get('port')} устарело: "
+                              f"сигнал {heard}, ETA {eta} — не учитывается")
+            else:
+                voyage.append(f"Ожидается в {expected.get('port')}: ETA {eta} "
+                              f"(AIS-catcher, сигнал {heard})")
         voyage += self.forecast_lines(vessel)
 
         # ---- порт и стоянка
@@ -4272,6 +4282,19 @@ class App:
         if minutes <= 0:
             minutes = 15.0
         return max(0.05, minutes / 60.0)
+
+    def expected_fresh_hours(self) -> float:
+        """Сколько часов сигнал AIS-catcher ещё считается свежим.
+
+        Для таблиц судов порог 15 минут, но страницу порта сервер обновляет
+        сам: судно может молчать час и всё равно стоять в порту. Поэтому
+        «Ожидаемые» живут по отдельному, более мягкому порогу.
+        """
+        try:
+            hours = float(self.config.get("expected_fresh_hours") or 6)
+        except (TypeError, ValueError):
+            hours = 6.0
+        return max(1.0, hours)
 
     def vessel_is_stale(self, vessel) -> bool:
         """Позиция судна старше его порога (или времени позиции нет вовсе).
@@ -5466,6 +5489,9 @@ def refresh_mmsi_cli(args) -> int:
     config = load_config(config_path)
     store = Store(Path(config_path).parent / DB_PATH.name)
     core = RadarCore(config, store, log=console_log)
+    # события карточки сайта и обогащения идут через очередь: без потребителя
+    # паспорт, полученный по кнопке в консоли, терялся и не попадал в базу
+    core._start_consumer()
     mmsis = [part.strip() for part in str(args.refresh_mmsi).split(",") if part.strip()]
     if not mmsis:
         console_log("Не указан ни один MMSI.")
@@ -5480,6 +5506,7 @@ def refresh_mmsi_cli(args) -> int:
             console_log(f"  ошибка: {error}")
             continue
         console_log(f"  {result.get('text')}")
+        time.sleep(1.5)  # очередь успевает записать паспорт из карточки
         fresh = store.vessel(mmsi) or {}
         console_log(f"  в базе: {fmt_number(fresh.get('lat'))}, "
                     f"{fmt_number(fresh.get('lon'))} · ход "

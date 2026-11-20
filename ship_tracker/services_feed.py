@@ -1508,6 +1508,94 @@ class GoradarFeed(ServiceFeed):
         self.ok(len(seen), detail)
 
 
+def goradar_near(lat, lon, delta=0.6, timeout=45):
+    """Позиции Goradar в маленьком прямоугольнике вокруг точки."""
+    import requests
+
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return []
+    payload = {"lat1": lat - delta, "lat2": lat + delta,
+               "lng1": lon - delta, "lng2": lon + delta}
+    try:
+        session = requests.Session()
+        session.headers.update(dict(MAP_HEADERS, Referer=GORADAR_HOME))
+        try:
+            session.get(GORADAR_HOME, timeout=30)
+        except Exception:
+            pass
+        response = session.post(GORADAR_URL, data=payload, timeout=timeout)
+        response.raise_for_status()
+        rows = response.json()
+    except (ValueError, TypeError):
+        return []
+    result = []
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            mmsi = _mmsi(row[0])
+            point_lat, point_lon = _number(row[2]), _number(row[3])
+        except (IndexError, TypeError):
+            continue
+        if not mmsi or point_lat is None or point_lon is None:
+            continue
+        course = _number(row[4]) if len(row) > 4 else None
+        if course is not None and (course <= 0 or course >= 360):
+            course = None
+        when = _time(row[5], utc=True) if len(row) > 5 and row[5] else None
+        if when is None:
+            continue
+        label = str(row[8] or "").strip() if len(row) > 8 else ""
+        result.append({
+            "mmsi": mmsi, "lat": point_lat, "lon": point_lon,
+            "sog": _number(row[7]) if len(row) > 7 else None,
+            "cog": course,
+            "at": when,
+            "name": label,
+        })
+    return result
+
+
+def mlive_near(lat, lon, radius=100, limit=500, timeout=45):
+    """Позиции MarineTraffic.live в радиусе вокруг точки (JSON-мост сайта)."""
+    import requests
+
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return []
+    try:
+        session = requests.Session()
+        session.headers.update(dict(MAP_HEADERS, Referer=MARINETRAFFIC_LIVE_HOME))
+        try:
+            session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
+        except Exception:
+            pass
+        response = session.get(
+            MARINETRAFFIC_LIVE_URL,
+            params={"lat": lat, "lon": lon, "radius": radius, "limit": limit},
+            timeout=timeout)
+        response.raise_for_status()
+        data = (response.json() or {}).get("data") or {}
+    except (ValueError, TypeError):
+        return []
+    result = []
+    for row in data.get("vessels") or []:
+        mmsi = _mmsi(row.get("mmsi"))
+        point_lat = _number(row.get("lat"))
+        point_lon = _number(row.get("lng"))
+        if not mmsi or point_lat is None or point_lon is None:
+            continue
+        result.append({
+            "mmsi": mmsi, "lat": point_lat, "lon": point_lon,
+            "sog": _number(row.get("speed_kn")),
+            "cog": _number(row.get("course_deg")),
+            "at": _time(row.get("updated"), utc=True),
+            "name": str(row.get("name") or "").strip(),
+        })
+    return result
+
+
 class MarineTrafficLiveFeed(ServiceFeed):
     """MarineTraffic.live (Ship Radar 24): публичная карта судов, ключ не нужен.
 

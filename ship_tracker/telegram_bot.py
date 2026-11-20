@@ -399,13 +399,21 @@ def vessel_card(vessel: dict, core) -> str:
                 f"({core_module.fmt_number(voyage['distance_km'])} км до {port_label})")
     declared = store_module.parse_iso(vessel.get("eta_declared"))
     if declared:
+        expired = declared < datetime.now() - timedelta(hours=6)
+        note = " — срок прошёл, капитан его не обновил" if expired else ""
         voyage_rows.append(f"Срок прибытия (AIS): {core_module.fmt_moment(declared)} "
-                           f"(передаёт капитан, в UTC)")
+                           f"(передаёт капитан, в UTC){note}")
     if portcalls is not None:
         expected = portcalls.expected_for_mmsi(mmsi)
         if expected:
-            voyage_rows.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
-                               f"{expected.get('eta') or 'не указан'} (AIS-catcher)")
+            heard = expected.get("last_heard") or "—"
+            eta = expected.get("eta") or "не указан"
+            if portcalls.expected_is_stale(expected):
+                voyage_rows.append(f"Ожидание в {expected.get('port')} устарело: "
+                                   f"сигнал {heard}, ETA {eta} — не учитывается")
+            else:
+                voyage_rows.append(f"Ожидается в {expected.get('port')}: заявленный ETA "
+                                   f"{eta} (AIS-catcher, сигнал {heard})")
     lines += section("Рейс", voyage_rows)
 
     if portcalls is not None and gfw_entry:

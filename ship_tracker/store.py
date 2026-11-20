@@ -5,6 +5,7 @@ DB Browser for SQLite, пока программа работает.
 """
 
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
@@ -194,7 +195,47 @@ def parse_iso(value):
     try:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
+        pass
+    # Open Waters и ShipFinder передают ETA строкой «MM-DD HH:MM» без года:
+    # без разбора карточка считала, что капитан срок не передавал
+    match = re.match(r"^(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})",
+                     str(value).strip())
+    if not match:
         return None
+    month, day, hour, minute = (int(part) for part in match.groups())
+    now = datetime.now()
+    try:
+        moment = datetime(now.year, month, day, hour, minute)
+    except ValueError:
+        return None
+    if (now - moment).days > 180:
+        try:
+            moment = moment.replace(year=now.year + 1)
+        except ValueError:
+            return None
+    return moment
+
+
+# Обратный переход назначения в пределах этого времени — не новое значение,
+# а «качели» двух источников; в историю он не попадает.
+DESTINATION_FLAP_MINUTES = 60
+
+
+def normalize_destination(value) -> str:
+    """Назначение в человеческом виде: без «@» и двойных пробелов."""
+    return " ".join(str(value or "").replace("@", " ").split())
+
+
+def canonical_destination(value) -> str:
+    """Ключ сравнения: «IZMAIL,  UA» и «izmail» — один и тот же порт.
+
+    Страна в конце («, UA», «/ TR») на смысл не влияет, а источники пишут её
+    то с пробелом, то без — из-за этого карточка показывала ложные
+    «менялось: IZMAIL -> IZMAIL,  UA».
+    """
+    text = normalize_destination(value)
+    text = re.sub(r"[\s,;/|-]+[A-Za-z]{2}$", "", text).strip()
+    return text.upper()
 
 
 class Store:
@@ -289,14 +330,36 @@ class Store:
                                     (mmsi,)).fetchone()
             # назначение меняется на глазах: пишем каждое изменение, иначе
             # в карточке остаётся только последний порт без объяснений
-            new_destination = str(data.get("destination") or "").strip()
-            old_destination = str(row[1] or "").strip() if row else ""
+            new_destination = normalize_destination(data.get("destination"))
+            old_destination = normalize_destination(row[1]) if row else ""
+            if new_destination:
+                data["destination"] = new_destination
             if (new_destination and old_destination
-                    and new_destination.upper() != old_destination.upper()):
-                self.conn.execute(
-                    "INSERT INTO destination_changes (mmsi, old_dest, new_dest, at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (mmsi, old_destination, new_destination, now))
+                    and canonical_destination(new_destination)
+                    != canonical_destination(old_destination)):
+                # Два источника могут писать один порт по-разному и перебивать
+                # друг друга: карточка показывала «BURGAS -> CEYHAN,TURKEY ->
+                # BURGAS» каждые две минуты. Обратный переход в пределах часа
+                # считаем тем же самым значением и в историю не пишем.
+                last = self.conn.execute(
+                    "SELECT old_dest, new_dest, at FROM destination_changes "
+                    "WHERE mmsi = ? ORDER BY id DESC LIMIT 1", (mmsi,)).fetchone()
+                flap = False
+                if last:
+                    moment = parse_iso(last[2])
+                    recent = (moment is not None
+                              and (datetime.now() - moment).total_seconds()
+                              < DESTINATION_FLAP_MINUTES * 60)
+                    flap = (recent
+                            and canonical_destination(last[1])
+                            == canonical_destination(old_destination)
+                            and canonical_destination(last[0])
+                            == canonical_destination(new_destination))
+                if not flap:
+                    self.conn.execute(
+                        "INSERT INTO destination_changes (mmsi, old_dest, new_dest, at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (mmsi, old_destination, new_destination, now))
             if row is None:
                 columns = ["mmsi", "first_seen", "updated_at", *data.keys()]
                 params = [mmsi, now, now, *data.values()]

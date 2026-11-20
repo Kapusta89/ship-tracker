@@ -123,7 +123,7 @@ def valid_static_field(field, value):
     if field == "destination":
         if upper in JUNK_DESTINATIONS or len(text) < 2 or len(text) > 40:
             return None
-        return text
+        return " ".join(text.split())
     if field == "name":
         if upper in {"-", "—", "UNKNOWN", "N/A", "NO NAME", "NONAME", "TEST",
                      "DEMO", "EXAMPLE", "SAMPLE"} or len(text) > 60:
@@ -168,9 +168,9 @@ def valid_static_field(field, value):
             return None
         return round(beam, 1) if 2 <= beam <= 80 else None
     if field == "eta_declared":
-        if upper in JUNK_DESTINATIONS:
-            return None
-        return text if len(text) <= 30 else None
+        # источники пишут ETA и полями AIS, и строкой «MM-DD HH:MM»: в базе
+        # всегда ISO, иначе карточка не могла разобрать срок прибытия
+        return ais_feed.parse_eta(value)
     return text
 
 
@@ -229,6 +229,9 @@ DEFAULT_CONFIG = {
     # профили и разрывы AIS в Global Fishing Watch (нужен токен)
     "use_aci": True,
     "aci_minutes": 60,
+    # сколько часов сигнал AIS-catcher считается свежим для «Ожидаемых»:
+    # страницу порта сервер обновляет сам, судно может молчать час
+    "expected_fresh_hours": 6,
     # публичные карты судов без ключа: дают позиции всех судов района
     "use_gor": True,
     "gor_minutes": 15,
@@ -1281,7 +1284,14 @@ class RadarCore:
             except (TypeError, ValueError):
                 return False
 
+        pinned = set(str(item) for item in (getattr(self, "pinned_mmsis", ()) or ()))
+
         def rank(row):
+            # Закреплённое судно следим всегда: оно может уйти за пределы
+            # района (STAR стоит у Сулины), и без отдельной подписки по MMSI
+            # его сообщения AIS пропадают.
+            if str(row.get("mmsi") or "") in pinned:
+                return -1
             # Самое ценное — судно, которое прямо сейчас идёт к нашему порту:
             # его позиция нужна каждую минуту. Стоящие в порту и так видны
             # районным потоком, поэтому они ниже.
@@ -2421,7 +2431,55 @@ class RadarCore:
                 parts.append("карточка сайта: только что запрашивалась")
             else:
                 parts.append("карточки нет: имя судна неизвестно")
+        # --- остальные источники: спрашиваем всех, кто может знать это судно
+        row = self.store.vessel(mmsi) or {}
+        lat, lon = row.get("lat"), row.get("lon")
+        if lat is not None and lon is not None:
+            for source, title, loader in (
+                    ("snapshot", "снимок Open Waters",
+                     lambda: ais_feed.snapshot_near(lat, lon)),
+                    ("goradar", "Goradar",
+                     lambda: services_feed.goradar_near(lat, lon)),
+                    ("mlive", "MarineTraffic.live",
+                     lambda: services_feed.mlive_near(lat, lon))):
+                try:
+                    events = loader()
+                except Exception as error:
+                    parts.append(f"{title}: ошибка ({error})")
+                    continue
+                found = None
+                for event in events:
+                    if str(event.get("mmsi")) == mmsi:
+                        found = event
+                        break
+                if not found:
+                    parts.append(f"{title}: судна нет в ответе")
+                    continue
+                if self._apply_near_found(mmsi, found, source):
+                    fresh = True
+                    parts.append(f"{title}: новая позиция")
+                else:
+                    parts.append(f"{title}: позиция без изменений")
         return {"text": "; ".join(parts), "fresh": fresh}
+
+    def _apply_near_found(self, mmsi, found, source) -> bool:
+        """Пишет точку из точечного запроса к источнику.
+
+        Возвращает True, только если точка оказалась новее той, что уже
+        в базе: старые ответы источников не должны перебивать свежие.
+        """
+        lat, lon = found.get("lat"), found.get("lon")
+        if lat is None or lon is None:
+            return False
+        moment = found.get("at") or datetime.now()
+        sog, cog, _heading = clean_motion(found.get("sog"), found.get("cog"))
+        try:
+            self.store.save_source_position(
+                str(mmsi), source, lat, lon, sog, cog, moment)
+        except Exception:
+            pass
+        return bool(self._accept_position(
+            str(mmsi), lat, lon, sog, cog, moment, source))
 
     def refresh_focus(self, limit=20) -> dict:
         """Обновляет по прямому запросу наши суда и закреплённые (pinned)."""

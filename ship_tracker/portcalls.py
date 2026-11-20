@@ -193,6 +193,60 @@ def expected_rows(cache=None) -> list[dict]:
     return rows
 
 
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def heard_hours(text):
+    """«2m ago», «1h 3m ago», «16h 9m ago» -> сколько часов назад был сигнал."""
+    found = re.findall(r"(\d+)\s*([hm])", str(text or ""))
+    if not found:
+        return None
+    total = 0.0
+    for value, unit in found:
+        total += int(value) / 60 if unit == "m" else int(value)
+    return total
+
+
+def eta_hours_left(text):
+    """«17 Oct 12:00» -> часов до ETA; отрицательное значение — срок прошёл."""
+    parts = str(text or "").strip().split()
+    if len(parts) != 3:
+        return None
+    try:
+        day = int(parts[0])
+        month = _MONTHS.get(parts[1].strip(".").lower())
+        hour, minute = (int(piece) for piece in parts[2].split(":"))
+    except (ValueError, TypeError):
+        return None
+    if not month:
+        return None
+    now = datetime.now()
+    try:
+        moment = datetime(now.year, month, day, hour, minute)
+    except ValueError:
+        return None
+    if moment > now + timedelta(days=300):   # ETA «прошлого года»
+        try:
+            moment = moment.replace(year=moment.year - 1)
+        except ValueError:
+            return None
+    return round((moment - now).total_seconds() / 3600, 1)
+
+
+def expected_is_stale(row, fresh_hours=6.0, eta_grace_hours=12.0) -> bool:
+    """Строка «Ожидаемых» уже ничего не значит: старый сигнал или старый ETA."""
+    if not isinstance(row, dict):
+        return True
+    heard = heard_hours(row.get("last_heard"))
+    eta = eta_hours_left(row.get("eta"))
+    if heard is not None and heard > float(fresh_hours):
+        return True
+    if eta is not None and eta < -float(eta_grace_hours):
+        return True
+    return False
+
+
 def expected_for_mmsi(mmsi, cache=None) -> dict | None:
     """Запись об ожидании для конкретного судна (если оно есть в списке)."""
     target = str(mmsi or "")

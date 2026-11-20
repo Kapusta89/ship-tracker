@@ -13,6 +13,7 @@
 import json
 import math
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -193,22 +194,12 @@ def parse_dimensions(value):
     return length, beam
 
 
-def parse_eta(value):
-    """Срок прибытия из ShipStaticData: поля Month/Day/Hour/Minute без года.
+def _eta_iso(month, day, hour, minute):
+    """ISO-время из полей AIS: года в сообщении нет, берём текущий.
 
-    По спецификации AIS время указано в UTC. Год не передаётся, поэтому берётся
-    текущий; если дата ушла больше чем на полгода в прошлое — значит, речь о
-    следующем годе.
+    Если дата ушла больше чем на полгода в прошлое — значит, речь о следующем
+    годе. По спецификации AIS время указано в UTC.
     """
-    if not isinstance(value, dict):
-        return None
-    try:
-        month = int(value.get("Month") or 0)
-        day = int(value.get("Day") or 0)
-        hour = int(value.get("Hour") or 0)
-        minute = int(value.get("Minute") or 0)
-    except (TypeError, ValueError):
-        return None
     if not (1 <= month <= 12 and 1 <= day <= 31):
         return None
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
@@ -224,6 +215,41 @@ def parse_eta(value):
         except ValueError:
             return None
     return moment.isoformat(timespec="minutes")
+
+
+_ETA_TEXT = re.compile(r"^(\d{1,2})[-.\s](\d{1,2})\s+(\d{1,2}):(\d{2})$")
+
+
+def parse_eta(value):
+    """Срок прибытия судна -> ISO-время (в источнике года нет).
+
+    AISStream передаёт поля Month/Day/Hour/Minute словарём, а Open Waters
+    и ShipFinder — строкой «MM-DD HH:MM». Раньше такая строка сохранялась
+    как есть, и карточка писала «капитан не передавал», хотя ETA было.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text).isoformat(timespec="minutes")
+        except ValueError:
+            pass
+        match = _ETA_TEXT.match(text)
+        if not match:
+            return None
+        month, day, hour, minute = (int(part) for part in match.groups())
+        return _eta_iso(month, day, hour, minute)
+    if not isinstance(value, dict):
+        return None
+    try:
+        month = int(value.get("Month") or 0)
+        day = int(value.get("Day") or 0)
+        hour = int(value.get("Hour") or 0)
+        minute = int(value.get("Minute") or 0)
+    except (TypeError, ValueError):
+        return None
+    return _eta_iso(month, day, hour, minute)
 
 
 def first_set(*values):
@@ -918,6 +944,35 @@ def parse_track(data) -> list:
         points.append({"at": moment, "lat": lat, "lon": lon, "sog": sog})
     points.sort(key=lambda point: point["at"])
     return points
+
+
+def snapshot_near(lat, lon, delta=2.0, timeout=25, max_age_hours=6.0):
+    """Свежие позиции Open Waters в маленьком прямоугольнике вокруг точки.
+
+    Для принудительного обновления одного судна: полный снимок района
+    большой, а точечный запрос отдаёт только округу и отвечает быстро.
+    """
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return []
+    box = (lat - delta, lon - delta, lat + delta, lon + delta)
+    query = ",".join(f"{value:.3f}" for value in box)
+    try:
+        import requests
+
+        response = requests.get(SNAPSHOT_URL, params={"bbox": query}, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+    features = data.get("features") if isinstance(data, dict) else None
+    events = []
+    for feature in features or []:
+        event = snapshot_event(feature, max_age_hours)
+        if event:
+            events.append(event)
+    return events
 
 
 VESSEL_URL = "https://ais.openwaters.io/v1/vessels/{mmsi}"
