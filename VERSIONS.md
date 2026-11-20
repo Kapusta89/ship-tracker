@@ -8,7 +8,8 @@
 |---|---|---|---|
 | Ship Tracker (исходное, Python) | `ship_tracker/ship_tracker.py` | **2026.12.69** | 2026-11-20 |
 | Ship Tracker для Windows | `ship_tracker.exe/ship_tracker.exe` | **2026.12.69** | 2026-11-20 |
-| Ship Tracker Mobile (телефон) | `shop_tracker_mob/shop_tracker_mob.exe` | **1.2.0** | 2026-11-20 |
+| Ship Tracker Mobile (телефон) | `shop_tracker_mob/shop_tracker_mob.exe` | **2.0.0** | 2026-11-20 |
+| Ship Tracker APK (Android) | `shop_tracker_mob/ShipTracker.apk` | **2.0.0** (200) | 2026-11-20 |
 
 Версия видна: в заголовке окна (обе настольные копии), в подвале мобильной
 страницы и в ответе `/api/ships` (`version`).
@@ -26,6 +27,13 @@
 
 ### 2026-11-20
 
+- **2.0.0 / APK 2.0.0** — полноценная мобильная версия и своя APK-сборка:
+  вкладки «Карта» (canvas с портами и судами), «Суда», «Порты», «Ожидаемые»,
+  «Стоянки», карточка судна с историей позиций и стоянками, автообновление
+  раз в 20 секунд, определения порта и расстояния до него, автопоиск сервера
+  по UDP 50505 в Wi-Fi, экран настройки адреса и понятные сообщения об ошибках.
+  APK собирается без Gradle (`shop_tracker_mob/android/build_apk.sh`):
+  aapt2 → javac → d8 → zipalign → apksigner, мин. Android 5.0.
 - **2026.12.69 / 1.2.0** — журналы в файл (`data/app.log`, `shop_tracker_mob.log`),
   `crash.log` через faulthandler в обеих настольных копиях и в мобильном
   сервере, перехват ошибок окна Tk в `data/errors.log`, сторож приёма
