@@ -2,14 +2,17 @@
 
 Один exe поднимает небольшой сервер на компьютере: телефон в той же
 Wi-Fi сети открывает приложение (или Android-обёртку из этой же папки)
-и видит те же суда, порты, ожидаемые прибытия и стоянки, что и на компьютере.
-Данные читаются только на чтение из базы Ship Tracker.
+и видит те же вкладки, что и настольная версия: «Радар», «В море»,
+«Прогноз 4 дня», «Прогноз всех судов», «Стоянки» и «Подключения».
+Данные читаются только на чтение из базы Ship Tracker; ключи и подключения
+задаются в варианте, который запускается через run.bat.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import socket
 import sqlite3
@@ -21,10 +24,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from mobile_page import PAGE
+
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.1.0"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
+
+# Как в настольной версии: позиция старше этого — уже не обстановка.
+MAX_VIEW_AGE_HOURS = 9.0
+KNOT_KMH = 1.852
+MIN_SPEED_KNOTS = 0.5
+DEFAULT_STAY_HOURS = 24.0
+GUESS_MAX_KM = 700.0
+GUESS_MAX_OFFSET = 35.0
 
 
 def app_dir() -> Path:
@@ -84,61 +97,89 @@ def parse_moment(text) -> datetime | None:
 
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
-    from math import asin, cos, radians, sin, sqrt
-
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return 2 * 6371.0 * asin(min(1.0, sqrt(a)))
-
-
-_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
 
 
-def heard_hours(text):
-    """«2m ago», «16h 9m ago» -> часы с последнего сигнала."""
-    found = re.findall(r"(\d+)\s*([hm])", str(text or ""))
-    if not found:
-        return None
-    total = 0.0
-    for value, unit in found:
-        total += int(value) / 60 if unit == "m" else int(value)
-    return total
+def bearing_deg(lat1, lon1, lat2, lon2) -> float:
+    """Начальный азимут от точки 1 к точке 2, градусы."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlambda = math.radians(lon2 - lon1)
+    y = math.sin(dlambda) * math.cos(phi2)
+    x = (math.cos(phi1) * math.sin(phi2)
+         - math.sin(phi1) * math.cos(phi2) * math.cos(dlambda))
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
-def eta_hours_left(text):
-    """«17 Oct 12:00» -> часов до ETA (минус — срок прошёл)."""
-    parts = str(text or "").strip().split()
-    if len(parts) != 3:
-        return None
-    try:
-        day = int(parts[0])
-        month = _MONTHS.get(parts[1].strip(".").lower())
-        hour, minute = (int(piece) for piece in parts[2].split(":"))
-        moment = datetime(datetime.now().year, month, day, hour, minute)
-    except (ValueError, TypeError):
-        return None
-    if moment > datetime.now() + timedelta(days=300):
-        try:
-            moment = moment.replace(year=moment.year - 1)
-        except ValueError:
-            return None
-    return round((moment - datetime.now()).total_seconds() / 3600, 1)
+def move_point(lat, lon, bearing, distance_km):
+    """Точка на расстоянии и азимуте (как в forecast.destination_point)."""
+    angular = distance_km / 6371.0
+    phi1, lambda1 = math.radians(lat), math.radians(lon)
+    theta = math.radians(bearing)
+    sin_phi2 = (math.sin(phi1) * math.cos(angular)
+                + math.cos(phi1) * math.sin(angular) * math.cos(theta))
+    phi2 = math.asin(max(-1.0, min(1.0, sin_phi2)))
+    lambda2 = lambda1 + math.atan2(
+        math.sin(theta) * math.sin(angular) * math.cos(phi1),
+        math.cos(angular) - math.sin(phi1) * sin_phi2)
+    return math.degrees(phi2), (math.degrees(lambda2) + 540.0) % 360.0 - 180.0
+
+
+def duration_text(hours) -> str:
+    """Длительность словами: «40 мин», «14 ч», «1 д 6 ч»."""
+    if hours is None:
+        return "—"
+    hours = max(0.0, float(hours))
+    if hours < 1:
+        return f"{round(hours * 60)} мин"
+    if hours < 24:
+        return f"{round(hours)} ч"
+    days, rest = divmod(round(hours), 24)
+    return f"{days} д" + (f" {rest} ч" if rest else "")
+
+
+def moment_text(moment: datetime | None) -> str:
+    return f"{moment:%d.%m %H:%M}" if moment else "—"
+
+
+def normalize_destination(text) -> set[str]:
+    cleaned = re.sub(r"[^0-9A-ZА-ЯЁ]+", " ", str(text or "").upper())
+    return {token for token in cleaned.split() if token}
+
+
+# Алиасы портов: в AIS пишут и старое имя, и код UN/LOCODE.
+PORT_ALIASES = {
+    "IZMAIL": {"UAIZM"},
+    "RENI": {"UARNI"},
+    "KILIYA": {"UAKIL"},
+    "VYLKOVE": {"UAVYL"},
+    "ZATOKA": {"BILHOROD", "DNISTROVSKYI", "BILHOROD-DNISTROVSKYI"},
+    "CHORNOMORSK": {"CHERNOMORSK", "ILICHEVSK", "CHORNOMORSK PORT"},
+    "ODESSA": {"ODESA", "ODESSA UA"},
+    "YUZHNY": {"PIVDENNYI", "YUZHNE", "PIVDENNY"},
+    "OCHAKIV": {"OCHAKOV"},
+    "MYKOLAIV": {"NIKOLAEV", "MYKOLAIV PORT"},
+}
 
 
 class Data:
-    """Читает базу Ship Tracker и отдаёт готовые данные для телефона."""
+    """Читает базу Ship Tracker и считает всё, что есть в настольной версии."""
 
     def __init__(self):
         self.database = find_database()
         self.config = find_config(self.database)
         self.ports = [port for port in (self.config.get("ports") or [])
                       if isinstance(port, dict) and port.get("lat") and port.get("lon")]
+        for port in self.ports:
+            port.setdefault("radius_km", 6.0)
         self.pinned = {str(item) for item in (self.config.get("pinned_mmsis") or [])}
         self.db_updated = None
         self._cache = None
         self._cache_at = 0.0
+        self._memo: dict[str, tuple[float, dict]] = {}
         self._lock = threading.Lock()
 
     def connect(self):
@@ -147,6 +188,19 @@ class Data:
         con.row_factory = sqlite3.Row
         return con
 
+    def memo(self, name: str, ttl: float, builder):
+        """Кэш тяжёлых расчётов: прогноз и «в море» считаются не каждый раз."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._memo.get(name)
+            if cached and now - cached[0] < ttl:
+                return cached[1]
+        value = builder()
+        with self._lock:
+            self._memo[name] = (now, value)
+        return value
+
+    # ------------------------------------------------------------ суда
     def query(self) -> list[dict]:
         with self._lock:
             if self._cache is not None and time.monotonic() - self._cache_at < 2.0:
@@ -159,8 +213,6 @@ class Data:
                     "SELECT mmsi, name, imo, callsign, type_label, destination, draft, "
                     "length_m, beam_m, eta_declared, lat, lon, sog, cog, heading, port, "
                     "position_at, updated_at FROM vessels").fetchall()
-                # updated_at меняется при каждом сохранении — по нему видно,
-                # обновляет ли базу компьютер прямо сейчас
                 self.db_updated = con.execute(
                     "SELECT MAX(updated_at) FROM vessels").fetchone()[0]
                 con.close()
@@ -198,6 +250,23 @@ class Data:
             self._cache_at = time.monotonic()
         return ships
 
+    def port_stats(self, ships=None) -> list[dict]:
+        """Порты с количеством судов: всего, свежих, под ходом."""
+        ships = self.query() if ships is None else ships
+        result = []
+        for port in self.ports:
+            name = str(port.get("name") or "")
+            near = [ship for ship in ships
+                    if str(ship.get("near_port") or "").lower() == name.lower()]
+            fresh = [ship for ship in near
+                     if ship["age_minutes"] is not None and ship["age_minutes"] <= 180]
+            moving = [ship for ship in near if (ship.get("sog") or 0) >= 0.5]
+            result.append({"name": name, "label": port.get("label") or name,
+                           "total": len(near), "fresh": len(fresh),
+                           "moving": len(moving), "lat": port.get("lat"),
+                           "lon": port.get("lon")})
+        return result
+
     def payload(self, query: str = "", limit: int = 300, only_pinned: bool = False,
                 port: str = "") -> dict:
         ships = self.query()
@@ -231,22 +300,353 @@ class Data:
             "ships": ships[:max(1, min(limit, 2000))],
         }
 
-    def port_stats(self, ships=None) -> list[dict]:
-        """Порты с количеством судов: всего, свежих, под ходом."""
-        ships = self.query() if ships is None else ships
-        result = []
+    # -------------------------------------------------- порты и треки
+    def port_at(self, lat, lon):
         for port in self.ports:
-            name = str(port.get("name") or "")
-            near = [ship for ship in ships
-                    if str(ship.get("near_port") or "").lower() == name.lower()]
-            fresh = [ship for ship in near
-                     if ship["age_minutes"] is not None and ship["age_minutes"] <= 180]
-            moving = [ship for ship in near
-                      if (ship.get("sog") or 0) >= 0.5]
-            result.append({"name": name, "total": len(near), "fresh": len(fresh),
-                           "moving": len(moving), "lat": port.get("lat"),
-                           "lon": port.get("lon")})
+            try:
+                km = haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            except (TypeError, ValueError):
+                continue
+            if km <= float(port.get("radius_km") or 6.0):
+                return port
+        return None
+
+    def destination_port(self, vessel):
+        """Порт из поля Destination: имя, подпись или известный алиас."""
+        tokens = normalize_destination(vessel.get("destination"))
+        if not tokens:
+            return None
+        for port in self.ports:
+            variants = set()
+            for source in (port.get("name"), port.get("label")):
+                variants |= normalize_destination(source)
+            variants |= PORT_ALIASES.get(str(port.get("name") or "").upper(), set())
+            if variants & tokens:
+                return port
+        return None
+
+    def tracks_map(self, hours=24.0) -> dict:
+        """Все треки за сутки одним запросом: иначе прогноз считался бы минутами."""
+        if not self.database:
+            return {}
+        since = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+        result: dict[str, list] = {}
+        try:
+            con = self.connect()
+            rows = con.execute(
+                "SELECT mmsi, ts, lat, lon, sog, cog FROM positions "
+                "WHERE ts >= ? ORDER BY mmsi, ts", (since,)).fetchall()
+            con.close()
+        except sqlite3.Error:
+            return {}
+        for row in rows:
+            result.setdefault(str(row["mmsi"]), []).append(dict(row))
         return result
+
+    def track(self, mmsi, hours=24.0) -> list[dict]:
+        if not self.database:
+            return []
+        since = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+        try:
+            con = self.connect()
+            rows = [dict(row) for row in con.execute(
+                "SELECT ts, lat, lon, sog, cog FROM positions "
+                "WHERE mmsi = ? AND ts >= ? ORDER BY ts", (str(mmsi), since)).fetchall()]
+            con.close()
+            return rows
+        except sqlite3.Error:
+            return []
+
+    def estimates(self, vessel, track=None):
+        """Ход и курс: из AIS, а если молчит — по треку (как в forecast.py)."""
+        speed = None
+        try:
+            speed = float(vessel.get("sog") or 0)
+        except (TypeError, ValueError):
+            speed = None
+        course = vessel.get("cog")
+        if course is None:
+            course = vessel.get("heading")
+        try:
+            course = float(course) if course is not None else None
+        except (TypeError, ValueError):
+            course = None
+        if course is not None and not (0 < course < 360):
+            course = None
+        points = [p for p in (track or []) if p.get("lat") is not None]
+        speeds = []
+        for point in points[-6:]:
+            try:
+                value = float(point.get("sog") or 0)
+            except (TypeError, ValueError):
+                continue
+            if MIN_SPEED_KNOTS <= value <= 40:
+                speeds.append(value)
+        source = "AIS"
+        if len(speeds) >= 3:
+            speeds.sort()
+            speed = speeds[len(speeds) // 2]
+            source = "средняя по треку"
+        if course is None and len(points) >= 2:
+            first, last = points[-2], points[-1]
+            course = bearing_deg(float(first["lat"]), float(first["lon"]),
+                                 float(last["lat"]), float(last["lon"]))
+            source += ", курс по треку"
+        if speed is None or not (MIN_SPEED_KNOTS <= float(speed) <= 40):
+            derived = []
+            stamped = [p for p in points if p.get("ts")][-8:]
+            for first, second in zip(stamped, stamped[1:]):
+                try:
+                    t1 = parse_moment(first["ts"])
+                    t2 = parse_moment(second["ts"])
+                    km = haversine_km(float(first["lat"]), float(first["lon"]),
+                                      float(second["lat"]), float(second["lon"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+                hours = (t2 - t1).total_seconds() / 3600.0 if t1 and t2 else 0
+                if hours <= 0 or km <= 0:
+                    continue
+                knots = km / hours / KNOT_KMH
+                if MIN_SPEED_KNOTS <= knots <= 40:
+                    derived.append(knots)
+            if len(derived) >= 2:
+                derived.sort()
+                speed = derived[len(derived) // 2]
+                source = f"по треку ({len(derived)} отрезков)"
+            else:
+                speed = None
+                source = "хода нет в AIS"
+        return speed, course, source
+
+    def stay_hours(self) -> dict:
+        """Медиана стоянки по порту — из наших визитов (для прогноза)."""
+        result = {}
+        if not self.database:
+            return result
+        try:
+            con = self.connect()
+            rows = con.execute(
+                "SELECT port, entered_at, left_at FROM port_visits "
+                "WHERE left_at IS NOT NULL").fetchall()
+            con.close()
+        except sqlite3.Error:
+            return result
+        buckets = {}
+        for port, entered, left in rows:
+            start, end = parse_moment(entered), parse_moment(left)
+            if not start or not end or end <= start:
+                continue
+            buckets.setdefault(str(port), []).append((end - start).total_seconds() / 3600)
+        for port, values in buckets.items():
+            values.sort()
+            result[port] = round(values[len(values) // 2], 1)
+        return result
+
+    # ------------------------------------------------------- «в море»
+    def sea(self) -> dict:
+        ships = self.query()
+        fresh_hours = float(self.config.get("sea_fresh_hours") or 12)
+        rows = []
+        for ship in ships:
+            if ship.get("lat") is None or ship.get("lon") is None:
+                continue
+            port = self.destination_port(ship)
+            if self.port_at(ship["lat"], ship["lon"]):
+                continue
+            distance = None
+            for candidate in self.ports:
+                km = haversine_km(ship["lat"], ship["lon"],
+                                  float(candidate["lat"]), float(candidate["lon"]))
+                if distance is None or km < distance:
+                    distance = km
+            ours = port is not None
+            age = ship.get("age_minutes")
+            if not ours and (age is None or age / 60.0 > fresh_hours):
+                continue
+            if ours and (age is None or age / 60.0 > MAX_VIEW_AGE_HOURS * 2):
+                continue
+            if distance is not None and distance > 120 and not ours:
+                continue
+            speed = ship.get("sog") or 0
+            eta_hours = None
+            if distance and speed >= MIN_SPEED_KNOTS:
+                eta_hours = round(distance / (float(speed) * KNOT_KMH), 1)
+            row = dict(ship)
+            row["port"] = str((port or {}).get("name") or ship.get("near_port") or "")
+            row["distance_text"] = f"{distance:.0f} км" if distance is not None else "—"
+            row["eta_hours"] = eta_hours
+            row["eta_text"] = ("прибытие " + moment_text(datetime.now() + timedelta(hours=eta_hours))
+                               if eta_hours else "ход не подтверждён")
+            if port:
+                row["port"] = str(port.get("name"))
+            rows.append(row)
+        rows.sort(key=lambda r: (r["eta_hours"] is None, r["eta_hours"] or 10 ** 6))
+        return {
+            "rows": rows[:300],
+            "ports": [str(port.get("name")) for port in self.ports],
+            "note": ("Суда, связанные с нашими портами: идут к нам (порт в назначении) "
+                     "или находятся рядом с портом. Стоящие в порту — во вкладке «Стоянки». "
+                     "Расстояние и прибытие — по прямой и текущему ходу."),
+        }
+
+    # ---------------------------------------------- прогноз 4 дня (план)
+    def forecast_plan(self) -> dict:
+        ships = self.query()
+        stay = self.stay_hours()
+        tracks = self.tracks_map(24)
+        rows = []
+        in_port = no_position = stale = 0
+        for ship in ships:
+            port = self.destination_port(ship)
+            if not port:
+                continue
+            age = ship.get("age_minutes")
+            if age is None or age / 60.0 > MAX_VIEW_AGE_HOURS:
+                stale += 1
+                continue
+            if self.port_at(ship["lat"], ship["lon"]):
+                in_port += 1
+                continue
+            try:
+                distance = haversine_km(ship["lat"], ship["lon"],
+                                        float(port["lat"]), float(port["lon"]))
+            except (TypeError, ValueError):
+                no_position += 1
+                continue
+            track = tracks.get(ship["mmsi"], [])
+            speed, course, source = self.estimates(ship, track)
+            moving = speed is not None and MIN_SPEED_KNOTS <= speed <= 40
+            travel = (distance / (float(speed) * KNOT_KMH)) if moving else None
+            stay_hours = stay.get(str(port.get("name")))
+            total = None
+            if travel is not None:
+                total = travel + (stay_hours or DEFAULT_STAY_HOURS)
+            departure = (datetime.now() + timedelta(hours=total)) if total else None
+            row = {
+                "mmsi": ship["mmsi"], "name": ship.get("name") or ship["mmsi"],
+                "port": str(port.get("name")), "destination": ship.get("destination") or "",
+                "route": f"{ship.get('destination') or '—'} → {port.get('name')}",
+                "speed_text": (f"{float(speed):.1f} уз" if moving else "стоит"),
+                "distance_text": f"{distance:.0f} км",
+                "travel_text": duration_text(travel) if travel is not None else "—",
+                "stay_text": (duration_text(stay_hours) if stay_hours else "≈ " + duration_text(DEFAULT_STAY_HOURS)),
+                "total_text": duration_text(total) if total else "—",
+                "departure_text": moment_text(departure),
+                "age_minutes": age,
+            }
+            rows.append(row)
+        rows.sort(key=lambda r: (r["total_text"] == "—", r["total_text"]))
+        return {
+            "rows": rows,
+            "note": ("Только суда, идущие с моря в наши порты. «В пути» — по прямой и "
+                     "текущему ходу, «стоянка» — медиана наших визитов в этот порт (иначе "
+                     "≈ сутки), «всего до выхода» — путь плюс стоянка. Стоящие в порту "
+                     f"считаются в «Стоянках» — здесь их нет ({in_port}). "
+                     f"Скрыто устаревших: {stale}, без позиции: {no_position}."),
+        }
+
+    # ------------------------------------- прогноз всех судов (4 суток)
+    def forecast_all(self) -> dict:
+        ships = self.query()
+        boxes = self.config.get("bounding_boxes") or [[[40.5, 26.0], [47.5, 42.0]]]
+        south = min(float(box[0][0]) for box in boxes)
+        west = min(float(box[0][1]) for box in boxes)
+        north = max(float(box[1][0]) for box in boxes)
+        east = max(float(box[1][1]) for box in boxes)
+        ports = self.ports
+        tracks = self.tracks_map(24)
+        rows = []
+        for ship in ships:
+            lat, lon = ship["lat"], ship["lon"]
+            if not (south <= lat <= north and west <= lon <= east):
+                continue
+            age = ship.get("age_minutes")
+            if age is None or age / 60.0 > MAX_VIEW_AGE_HOURS:
+                continue
+            guessed = False
+            port = self.destination_port(ship)
+            track = tracks.get(ship["mmsi"], [])
+            if not port:
+                speed, course, source = self.estimates(ship, track)
+                guess = None
+                if course is not None and speed:
+                    reach = float(speed) * KNOT_KMH * 96.0
+                    for candidate in ports:
+                        km = haversine_km(lat, lon, float(candidate["lat"]), float(candidate["lon"]))
+                        if km > min(GUESS_MAX_KM, reach) or km < 0.5:
+                            continue
+                        offset = abs(((bearing_deg(lat, lon, float(candidate["lat"]),
+                                                   float(candidate["lon"])) - course
+                                       + 540.0) % 360.0) - 180.0)
+                        if offset > GUESS_MAX_OFFSET:
+                            continue
+                        if guess is None or offset < guess[0]:
+                            guess = (offset, candidate)
+                port = guess[1] if guess else None
+                guessed = bool(port)
+            if not port:
+                continue
+            speed, course, source = self.estimates(ship, track)
+            distance = haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            moving = speed is not None and MIN_SPEED_KNOTS <= speed <= 40
+            hours = distance / (float(speed) * KNOT_KMH) if moving and distance else None
+            row = {
+                "mmsi": ship["mmsi"], "name": ship.get("name") or ship["mmsi"],
+                "type_label": ship.get("type_label") or "", "port": str(port.get("name")),
+                "guessed": guessed, "destination": ship.get("destination") or "",
+                "speed_text": (f"{float(speed):.1f} уз" if moving else "стоит"),
+                "distance_text": f"{distance:.0f} км",
+                "eta_text": ("через " + duration_text(hours) + " · "
+                             + moment_text(datetime.now() + timedelta(hours=hours))
+                             if hours else "—"),
+                "day1": self.position_after(lat, lon, port, speed, 24.0, distance),
+                "day2": self.position_after(lat, lon, port, speed, 48.0, distance),
+                "day4": self.position_after(lat, lon, port, speed, 96.0, distance),
+                "age_minutes": age,
+            }
+            rows.append(row)
+        rows.sort(key=lambda r: (r["eta_text"] == "—", r["name"].lower()))
+        return {
+            "rows": rows[:300],
+            "note": ("Все суда в рабочем районе, идущие в наши порты: порт из назначения, "
+                     "а если поле пустое — по линии курса с проверкой, что судно успевает "
+                     "дойти. «Через день / 2 дня / 4 дня» — где судно будет на этот срок."),
+        }
+
+    def position_after(self, lat, lon, port, speed, hours, distance):
+        """Где судно окажется через N часов пути в наш порт."""
+        if not speed or speed < MIN_SPEED_KNOTS:
+            return "стоит"
+        reach = float(speed) * KNOT_KMH * hours
+        if distance <= reach:
+            moment = datetime.now() + timedelta(hours=distance / (float(speed) * KNOT_KMH))
+            return f"в порту с {moment:%d.%m %H:%M}"
+        new_lat, new_lon = move_point(lat, lon,
+                                      bearing_deg(lat, lon, float(port["lat"]),
+                                                  float(port["lon"])), reach)
+        return f"{new_lat:.2f}, {new_lon:.2f}"
+
+    # ------------------------------------------------------- стоянки
+    def visits(self, limit: int = 80) -> list[dict]:
+        rows = []
+        try:
+            con = self.connect()
+            rows = [dict(row) for row in con.execute(
+                "SELECT v.mmsi, v.port, v.entered_at, v.left_at, v.source, "
+                "COALESCE(u.name, '') AS name "
+                "FROM port_visits v LEFT JOIN vessels u ON u.mmsi = v.mmsi "
+                "ORDER BY v.entered_at DESC LIMIT ?", (max(1, min(limit, 400)),)).fetchall()]
+            con.close()
+        except sqlite3.Error:
+            pass
+        now = datetime.now()
+        for row in rows:
+            entered = parse_moment(row.get("entered_at"))
+            left = parse_moment(row.get("left_at"))
+            row["hours"] = (round(((left or now) - entered).total_seconds() / 3600, 1)
+                            if entered else None)
+            row["open"] = not row.get("left_at")
+        return rows
 
     def vessel(self, mmsi) -> dict:
         """Судно целиком: паспорт, позиция, последние точки и стоянки."""
@@ -271,443 +671,79 @@ class Data:
             pass
         return dict(ship, history=history, visits=visits)
 
-    def visits(self, limit: int = 80) -> list[dict]:
-        rows = []
+    # ---------------------------------------------------- подключения
+    def connections(self) -> dict:
+        """Состояние каналов по настройкам варианта run.bat.
+
+        Ключи живут в `ship_tracker/data/config.json`; если этой копии рядом
+        нет, показываем настройки той копии, из которой читается база.
+        """
+        config = self.config
+        run_config = app_dir().parent / "ship_tracker" / "data" / "config.json"
         try:
-            con = self.connect()
-            rows = [dict(row) for row in con.execute(
-                "SELECT v.mmsi, v.port, v.entered_at, v.left_at, v.source, "
-                "COALESCE(u.name, '') AS name "
-                "FROM port_visits v LEFT JOIN vessels u ON u.mmsi = v.mmsi "
-                "ORDER BY v.entered_at DESC LIMIT ?", (max(1, min(limit, 300)),)).fetchall()]
-            con.close()
-        except sqlite3.Error:
+            loaded = json.loads(run_config.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                config = loaded
+        except (OSError, ValueError):
             pass
-        now = datetime.now()
-        for row in rows:
-            entered = parse_moment(row.get("entered_at"))
-            left = parse_moment(row.get("left_at"))
-            row["hours"] = (round(((left or now) - entered).total_seconds() / 3600, 1)
-                            if entered else None)
-            row["open"] = not row.get("left_at")
-        return rows
 
-    def expected(self) -> dict:
-        """Ожидаемые прибытия AIS-catcher (файл expected.json рядом с базой)."""
-        cache = {}
-        if self.database:
-            try:
-                cache = json.loads((self.database.parent / "expected.json")
-                                   .read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                cache = {}
+        def has(key):
+            return bool(str(config.get(key) or "").strip())
+
         rows = []
-        for locode, entry in (cache.get("ports") or {}).items():
-            if not isinstance(entry, dict):
-                continue
-            for vessel in entry.get("vessels") or []:
-                if not isinstance(vessel, dict):
-                    continue
-                heard = heard_hours(vessel.get("last_heard"))
-                eta_left = eta_hours_left(vessel.get("eta"))
-                stale = ((heard is not None and heard > 6)
-                         or (eta_left is not None and eta_left < -12))
-                rows.append({
-                    "port": entry.get("name") or locode,
-                    "locode": locode,
-                    "mmsi": str(vessel.get("mmsi") or ""),
-                    "name": vessel.get("name") or "",
-                    "from": vessel.get("from") or vessel.get("origin") or "",
-                    "eta": vessel.get("eta") or "",
-                    "last_heard": vessel.get("last_heard") or "",
-                    "heard_hours": heard,
-                    "eta_hours": eta_left,
-                    "stale": stale,
-                })
-        rows.sort(key=lambda row: (row["stale"], row["eta"] or ""))
-        return {"updated": cache.get("updated") or "",
-                "stale": bool(cache.get("stale")), "rows": rows}
 
+        def add(title, enabled, key=None, detail=""):
+            keyed = key is None or has(key)
+            if not enabled:
+                state, text = "off", "выключено"
+            elif keyed:
+                state, text = "on", "ключ есть" if key else "включено"
+            else:
+                state, text = "warn", "нужен ключ"
+            rows.append({"title": title, "detail": detail, "state": state,
+                         "state_text": text})
 
-PAGE = """<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
-<meta name="theme-color" content="#0b1622">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Ship Tracker</title>
-<link rel="manifest" href="/manifest.webmanifest">
-<style>
-:root { color-scheme: dark; --bg: #0b1622; --card: #10202e; --line: #1d3144;
-  --text: #e8f1fa; --dim: #7d95ad; --accent: #4aa8ff; }
-* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
-body { font: 16px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
-  padding-bottom: calc(66px + env(safe-area-inset-bottom)); }
-header { position: sticky; top: 0; z-index: 8; background: rgba(11,22,34,.96);
-  backdrop-filter: blur(8px); padding: calc(8px + env(safe-area-inset-top)) 12px 8px; }
-h1 { font-size: 18px; margin: 0 0 2px; font-weight: 650; }
-.sub { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: #34c759; }
-.dot.stale { background: #ff9f0a; } .dot.off { background: #ff453a; }
-main { padding: 0 12px; }
-input[type=search] { width: 100%; padding: 12px 14px; font-size: 16px; border-radius: 14px;
-  border: 1px solid var(--line); background: #12222f; color: var(--text); outline: none; margin-top: 8px; }
-input[type=search]::placeholder { color: #6d8299; }
-.chips { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0 4px; scrollbar-width: none; }
-.chips::-webkit-scrollbar { display: none; }
-.chip { flex: 0 0 auto; padding: 7px 13px; border-radius: 999px; border: 1px solid var(--line);
-  background: #0f1e2b; color: #a9c2d8; font-size: 13px; }
-.chip.on { background: #1e4f7a; border-color: #2f6c9e; color: #fff; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
-  padding: 12px 14px; margin-bottom: 9px; }
-.card.pinned { border-color: #3f7fae; }
-.row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
-.name { font-size: 16px; font-weight: 650; }
-.star { color: #ffd166; margin-left: 4px; }
-.small { font-size: 11px; color: #6f879e; }
-.sog { font-size: 15px; font-weight: 600; color: #9fd0ff; white-space: nowrap; }
-.meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
-.tag { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #162a3b; color: #a9c2d8; }
-.tag.warn { background: #3a2a12; color: #ffcf7d; }
-.tag.bad { background: #3a1a1a; color: #ff9c94; }
-.tag.ok { background: #12301f; color: #8ee0ab; }
-.hint { font-size: 12px; color: var(--dim); margin: 6px 2px 10px; }
-.empty { text-align: center; color: var(--dim); padding: 40px 10px; font-size: 14px; }
-nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 9; display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  background: rgba(13,26,38,.98); border-top: 1px solid var(--line);
-  padding: 6px 4px calc(6px + env(safe-area-inset-bottom)); }
-nav button { min-width: 0; background: none; border: 0; color: #7d95ad;
-  font-size: 10px; display: flex; flex-direction: column; align-items: center; gap: 2px;
-  padding: 4px 0; white-space: nowrap; }
-nav button.on { color: var(--accent); }
-nav svg { width: 22px; height: 22px; }
-.sheet { position: fixed; inset: 0; z-index: 20; display: none; }
-.sheet.open { display: block; }
-.sheet .backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.55); }
-.sheet .panel { position: absolute; left: 0; right: 0; bottom: 0; max-height: 88%;
-  overflow-y: auto; background: #0e1c29; border-radius: 18px 18px 0 0;
-  padding: 14px 14px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }
-.sheet .handle { width: 42px; height: 4px; border-radius: 2px; background: #2b4256;
-  margin: 0 auto 10px; }
-.kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 8px; font-size: 14px; margin-top: 10px; }
-.kv dt { color: var(--dim); } .kv dd { margin: 0; }
-canvas { width: 100%; display: block; border-radius: 16px; background: #0a1a27; }
-#map { height: calc(100vh - 300px); min-height: 280px; max-height: 640px; }
-.portRow { display: flex; justify-content: space-between; align-items: center; }
-a { color: #7cc4ff; }
-</style>
-</head>
-<body>
-<header>
-  <h1>Ship Tracker</h1>
-  <div class="sub"><span class="dot" id="dot"></span><span id="status">подключаюсь…</span></div>
-  <input id="search" type="search" placeholder="Поиск: имя, назначение, MMSI" autocomplete="off">
-</header>
-<main id="view"></main>
-<nav>
-  <button data-tab="map" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 3 3 5v16l6-2 6 2 6-2V3l-6 2-6-2Z"/><path d="M9 3v16M15 5v16"/></svg>Карта</button>
-  <button data-tab="ships"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17h18M5 17V9l7-5 7 5v8"/><path d="M9 17v-4h6v4"/></svg>Суда</button>
-  <button data-tab="ports"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>Порты</button>
-  <button data-tab="expected"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Ожид.</button>
-  <button data-tab="visits"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Стоянки</button>
-</nav>
-<div class="sheet" id="sheet"><div class="backdrop" data-close></div>
-  <div class="panel"><div class="handle"></div><div id="sheetBody"></div></div>
-</div>
-<script>
-const view = document.getElementById('view');
-const statusEl = document.getElementById('status');
-const dot = document.getElementById('dot');
-const search = document.getElementById('search');
-const sheet = document.getElementById('sheet');
-const sheetBody = document.getElementById('sheetBody');
-let tab = 'map', data = null, portFilter = '', timer = null, mapShips = [];
+        add("AISStream — районный поток", bool(config.get("use_area_feed", True)),
+            "api_key", "живой поток wss://stream.aisstream.io")
+        add("AISStream — слежение по MMSI", bool(config.get("use_mmsi_watch", False)),
+            "api_key", "отдельные подписки на наши суда")
+        add("Open Waters — живой поток", bool(config.get("use_openwaters", True)),
+            "openwaters_token", "второй живой поток AIS")
+        add("Open Waters — снимок района", bool(config.get("use_snapshot", True)),
+            None, "позиции судов вокруг портов, ключ не нужен")
+        add("GFW — история заходов", bool(config.get("use_gfw", False)),
+            "gfw_key", "порт-заходы и паспорта судов")
+        add("VesselFinder", bool(config.get("use_vf", False)), "vf_key", "")
+        add("VesselFinder AIS", bool(config.get("use_vfa", False)), "vfa_key", "")
+        add("MarineTraffic", bool(config.get("use_mt", False)), "mt_key", "")
+        add("MyShipTracking", bool(config.get("use_mst", False)), "mst_key", "")
+        add("AIS-catcher", bool(config.get("use_aci", True)), None,
+            "ожидаемые прибытия по портам")
+        add("Goradar", bool(config.get("use_gor", True)), None, "")
+        add("MarineTraffic.live", bool(config.get("use_mlive", True)), None, "")
+        add("Ship Radar", bool(config.get("use_srd", True)), None, "")
+        add("ShipFinder", bool(config.get("use_sfp", True)), None, "")
+        add("Telegram-бот", has("telegram_token"), "telegram_token", "")
 
-const esc = v => String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
-function ago(m) {
-  if (m === null || m === undefined) return 'нет данных';
-  if (m < 2) return 'только что';
-  if (m < 60) return m + ' мин назад';
-  const h = Math.round(m / 60);
-  if (h < 24) return h + ' ч назад';
-  return Math.round(h / 24) + ' дн назад';
-}
-const etaText = v => v ? String(v).slice(0, 16).replace('T', ' ') : '';
-const fmtCoord = v => Number(v).toFixed(5);
+        desktop_version = "—"
+        source = app_dir().parent / "ship_tracker" / "ship_tracker.py"
+        try:
+            match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"',
+                              source.read_text(encoding="utf-8"))
+            if match:
+                desktop_version = match.group(1)
+        except OSError:
+            pass
+        return {
+            "rows": rows,
+            "version": APP_VERSION,
+            "desktop_version": desktop_version,
+            "database": str(self.database or ""),
+            "note": ("Ключи и подключения задаются в варианте Ship Tracker, который "
+                     "запускается через run.bat (папка ship_tracker). Здесь видно "
+                     "только состояние этой копии: что включено и есть ли ключ."),
+        }
 
-async function load() {
-  try {
-    const r = await fetch('/api/ships?limit=2000', {cache: 'no-store'});
-    data = await r.json();
-    const age = data.db_age_minutes;
-    dot.className = 'dot' + (age === null || age > 15 ? ' off' : age > 5 ? ' stale' : '');
-    statusEl.textContent = (age === null ? 'база не обновляется' : 'база обновлена ' + ago(age))
-      + ' · судов ' + data.total;
-    render();
-  } catch (e) {
-    dot.className = 'dot off';
-    statusEl.textContent = 'нет связи с компьютером';
-    view.innerHTML = '<div class="empty">Нет связи.<br>Проверьте, что Ship Tracker запущен на компьютере,<br>и телефон в той же Wi-Fi сети.</div>';
-  }
-}
-
-function shipCard(s) {
-  const stale = s.age_minutes !== null && s.age_minutes > 180;
-  const tags = [];
-  if (s.destination) tags.push(`<span class="tag">→ ${esc(s.destination)}</span>`);
-  if (s.near_port) tags.push(`<span class="tag ok">${esc(s.near_port)}</span>`);
-  if (s.type_label) tags.push(`<span class="tag">${esc(s.type_label)}</span>`);
-  tags.push(`<span class="tag ${stale ? 'bad' : ''}">${ago(s.age_minutes)}</span>`);
-      const sog = s.sog == null ? '—' : Number(s.sog).toFixed(1);
-  return `<article class="card ${s.pinned ? 'pinned' : ''}" data-mmsi="${esc(s.mmsi)}">
-    <div class="row"><div><div class="name">${esc(s.name || 'Без имени')}${s.pinned ? '<span class="star">★</span>' : ''}</div>
-    <div class="small">MMSI ${esc(s.mmsi)}${s.imo ? ' · IMO ' + esc(s.imo) : ''}</div></div>
-    <div class="sog">${sog} уз</div></div>
-    <div class="meta">${tags.join('')}</div></article>`;
-}
-
-function renderMap() {
-  const ports = data.ports.filter(p => p.lat && p.lon);
-  const ships = data.ships.filter(s => s.age_minutes !== null && s.age_minutes <= 720);
-  mapShips = ships;
-  view.innerHTML = `<div class="hint">Порты и суда за последние 12 часов. Нажмите на точку.</div>
-    <canvas id="map" height="520"></canvas>
-    <div class="meta" style="margin:10px 2px">
-      <span class="tag ok">● у порта</span><span class="tag">● в море</span>
-      <span class="tag bad">● сигнал старше 3 ч</span></div>`;
-  const canvas = document.getElementById('map');
-  drawMap(canvas, ports, ships);
-  window.addEventListener('resize', () => drawMap(canvas, ports, ships), {once: true});
-  canvas.addEventListener('click', ev => pickShip(canvas, ev));
-}
-
-function mapProjection(canvas, ports, ships) {
-  const pts = ports.map(p => [Number(p.lat), Number(p.lon)])
-    .concat(ships.map(s => [s.lat, s.lon]));
-  let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
-  pts.forEach(([la, lo]) => { minLat = Math.min(minLat, la); maxLat = Math.max(maxLat, la);
-    minLon = Math.min(minLon, lo); maxLon = Math.max(maxLon, lo); });
-  const padLat = Math.max(0.25, (maxLat - minLat) * 0.12);
-  const padLon = Math.max(0.25, (maxLon - minLon) * 0.12);
-  minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
-  const w = canvas.width, h = canvas.height;
-  return ([la, lo]) => [ (lo - minLon) / (maxLon - minLon) * w,
-                         h - (la - minLat) / (maxLat - minLat) * h ];
-}
-function drawMap(canvas, ports, ships) {
-  const dpr = window.devicePixelRatio || 1;
-  const width = canvas.clientWidth || 360;
-  const height = Math.max(260, Math.round(canvas.clientHeight || 340));
-  canvas.width = width * dpr;
-  canvas.height = height * dpr;
-  const g = canvas.getContext('2d');
-  g.scale(dpr, dpr);
-  g.clearRect(0, 0, width, height);
-  const project = mapProjection({width, height}, ports, ships);
-  g.strokeStyle = 'rgba(70,110,145,.18)';
-  for (let i = 0; i <= 6; i++) {
-    g.beginPath(); g.moveTo(0, i * height / 6); g.lineTo(width, i * height / 6); g.stroke();
-    g.beginPath(); g.moveTo(i * width / 6, 0); g.lineTo(i * width / 6, height); g.stroke();
-  }
-  ships.forEach(s => {
-    const [x, y] = project([s.lat, s.lon]);
-    const near = !!s.near_port;
-    g.beginPath(); g.arc(x, y, near ? 4 : 3, 0, Math.PI * 2);
-    g.fillStyle = (s.age_minutes ?? 999) > 180 ? '#ff9c94' : near ? '#8ee0ab' : '#7cc4ff';
-    g.globalAlpha = 0.85; g.fill(); g.globalAlpha = 1;
-  });
-  const boxes = [];
-  const labels = ports.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
-  // сначала все отметки портов, потом подписи: иначе маркер соседа ложится на текст
-  ports.forEach(p => {
-    const [x, y] = project([Number(p.lat), Number(p.lon)]);
-    g.fillStyle = '#ffd166';
-    g.fillRect(x - 3, y - 3, 6, 6);
-  });
-  labels.forEach(p => {
-    const [x, y] = project([Number(p.lat), Number(p.lon)]);
-    g.font = '600 10px -apple-system, Segoe UI, sans-serif';
-    const text = p.name;
-    const w = g.measureText(text).width;
-    const tries = [[7, 4], [7, -12], [7, 20], [7, -28], [7, 36]];
-    for (const [dx, dy] of tries) {
-      const left = x + dx - 2, top = y + dy - 10;
-      const box = [left, top, left + w + 5, top + 14];
-      if (box[0] < 0 || box[2] > width) continue;
-      const clash = boxes.some(b => !(box[2] < b[0] || box[0] > b[2] || box[3] < b[1] || box[1] > b[3]));
-      if (clash) continue;
-      boxes.push(box);
-      g.fillStyle = 'rgba(11,22,34,.82)';
-      g.fillRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
-      g.fillStyle = '#e8f1fa';
-      g.fillText(text, x + dx, y + dy);
-      break;
-    }
-  });
-  canvas._project = project;
-}
-function pickShip(canvas, ev) {
-  const rect = canvas.getBoundingClientRect();
-  const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
-  let best = null, bestD = 22;
-  mapShips.forEach(s => {
-    const [sx, sy] = canvas._project([s.lat, s.lon]);
-    const d = Math.hypot(sx - x, sy - y);
-    if (d < bestD) { best = s; bestD = d; }
-  });
-  if (best) openVessel(best.mmsi);
-}
-
-function renderShips() {
-  let ships = data.ships;
-  if (portFilter) ships = ships.filter(s => (s.near_port || s.port || '').toLowerCase() === portFilter.toLowerCase());
-  const q = search.value.trim().toLowerCase();
-  if (q) ships = ships.filter(s => (s.name || '').toLowerCase().includes(q)
-    || (s.destination || '').toLowerCase().includes(q) || s.mmsi === q);
-  view.innerHTML = (portFilter ? `<div class="hint">Порт: <b>${esc(portFilter)}</b> · <a href="#" id="clearPort">показать все</a></div>` : '')
-    + (ships.length ? ships.slice(0, 400).map(shipCard).join('') : '<div class="empty">Ничего не найдено</div>');
-  const clear = document.getElementById('clearPort');
-  if (clear) clear.addEventListener('click', e => { e.preventDefault(); portFilter = ''; render(); });
-}
-
-function renderPorts() {
-  view.innerHTML = data.ports.map(p => `<article class="card" data-port="${esc(p.name)}">
-    <div class="portRow"><div><div class="name">${esc(p.name)}</div>
-    <div class="small">${p.total} судов у порта · ${p.fresh} со свежим сигналом</div></div>
-    <div class="sog">${p.moving} в ходу</div></div></article>`).join('')
-    || '<div class="empty">Порты не настроены</div>';
-  view.querySelectorAll('[data-port]').forEach(el => el.addEventListener('click', () => {
-    portFilter = el.dataset.port; tab = 'ships'; setTab('ships');
-  }));
-}
-
-async function renderExpected() {
-  view.innerHTML = '<div class="empty">Загружаю…</div>';
-  try {
-    const r = await fetch('/api/expected', {cache: 'no-store'});
-    const exp = await r.json();
-    const rows = exp.rows || [];
-    if (!rows.length) { view.innerHTML = '<div class="empty">Ожидаемых прибытий нет</div>'; return; }
-    view.innerHTML = `<div class="hint">Обновлено: ${esc((exp.updated || '').slice(0, 16).replace('T', ' '))}. Устаревшие скрыты.</div>`
-      + rows.filter(r => !r.stale).map(r => `<article class="card">
-        <div class="row"><div><div class="name">${esc(r.name || r.mmsi)}</div>
-        <div class="small">${esc(r.from || '—')} → ${esc(r.port)}</div></div>
-        <div class="sog">${esc(r.eta || '—')}</div></div>
-        <div class="meta"><span class="tag">сигнал ${esc(r.last_heard || '—')}</span>
-        <span class="tag">MMSI ${esc(r.mmsi)}</span></div></article>`).join('')
-      || '<div class="empty">Все ожидания устарели</div>';
-  } catch (e) { view.innerHTML = '<div class="empty">Не удалось получить ожидаемые</div>'; }
-}
-
-async function renderVisits() {
-  view.innerHTML = '<div class="empty">Загружаю…</div>';
-  try {
-    const r = await fetch('/api/visits', {cache: 'no-store'});
-    const data2 = await r.json();
-    const rows = data2.rows || [];
-    view.innerHTML = rows.length ? rows.map(v => `<article class="card">
-      <div class="row"><div><div class="name">${esc(v.name || v.mmsi)}</div>
-      <div class="small">${esc(v.port)} · ${esc((v.entered_at || '').slice(0, 16).replace('T', ' '))}</div></div>
-      <div class="sog">${v.hours === null ? '—' : v.hours + ' ч'}</div></div>
-      <div class="meta"><span class="tag ${v.open ? 'ok' : ''}">${v.open ? 'стоит сейчас' : 'ушло'}</span>
-      <span class="tag">MMSI ${esc(v.mmsi)}</span></div></article>`).join('')
-      : '<div class="empty">Стоянок пока нет</div>';
-  } catch (e) { view.innerHTML = '<div class="empty">Не удалось получить стоянки</div>'; }
-}
-
-function render() {
-  if (!data) return;
-  if (tab === 'map') renderMap();
-  else if (tab === 'ships') renderShips();
-  else if (tab === 'ports') renderPorts();
-  else if (tab === 'expected') renderExpected();
-  else renderVisits();
-}
-
-function setTab(name) {
-  tab = name;
-  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
-  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
-  search.style.display = name === 'ships' ? 'block' : 'none';
-  render();
-}
-document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
-search.addEventListener('input', () => { if (tab === 'ships') renderShips(); });
-
-async function openVessel(mmsi) {
-  sheet.classList.add('open');
-  sheetBody.innerHTML = '<div class="empty">Загружаю…</div>';
-  try {
-    const r = await fetch('/api/vessel?mmsi=' + encodeURIComponent(mmsi), {cache: 'no-store'});
-    const v = await r.json();
-    if (!v.mmsi) { sheetBody.innerHTML = '<div class="empty">Судно не найдено</div>'; return; }
-    const coords = `${fmtCoord(v.lat)}, ${fmtCoord(v.lon)}`;
-    const mapUrl = `https://www.google.com/maps?q=${v.lat},${v.lon}`;
-    const hist = (v.history || []).slice().reverse();
-    const visits = (v.visits || []).map(p => `<div>${esc(p.port)} · ${esc((p.entered_at || '').slice(0, 16).replace('T', ' '))}${p.left_at ? ' → ' + esc((p.left_at || '').slice(0, 16).replace('T', ' ')) : ' · стоит'}</div>`).join('');
-    sheetBody.innerHTML = `
-      <div class="row"><div><div class="name" style="font-size:19px">${esc(v.name || 'Без имени')}</div>
-      <div class="small">MMSI ${esc(v.mmsi)}${v.imo ? ' · IMO ' + esc(v.imo) : ''}${v.callsign ? ' · ' + esc(v.callsign) : ''}</div></div>
-      <div class="sog">${v.sog == null ? '—' : Number(v.sog).toFixed(1)} уз</div></div>
-      <div class="meta">
-        ${v.destination ? `<span class="tag">→ ${esc(v.destination)}</span>` : ''}
-        ${v.near_port ? `<span class="tag ok">${esc(v.near_port)}</span>` : ''}
-        <span class="tag ${(v.age_minutes ?? 99) > 180 ? 'bad' : ''}">${ago(v.age_minutes)}</span>
-      </div>
-      <dl class="kv">
-        <dt>Координаты</dt><dd><a href="${mapUrl}" target="_blank" rel="noopener">${coords}</a></dd>
-        <dt>Курс / скорость</dt><dd>${v.cog ?? '—'}° · ${v.sog ?? '—'} уз</dd>
-        <dt>Назначение</dt><dd>${esc(v.destination || '—')}</dd>
-        <dt>ETA по AIS</dt><dd>${esc(etaText(v.eta_declared) || '—')}</dd>
-        <dt>Осадка</dt><dd>${v.draft ?? '—'} м</dd>
-        <dt>Размеры</dt><dd>${v.length_m ?? '—'} × ${v.beam_m ?? '—'} м</dd>
-        <dt>Тип</dt><dd>${esc(v.type_label || '—')}</dd>
-        <dt>До порта</dt><dd>${v.distance_km ?? '—'} км</dd>
-      </dl>
-      <div class="hint" style="margin-top:14px">История позиций (${hist.length})</div>
-      <canvas id="track" height="120"></canvas>
-      <div class="hint" style="margin-top:14px">Стоянки</div>
-      ${visits || '<div class="small">нет записей</div>'}`;
-    drawTrack(document.getElementById('track'), hist);
-  } catch (e) { sheetBody.innerHTML = '<div class="empty">Не удалось загрузить судно</div>'; }
-}
-function drawTrack(canvas, points) {
-  if (!canvas || points.length < 2) return;
-  const dpr = window.devicePixelRatio || 1, width = canvas.clientWidth || 320;
-  canvas.width = width * dpr; canvas.height = 110 * dpr;
-  canvas.style.height = '110px';
-  const g = canvas.getContext('2d'); g.scale(dpr, dpr);
-  const lat = points.map(p => p.lat), lon = points.map(p => p.lon);
-  const minLat = Math.min(...lat), maxLat = Math.max(...lat);
-  const minLon = Math.min(...lon), maxLon = Math.max(...lon);
-  const sx = v => 8 + (v - minLon) / (maxLon - minLon || 1) * (width - 16);
-  const sy = v => 100 - (v - minLat) / (maxLat - minLat || 1) * 88;
-  g.strokeStyle = '#4aa8ff'; g.lineWidth = 2; g.beginPath();
-  points.forEach((p, i) => i ? g.lineTo(sx(p.lon), sy(p.lat)) : g.moveTo(sx(p.lon), sy(p.lat)));
-  g.stroke();
-  const last = points[points.length - 1];
-  g.fillStyle = '#ffd166'; g.beginPath(); g.arc(sx(last.lon), sy(last.lat), 4, 0, 7); g.fill();
-}
-document.getElementById('sheet').addEventListener('click', e => {
-  if (e.target.dataset.close !== undefined) sheet.classList.remove('open');
-});
-view.addEventListener('click', e => {
-  const card = e.target.closest('[data-mmsi]');
-  if (card) { openVessel(card.dataset.mmsi); return; }
-});
-
-search.style.display = 'none';
-if (location.hash) setTab(location.hash.slice(1));
-load();
-timer = setInterval(load, 20000);
-</script>
-</body>
-</html>
-"""
 
 MANIFEST = {
     "name": "Ship Tracker",
@@ -720,8 +756,6 @@ MANIFEST = {
 
 
 class Server(ThreadingHTTPServer):
-    """Порт освобождается сразу после закрытия (SO_REUSEADDR)."""
-
     allow_reuse_address = True
     daemon_threads = True
 
@@ -755,8 +789,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
         if path == "/":
-            page = PAGE.replace("{{VERSION}}", APP_VERSION)
-            self.send_bytes(page.encode("utf-8"), "text/html; charset=utf-8")
+            self.send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/manifest.webmanifest":
             self.send_bytes(json.dumps(MANIFEST).encode("utf-8"),
@@ -768,19 +801,27 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 300
             self.send_json(self.data.payload(
-                query=(params.get("q") or [""])[0],
-                limit=limit,
+                query=(params.get("q") or [""])[0], limit=limit,
                 only_pinned=(params.get("pinned") or [""])[0] == "1",
                 port=(params.get("port") or [""])[0]))
+            return
+        if path == "/api/sea":
+            self.send_json(self.data.memo("sea", 15.0, self.data.sea))
+            return
+        if path == "/api/forecast":
+            self.send_json(self.data.memo("plan", 20.0, self.data.forecast_plan))
+            return
+        if path == "/api/forecast_all":
+            self.send_json(self.data.memo("all", 30.0, self.data.forecast_all))
             return
         if path == "/api/ports":
             self.send_json({"ports": self.data.port_stats()})
             return
+        if path == "/api/connections":
+            self.send_json(self.data.connections())
+            return
         if path == "/api/vessel":
             self.send_json(self.data.vessel((params.get("mmsi") or [""])[0]))
-            return
-        if path == "/api/expected":
-            self.send_json(self.data.expected())
             return
         if path == "/api/visits":
             try:
@@ -869,8 +910,7 @@ def main() -> int:
 
     lock = claim_lock()
     if lock is None:
-        print("Ship Tracker Mobile уже запущен — второе окно не открываю.",
-              flush=True)
+        print("Ship Tracker Mobile уже запущен — второе окно не открываю.", flush=True)
         return 0
 
     data = Data()
