@@ -37,14 +37,19 @@ OPENWATERS_URL = "wss://ais.openwaters.io/v0/stream"
 # «не работающие подключения» и старые данные в карточках.
 # Теперь все запросы идут через одну очередь: не больше 110 в минуту, позиции
 # берутся пачками до 10 MMSI за запрос, а после отказа сайта — пауза.
-OPENWATERS_UA = "ShipTracker/2026.12.73 (Ship Tracker; shiptracker@example.org)"
-OPENWATERS_PER_MINUTE = 110
-OPENWATERS_GAP_SECONDS = 0.2
+OPENWATERS_UA = "ShipTracker/2026.12.74 (Ship Tracker; shiptracker@example.org)"
+OPENWATERS_PER_MINUTE = 90
+# первые полторы минуты после запуска — мягче: прошлый сеанс мог оставить
+# в окне лимита свои запросы, и старт не должен сразу получать отказ
+OPENWATERS_WARMUP_SECONDS = 90.0
+OPENWATERS_WARMUP_PER_MINUTE = 45
+OPENWATERS_GAP_SECONDS = 0.3
 OPENWATERS_BATCH = 10          # до 10 MMSI за один запрос (анонимный тариф)
 OPENWATERS_COOLDOWN = 60.0     # пауза после ответа «rate limited»
 
 _ow_lock = threading.Lock()
 _ow_sent = []
+_ow_started = time.monotonic()
 _ow_cooldown_until = 0.0
 _ow_note_at = 0.0
 _ow_log = None
@@ -81,7 +86,10 @@ def _openwaters_slot() -> None:
             else:
                 while _ow_sent and now - _ow_sent[0] >= 60.0:
                     _ow_sent.pop(0)
-                if len(_ow_sent) < OPENWATERS_PER_MINUTE:
+                limit = (OPENWATERS_WARMUP_PER_MINUTE
+                         if now - _ow_started < OPENWATERS_WARMUP_SECONDS
+                         else OPENWATERS_PER_MINUTE)
+                if len(_ow_sent) < limit:
                     gap = (0.0 if not _ow_sent
                            else OPENWATERS_GAP_SECONDS - (now - _ow_sent[-1]))
                     if gap <= 0:

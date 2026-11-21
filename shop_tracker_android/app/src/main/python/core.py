@@ -882,12 +882,16 @@ class RadarCore:
             pass
 
     # ------------------------------------------------------------ запуск
-    def start(self, feed=True):
+    def start(self, feed=True, services=True):
         """Поднимает приём AIS и разбор событий.
 
         `feed=False` — режим бота, поднятого окном: AIS принимает само окно,
         а бот только читает общую базу. Иначе зависший бот уносит с собой
         поток AIS, и окно навсегда показывает старые данные.
+
+        `services=False` — не опрашивать внешние сервисы: их уже опрашивает
+        окно, а второй набор запросов только делит лимиты сайтов (у Open
+        Waters — 120 запросов в минуту на адрес) и даёт отказы 429.
         """
         if self.feed and self.feed.is_alive():
             return
@@ -898,8 +902,9 @@ class RadarCore:
             self.stop_event = threading.Event()
             self.events = queue.Queue(maxsize=20000)
             self._start_consumer()
-            self._start_services()
-            self._start_startup_refresh()
+            if services:
+                self._start_services()
+                self._start_startup_refresh()
             return
         # AIS принимает только один процесс: второй читает уже готовую базу
         lock = claim_feed_lock(self.store)

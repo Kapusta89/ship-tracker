@@ -1785,8 +1785,11 @@ def start_ingest() -> bool:
         return True
     try:
         # бот, поднятый окном, AIS не принимает: это делает окно. Иначе
-        # зависший бот останавливает данные для карты
-        core.start(feed=not parent_pid())
+        # зависший бот останавливает данные для карты. Внешние сервисы он
+        # тоже не опрашивает: второй набор запросов делит лимиты сайтов
+        # с окном (Open Waters — 120 запросов в минуту на адрес) и даёт 429
+        parent = parent_pid()
+        core.start(feed=not parent, services=not parent)
     except Exception as error:
         logging.warning("Поток AIS не запущен: %s", error)
         return False

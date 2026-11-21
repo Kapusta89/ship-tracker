@@ -362,6 +362,9 @@ class MarineLinkTypesFeed(base.ServiceFeed):
 
     def poll_once(self):
         self.load_types()
+        if self.blocked_until > time.monotonic():
+            # справочник попросил паузу: статус «лимит запросов» уже выставлен
+            return
         if not self.types:
             raise RuntimeError("справочник MarineLink не отдал списки судов")
         try:

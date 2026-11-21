@@ -1163,6 +1163,14 @@ class GfwFeed(ServiceFeed):
     # раз в час: паспорта судов меняются редко, но база из снимков
     # пополняется быстро, и ждать 12 часов перед обогащением не нужно
     interval = 3600.0
+    # запросы к GFW идут параллельно: у сайта ответ на один запрос —
+    # секунда-две, и последовательный обход 60 судов занимал больше двух
+    # минут, из-за чего «обновление при открытии» не дожидалось GFW.
+    # На шести потоках холодный обход — около 45 с, повторный — 20 с
+    workers = 6
+    # свежий паспорт не перезапрашиваем: хватает раз в 6 часов, а разрывы
+    # AIS и заходы обновляются каждый цикл
+    identity_hours = 6.0
 
     def __init__(self, *args, vessels=None, max_vessels=None, days=None,
                  cache_path=None, **kwargs):
@@ -1230,51 +1238,88 @@ class GfwFeed(ServiceFeed):
                 "end": str(gap.get("end") or "")[:16].replace("T", " "),
                 "hours": hours, "position_text": where}
 
+    def cached_identity(self, mmsi, known):
+        """Уже известный профиль судна, если его проверяли недавно."""
+        record = known.get(mmsi)
+        if not isinstance(record, dict) or not record.get("id"):
+            return None, record
+        try:
+            moment = datetime.fromisoformat(str(record.get("checked") or ""))
+        except (TypeError, ValueError):
+            return None, record
+        if (datetime.now() - moment).total_seconds() < self.identity_hours * 3600:
+            return record, record
+        return None, record
+
+    def enrich(self, mmsi, known):
+        """Паспорт, разрывы AIS и заходы одного судна — для одного потока."""
+        profile, record = self.cached_identity(mmsi, known)
+        if profile is None:
+            profile = self.vessel_id(mmsi)
+            if not profile:
+                return None
+        merged = dict(record or {})
+        merged.update(profile)
+        merged["gap"] = self.last_gap(profile["id"])
+        try:
+            merged["port_visits"] = portcalls.gfw_port_visits(
+                self.api_key, profile["id"], days=365)
+        except Exception as error:
+            # история заходов — дополнение: без неё профиль и разрывы
+            # всё равно сохраняются
+            merged["port_visits_error"] = str(error)[:80]
+        merged["checked"] = datetime.now().isoformat(timespec="seconds")
+        # паспорт сразу в базу: именно из-за пустых полей в карточках
+        # были прочерки вместо типа, размеров и позывного
+        self.emit({"kind": "static", "mmsi": mmsi,
+                   "name": profile.get("name") or "",
+                   "imo": profile.get("imo") or "",
+                   "callsign": profile.get("callsign") or "",
+                   "type_code": profile.get("type_code"),
+                   "type_label": profile.get("type_label") or "",
+                   "length_m": profile.get("length_m"),
+                   "at": datetime.now(),
+                   "source": "gfw"})
+        return merged
+
     def poll_once(self):
         cache = portcalls.load_gfw(self.cache_path)
         known = cache.get("vessels") if isinstance(cache.get("vessels"), dict) else {}
+        targets = []
+        for value in list(self.vessels())[:self.max_vessels]:
+            mmsi = str(value or "").strip()
+            if mmsi and mmsi not in targets:
+                targets.append(mmsi)
+        if not targets:
+            self.ok(0, "нет судов для обогащения")
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(mmsi):
+            if self.stop_event.is_set():
+                return None
+            try:
+                return mmsi, self.enrich(mmsi, known)
+            except Exception as error:
+                return error
+
         found = gaps = 0
         errors = 0
-        for mmsi in list(self.vessels())[:self.max_vessels]:
-            if self.stop_event.is_set():
-                break
-            mmsi = str(mmsi or "")
-            if not mmsi:
-                continue
-            try:
-                profile = self.vessel_id(mmsi)
-                if not profile:
+        with ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(targets)))) as pool:
+            for result in pool.map(one, targets):
+                if result is None:
                     continue
-                record = dict(known.get(mmsi) or {})
-                record.update(profile)
-                record["gap"] = self.last_gap(profile["id"])
-                try:
-                    record["port_visits"] = portcalls.gfw_port_visits(
-                        self.api_key, profile["id"], days=365)
-                except Exception as error:
-                    # история заходов — дополнение: без неё профиль и разрывы
-                    # всё равно сохраняются
-                    record["port_visits_error"] = str(error)[:80]
-                record["checked"] = datetime.now().isoformat(timespec="seconds")
+                if isinstance(result, Exception):
+                    errors += 1
+                    if errors == 1:
+                        self.log(f"{self.title}: {result}")
+                    continue
+                mmsi, record = result
+                if not record:
+                    continue
                 known[mmsi] = record
                 found += 1
                 gaps += 1 if record.get("gap") else 0
-                # паспорт сразу в базу: именно из-за пустых полей в карточках
-                # были прочерки вместо типа, размеров и позывного
-                self.emit({"kind": "static", "mmsi": mmsi,
-                           "name": profile.get("name") or "",
-                           "imo": profile.get("imo") or "",
-                           "callsign": profile.get("callsign") or "",
-                           "type_code": profile.get("type_code"),
-                           "type_label": profile.get("type_label") or "",
-                           "length_m": profile.get("length_m"),
-                           "at": datetime.now(),
-                           "source": "gfw"})
-            except Exception as error:
-                errors += 1
-                if errors == 1:
-                    self.log(f"{self.title}: {error}")
-            self.stop_event.wait(1.0)
         cache["vessels"] = known
         cache["updated"] = datetime.now().isoformat(timespec="seconds")
         portcalls.save_gfw(cache, self.cache_path)
