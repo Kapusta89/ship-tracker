@@ -473,6 +473,24 @@ def _type_code(value):
     return int(number)
 
 
+def cloudflare_block(response) -> bool:
+    """Сайт вместо данных отдал проверку Cloudflare («Just a moment…»).
+
+    С 2026 года marinetraffic.live закрыт этой проверкой: на любой запрос —
+    страница или JSON-мост — приходит 403 с HTML вместо данных. Ключа тут нет,
+    повторять бессмысленно: источник ждёт час и пробует снова.
+    """
+    if response is None or response.status_code not in (403, 429, 503):
+        return False
+    try:
+        text = (response.text or "")[:8000].lower()
+    except Exception:
+        return False
+    return ("just a moment" in text or "cf-mitigated" in text
+            or "challenge-platform" in text or "__cf_chl" in text
+            or "attention required! | cloudflare" in text)
+
+
 class ServiceFeed(threading.Thread):
     """Опрос одного внешнего сервиса с паузой между запросами."""
 
@@ -480,6 +498,9 @@ class ServiceFeed(threading.Thread):
     interval = 300.0
     # внешний API, а не AIS-поток: не участвует в состоянии «поток на связи»
     service = True
+    # проверка Cloudflare: сколько ждать до следующей попытки
+    blocked_for = 3600.0
+    blocked_until = 0.0
 
     def __init__(self, on_event, log, stop_event, api_key="", bboxes=None,
                  on_status=None, name=None, **options):
@@ -536,6 +557,23 @@ class ServiceFeed(threading.Thread):
         """Выполнить следующий цикл сейчас — для обновления при открытии."""
         self._wake.set()
 
+    def is_blocked(self) -> bool:
+        """Сайт только что закрылся проверкой Cloudflare — сейчас не стучимся."""
+        return time.monotonic() < self.blocked_until
+
+    def blocked(self, reason="сайт закрыл доступ проверкой Cloudflare"):
+        """Отмечает источник закрытым и пишет причину один раз, без потока ошибок.
+
+        Иначе один закрытый сайт забивает журнал сотней строк за цикл и
+        выглядит в окне как «ошибка подключения», хотя дело не в ключе.
+        """
+        self.blocked_until = time.monotonic() + self.blocked_for
+        minutes = max(1, int(self.blocked_for // 60))
+        self.set_status(f"закрыт Cloudflare, ждём {minutes} мин")
+        self.log(f"{self.title}: {reason}; повтор через {minutes} мин, "
+                 f"данные пока берутся из других каналов.")
+        self.last_error = reason
+
     # одна и та же ошибка повторяется каждый цикл: пишем её в журнал не чаще
     # раза в 10 минут, но и не молчим сутками, как было раньше
     fail_log_every = 600.0
@@ -570,6 +608,11 @@ class ServiceFeed(threading.Thread):
     def run(self):
         while not self.stop_event.is_set():
             started = time.monotonic()
+            if self.is_blocked():
+                # сайт закрыт проверкой Cloudflare: не тратим цикл на запросы
+                if self.sleep_until_next(started):
+                    break
+                continue
             try:
                 self.poll_once()
             except Exception as error:  # сеть, лимит, формат — ждём следующий цикл
@@ -1665,15 +1708,26 @@ class MarineTrafficLiveFeed(ServiceFeed):
         radius = self.radius_km if self.ports else max(self.radius_km, 220)
         seen = {}
         errors = 0
+        blocked = False
         for lat, lon in centers:
-            if self.stop_event.is_set():
+            if self.stop_event.is_set() or blocked:
                 break
             params = {"lat": lat, "lon": lon, "radius": radius, "limit": self.limit}
             try:
                 response = session.get(MARINETRAFFIC_LIVE_URL, params=params, timeout=45)
-                response.raise_for_status()
-                data = ((response.json() or {}).get("data") or {})
             except Exception:
+                errors += 1
+                continue
+            if response.status_code >= 400:
+                if cloudflare_block(response):
+                    # сайт закрыт целиком: остальные точки опроса смысла не имеют
+                    blocked = True
+                    continue
+                errors += 1
+                continue
+            try:
+                data = ((response.json() or {}).get("data") or {})
+            except ValueError:
                 errors += 1
                 continue
             for row in data.get("vessels") or []:
@@ -1694,6 +1748,9 @@ class MarineTrafficLiveFeed(ServiceFeed):
             self.stop_event.wait(0.4)
         for event in seen.values():
             self.emit(event)
+        if blocked and not seen:
+            self.blocked("карта больше не отдаёт данные через JSON-мост")
+            return
         detail = f"точек {len(centers)}" + (f", ошибок {errors}" if errors else "")
         self.ok(len(seen), detail)
 
@@ -1964,6 +2021,10 @@ class ShipRadarDetailsFeed(ServiceFeed):
         if not mmsi:
             return None
         response = self.http().get(self.url_for(mmsi, name), timeout=30)
+        if cloudflare_block(response):
+            self.blocked("карточки судов больше не отдаются без проверки браузера")
+            raise RuntimeError("сайт Ship Radar 24 закрыл доступ проверкой "
+                               "Cloudflare — карточка сейчас недоступна")
         response.raise_for_status()
         card = parse_vessel_card(response.text)
         self.attempts[mmsi] = {"at": time.time(), "ok": True}
@@ -1986,6 +2047,20 @@ class ShipRadarDetailsFeed(ServiceFeed):
                 break
             try:
                 response = session.get(self.url_for(mmsi, name), timeout=30)
+            except Exception as error:
+                errors += 1
+                if errors == 1:
+                    self.log(f"{self.title}: карточка не открылась "
+                             f"({error.__class__.__name__}: {self.url_for(mmsi, name)})")
+                self.attempts[mmsi] = {"at": time.time(), "ok": False}
+                self.stop_event.wait(self.pause)
+                continue
+            if cloudflare_block(response):
+                # весь сайт закрыт проверкой: нет смысла читать оставшиеся карточки
+                self._save_attempts()
+                self.blocked("карточки судов больше не отдаются без проверки браузера")
+                return
+            try:
                 response.raise_for_status()
                 card = parse_vessel_card(response.text)
             except Exception as error:

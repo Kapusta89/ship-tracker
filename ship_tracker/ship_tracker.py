@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.71"
+APP_VERSION = "2026.12.72"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -4233,7 +4233,8 @@ class App:
     PROBLEM_WORDS = ("ошибк", "error", "invalid", "not found", "не найден",
                      "не найдена", "не принят", "нет ответа", "не отвечает",
                      "не удалось", "лимит", "429", "401", "403", "503",
-                     "отказ", "timeout", "timed out", "unavailable")
+                     "отказ", "timeout", "timed out", "unavailable",
+                     "cloudflare")
 
     def collect_problems(self):
         """Текущие ошибки связи и ключей — короткими строками для шапки."""
@@ -4290,6 +4291,11 @@ class App:
                 lines.append(f"  {index}. {item}")
             if len(problems) > 6:
                 lines.append(f"  … и ещё {len(problems) - 6}")
+            if any("cloudflare" in item.lower() for item in problems):
+                lines.append("Ship Radar 24 и MarineTraffic.live закрылись проверкой "
+                             "Cloudflare — ключ тут не поможет, они сами ждут час "
+                             "и пробуют снова; суда в это время берутся из AISStream, "
+                             "Goradar и снимка района.")
             lines.append("Что делать: вставьте правильный ключ в поле сервиса ниже "
                          "и нажмите «Проверить». Ключ AISStream берётся бесплатно "
                          "на aisstream.io, остальные — в кабинете сервиса.")
@@ -5011,11 +5017,13 @@ class App:
             if name and len(received["ships"]) < 3:
                 received["ships"].append(f"{name} ({flags.flag_text(mmsi)}, MMSI {mmsi})")
 
+        feed = None
         try:
             feed = ais_feed.AISStreamFeed(token, self.config.get("bounding_boxes"),
                                           self.config.get("message_types"), on_event,
                                           self.log, stop,
-                                          stream_url=ais_feed.OPENWATERS_URL, name="ais-feed-ow-check")
+                                          stream_url=ais_feed.OPENWATERS_URL,
+                                          name="ais-feed-ow-check")
             feed.start()
             deadline = time.time() + 15
             while time.time() < deadline and received["count"] == 0 and not feed.last_error:
@@ -5024,7 +5032,8 @@ class App:
         finally:
             stop.set()
         try:
-            feed.join(timeout=5)
+            if feed is not None:
+                feed.join(timeout=5)
         except Exception:
             pass
         if connected and received["count"] > 0:
@@ -5098,9 +5107,6 @@ class App:
                 self.log("Основной поток AIS снова запущен.")
             except Exception as error2:
                 self.log(f"Не удалось снова запустить поток AIS: {error2}")
-        if was_running:
-            self.core.start()
-            self.log("Основной поток снова запущен.")
 
     def test_telegram(self):
         """Проверка Telegram в фоне: окно не замирает на время сетевых запросов."""

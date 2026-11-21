@@ -14,7 +14,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 : "${ANDROID_HOME:?задайте ANDROID_HOME (папка Android SDK)}"
 GRADLE_BIN="${GRADLE:-gradle}"
 BUILD_DIR="${SHIPTRACKER_BUILD_DIR:-C:/Users/Public/st-android-build}"
-OUT="$HERE/ShipTracker-autonomous.apk"
+# В имени файла — версия из build.gradle: по папке сразу видно, что за сборка.
+VERSION_NAME="$(sed -n 's/.*versionName[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' \
+  "$HERE/app/build.gradle" | head -1)"
+[ -n "$VERSION_NAME" ] || VERSION_NAME="dev"
+OUT="$HERE/ShipTracker-autonomous-$VERSION_NAME.apk"
 
 # Модули и шаблон настроек (android_defaults.py) генерируются из исходников;
 # в git его нет, потому что в нём остаются рабочие ключи без ограничений.
@@ -36,5 +40,10 @@ cd "$BUILD_DIR"
 APK="$BUILD_DIR/app/build/outputs/apk/debug/app-debug.apk"
 [ -f "$APK" ] || { echo "APK не собран: $APK" >&2; exit 1; }
 cp "$APK" "$OUT"
+# в папке должен остаться один APK: прежние сборки (без версии в имени и
+# с другим номером) убираем, чтобы не перепутать файлы
+for old in "$HERE"/ShipTracker-autonomous*.apk; do
+  [ "$old" = "$OUT" ] || rm -f "$old"
+done
 ls -la "$OUT"
 echo "Готово: $OUT"
