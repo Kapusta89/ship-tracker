@@ -19,11 +19,10 @@ done
 
 # Шаблон настроек: берём рабочие порты и фильтры, ключи вычищаем полностью.
 #
-# В APK остаётся только ключ, который работает на любом устройстве и не
-# привязан к аккаунту с лимитом на устройство: токен Global Fishing Watch
-# (бесплатный, общий). Ключи с ограничениями — AISStream, VesselFinder,
-# MarineTraffic, MyShipTracking, Datalastic, AISHub, ShipNext, Open Waters,
-# Telegram — остаются пустыми: их вводит сам пользователь на экране настроек.
+# APK передаётся другому человеку, поэтому в нём нет ни одного ключа: и
+# AISStream, и Global Fishing Watch, и Telegram, и остальные поля пустые.
+# Свои ключи владелец телефона вводит на экране подключений (кнопка с
+# шестерёнкой), там же стоят ссылки на сервисы, где эти ключи выдают.
 python - "$ROOT/ship_tracker/data/config.json" "$PY/android_defaults.py" <<'PY'
 import json
 import pprint
@@ -33,23 +32,25 @@ from pathlib import Path
 source, target = Path(sys.argv[1]), Path(sys.argv[2])
 config = json.loads(source.read_text(encoding="utf-8"))
 
-# ключи без привязки к устройству — можно оставить в сборке
-PUBLIC_KEYS = {"gfw_key"}
+# ключи, которые нельзя оставлять в сборке (gfw_key тоже: он привязан
+# к аккаунту владельца, и передавать его вместе с приложением нельзя)
+PUBLIC_KEYS: set[str] = set()
 secrets = {
     "api_key", "openwaters_token", "vf_key", "vfa_key", "mt_key", "mst_key",
     "vesselapi_key", "telegram_token", "telegram_chat_id", "dat_key",
-    "aishub_key", "sn_key",
+    "aishub_key", "sn_key", "gfw_key",
 } - PUBLIC_KEYS
 for key in secrets:
     if key in config:
         config[key] = "" if not isinstance(config[key], bool) else False
 config["telegram_commands"] = False
 config["use_sn"] = False
+config["use_gfw"] = bool(str(config.get("gfw_key") or "").strip())
 target.write_text(
     '"""Настройки по умолчанию для автономной версии.\n\n'
     'Файл создаётся скриптом sync_python.sh из ship_tracker/data/config.json.\n'
-    'Остаётся только ключ без привязки к устройству (gfw_key); ключи с\n'
-    'ограничениями пустые — пользователь вводит их на экране настроек.\n"""\n\n'
+    'Ключей в нём нет: приложение передаётся другому человеку, и все ключи\n'
+    'владелец телефона вводит сам на экране подключений.\n"""\n\n'
     "CONFIG = " + pprint.pformat(config, indent=1, width=100, sort_dicts=False) + "\n",
     encoding="utf-8")
 print(f"настройки по умолчанию: {target.name}, полей {len(config)}")

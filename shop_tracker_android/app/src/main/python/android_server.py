@@ -16,7 +16,7 @@ import mobile_server
 import portcalls
 import setup_page
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 
 
 class Server(ThreadingHTTPServer):
@@ -64,13 +64,8 @@ _expected_lock = threading.Lock()
 
 
 def setup_html() -> str:
-    config = android_main.load_config()
-    return setup_page.render(
-        api_key=str(config.get("api_key") or ""),
-        gfw_key=str(config.get("gfw_key") or ""),
-        telegram_token=str(config.get("telegram_token") or ""),
-        telegram_chat=str(config.get("telegram_chat_id") or ""),
-    )
+    """Экран подключений: всегда пустой, без ключей из сборки."""
+    return setup_page.render()
 
 
 def _key_present(config: dict, key: str | None) -> bool:

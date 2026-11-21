@@ -15,13 +15,19 @@ body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 -apple-
 h1 { font-size:20px; margin:0 0 4px; }
 p.sub { color:var(--dim); font-size:13px; margin:0 0 16px; }
 .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; margin-bottom:12px; }
-label { display:block; font-size:13px; color:#a9c2d8; margin:10px 0 6px; }
+.head { display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin:12px 0 6px; }
+.head:first-child { margin-top:0; }
+label { display:block; font-size:13px; color:#a9c2d8; }
 input { width:100%; padding:12px 14px; font-size:16px; border-radius:12px; border:1px solid var(--line);
   background:#12222f; color:var(--text); outline:none; }
+input::placeholder { color:#5d7b93; }
+a.get { font-size:12px; color:var(--accent); text-decoration:none; border:1px solid var(--line);
+  border-radius:8px; padding:3px 9px; white-space:nowrap; }
 button { width:100%; margin-top:14px; padding:14px; font-size:16px; font-weight:600; border:0; border-radius:14px;
   background:var(--accent); color:#04121f; }
 .note { font-size:12px; color:#9db6cc; background:#10202e; border:1px solid var(--line);
   border-radius:12px; padding:10px 12px; margin:0 0 12px; }
+.tip { font-size:12px; color:var(--dim); margin:6px 0 0; }
 .ok { color:#8ee0ab; font-size:13px; margin-top:10px; }
 .err { color:#ff9c94; font-size:13px; margin-top:10px; }
 </style>
@@ -30,27 +36,41 @@ button { width:100%; margin-top:14px; padding:14px; font-size:16px; font-weight:
 <h1>Ship Tracker</h1>
 <p class="sub">Автономная версия: данные собираются на телефоне, компьютер не нужен.</p>
 
-<div class="note">Ключи хранятся только в памяти приложения на этом телефоне.
-AISStream обязателен — без него нет живых позиций судов. Остальные источники
-(Maritime Optima, ShipAtlas, MarineLink, Goradar, Ship Radar 24, ShipFinder,
-AIS-catcher) работают без ключа.</div>
+<div class="note">Здесь нет чужих ключей — поля пустые. Введите свои: они хранятся
+только в памяти приложения на этом телефоне и никуда не отправляются, кроме
+самих сервисов. AISStream обязателен — без него нет живых позиций судов.
+Остальные источники (Maritime Optima, ShipAtlas, MarineLink, Goradar,
+Ship Radar 24, ShipFinder, AIS-catcher) работают без ключа.</div>
 
 <form class="card" id="form">
-  <label for="api_key">Ключ AISStream (обязателен)</label>
+  <div class="head">
+    <label for="api_key">Ключ AISStream (обязателен)</label>
+    <a class="get" href="https://aisstream.io/" target="_blank" rel="noopener">получить ключ</a>
+  </div>
   <input id="api_key" name="api_key" autocomplete="off" spellcheck="false"
-         placeholder="вставьте ключ с aisstream.io" value="__API_KEY__">
+         placeholder="вставьте ключ с aisstream.io">
 
-  <label for="gfw_key">Токен Global Fishing Watch (необязательно)</label>
+  <div class="head">
+    <label for="gfw_key">Токен Global Fishing Watch (необязательно)</label>
+    <a class="get" href="https://globalfishingwatch.org/our-apis/tokens" target="_blank" rel="noopener">получить токен</a>
+  </div>
   <input id="gfw_key" name="gfw_key" autocomplete="off" spellcheck="false"
-         placeholder="если нужны разрывы AIS и заходы в порты" value="__GFW_KEY__">
+         placeholder="если нужны разрывы AIS и заходы в порты">
 
-  <label for="telegram_token">Токен Telegram-бота (необязательно)</label>
+  <div class="head">
+    <label for="telegram_token">Токен Telegram-бота (необязательно)</label>
+    <a class="get" href="https://t.me/BotFather" target="_blank" rel="noopener">создать бота</a>
+  </div>
   <input id="telegram_token" name="telegram_token" autocomplete="off" spellcheck="false"
-         placeholder="токен от @BotFather" value="__TELEGRAM_TOKEN__">
+         placeholder="токен от @BotFather">
 
-  <label for="telegram_chat_id">Чат для уведомлений (необязательно)</label>
+  <div class="head">
+    <label for="telegram_chat_id">Чат для уведомлений (необязательно)</label>
+    <a class="get" href="https://t.me/userinfobot" target="_blank" rel="noopener">узнать chat_id</a>
+  </div>
   <input id="telegram_chat_id" name="telegram_chat_id" autocomplete="off" spellcheck="false"
-         placeholder="например 6518041859" value="__TELEGRAM_CHAT__">
+         placeholder="например 6518041859">
+  <div class="tip">Свой chat_id бот показывает командой /id.</div>
 
   <button type="submit">Сохранить и запустить</button>
   <div class="ok" id="ok" hidden>Сохранено, сбор данных запущен.</div>
@@ -83,9 +103,6 @@ form.addEventListener('submit', async (ev) => {
 """
 
 
-def render(api_key: str, gfw_key: str, telegram_token: str, telegram_chat: str) -> str:
-    return (SETUP_PAGE
-            .replace("__API_KEY__", api_key)
-            .replace("__GFW_KEY__", gfw_key)
-            .replace("__TELEGRAM_TOKEN__", telegram_token)
-            .replace("__TELEGRAM_CHAT__", telegram_chat))
+def render() -> str:
+    """Экран подключений: поля всегда пустые, ключи вводит владелец телефона."""
+    return SETUP_PAGE
