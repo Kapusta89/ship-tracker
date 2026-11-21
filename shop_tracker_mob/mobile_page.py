@@ -257,15 +257,35 @@ function shipIsStale(s) {
   return (s.age_minutes ?? 99999) > staleLimit(s);
 }
 function radarFiltered(s) {
+  // выбранное судно остаётся на карте при любом фильтре — как на ПК
+  if (String(s.mmsi) === String(radarSelected)) return true;
   if ((s.age_minutes ?? 99999) > 720) return false;
   if (targetsOnly && !s.target) return false;
   if (portOnly && !s.near_port) return false;
   return true;
 }
 
+function radarShown() {
+  const sets = radarSets();
+  const shown = sets.ours.filter(radarFiltered);
+  const selected = sets.all.find(s => String(s.mmsi) === String(radarSelected));
+  if (selected && !shown.includes(selected)) shown.push(selected);
+  return shown;
+}
+function freeSpace(box, boxes) {
+  return !boxes.some(b => !(box[0] + box[2] < b[0] || box[0] > b[0] + b[2]
+    || box[1] + box[3] < b[1] || box[1] > b[1] + b[3]));
+}
+function staleLabelText() {
+  const setting = settingsData && (settingsData.numbers || [])
+    .find(n => n.key === 'stale_minutes');
+  const minutes = setting ? Number(setting.value) : 15;
+  return (minutes > 0 ? minutes + ' мин' : '—') + ' / 9 ч в порту';
+}
+
 function renderRadar() {
   if (!ships) return;
-  mapShips = radarSets().ours.filter(radarFiltered);
+  mapShips = radarShown();
   view.innerHTML = `
     <div class="bar">
       <button data-act="refresh">⟳ Обновить</button>
@@ -420,21 +440,24 @@ function drawRadarMap(canvas) {
   };
   canvas._project = project;
   const sets = radarSets();
-  const shown = sets.ours.filter(radarFiltered);
+  const shown = radarShown();
   const traffic = sets.traffic.filter(s => (s.age_minutes ?? 99999) <= 720);
+  const boxes = [];
   const pxPerKm = height / ((base.maxLat - base.minLat) * 111.32 || 1);
   const toGeo = (x, y) => [base.minLat + (1 - y / height) * (base.maxLat - base.minLat),
                            base.minLon + (x / width) * (base.maxLon - base.minLon)];
 
   // сетка с подписями широты и долготы
-  g.strokeStyle = 'rgba(70,110,145,.20)'; g.lineWidth = 1;
-  g.fillStyle = '#2f5b6e'; g.font = '9px Consolas, monospace';
+  g.strokeStyle = showSchematic ? 'rgba(48,64,80,.65)' : 'rgba(70,110,145,.20)';
+  g.lineWidth = 1;
+  g.fillStyle = showSchematic ? '#607080' : '#2f5b6e';
+  g.font = (showSchematic ? '8px' : '9px') + ' Consolas, monospace';
   const steps = showSchematic ? 4 : 6;
   for (let i = 0; i <= steps; i++) {
     const y = i * height / steps, x = i * width / steps;
     g.beginPath(); g.moveTo(0, y); g.lineTo(width, y); g.stroke();
     g.beginPath(); g.moveTo(x, 0); g.lineTo(x, height); g.stroke();
-    if (i && i < steps) {
+    if (i && i < steps && (!showSchematic || i === steps / 2)) {
       g.fillText(toGeo(0, y)[0].toFixed(1), 3, y - 3);
       g.fillText(toGeo(x, 0)[1].toFixed(1), x + 3, height - 5);
     }
@@ -444,17 +467,34 @@ function drawRadarMap(canvas) {
   (ports || []).forEach(p => {
     if (!p.lat || !p.lon) return;
     const [x, y] = project([Number(p.lat), Number(p.lon)]);
-    if (x < -20 || x > width + 20 || y < -20 || y > height + 20) return;
-    const radius = Math.max(3, Number(p.radius_km || 5) * pxPerKm * mapView.scale);
-    g.strokeStyle = showSchematic ? '#1c6b42' : 'rgba(31,122,82,.9)';
-    g.setLineDash(showSchematic ? [] : [3, 3]);
-    g.beginPath(); g.arc(x, y, radius, 0, Math.PI * 2); g.stroke();
-    g.setLineDash([]);
-    g.fillStyle = '#35d08a'; g.fillRect(x - 2, y - 2, 4, 4);
-    if (!showSchematic) {
-      g.font = '600 10px -apple-system, Segoe UI, sans-serif';
-      g.fillStyle = '#7fe0b3';
-      g.fillText(p.name, x + 6, y + 13);
+    if (x < -10 || x > width + 10 || y < -10 || y > height + 10) return;
+    const radius = Math.max(4, Number(p.radius_km || 5) * pxPerKm * mapView.scale);
+    const name = String(p.name || '');
+    if (showSchematic) {
+      g.strokeStyle = '#1c6b42'; g.lineWidth = 2;
+      g.beginPath(); g.arc(x, y, radius, 0, Math.PI * 2); g.stroke();
+      g.font = '600 8px Consolas, monospace';
+      const w = g.measureText(name).width;
+      const box = [x - w / 2, y + radius + 1, w, 10];
+      if (!freeSpace(box, boxes)) return;
+      boxes.push(box);
+      g.fillStyle = '#607080'; g.textAlign = 'center';
+      g.fillText(name, x, y + radius + 9);
+      g.textAlign = 'start';
+    } else {
+      g.strokeStyle = 'rgba(31,122,82,.9)'; g.lineWidth = 1;
+      g.setLineDash([3, 3]);
+      g.beginPath(); g.arc(x, y, radius, 0, Math.PI * 2); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = '#35d08a'; g.fillRect(x - 2, y - 2, 4, 4);
+      g.font = '600 10px Consolas, monospace';
+      const w = g.measureText(name).width;
+      const box = [x - w / 2, y - radius - 18, w, 12];
+      if (!freeSpace(box, boxes)) return;
+      boxes.push(box);
+      g.fillStyle = '#7fe0b3'; g.textAlign = 'center';
+      g.fillText(name, x, y - radius - 8);
+      g.textAlign = 'start';
     }
   });
 
@@ -505,7 +545,6 @@ function drawRadarMap(canvas) {
   });
 
   // наши суда
-  const boxes = [];
   let faded = 0, drawn = 0;
   shown.forEach(s => {
     const fresh = !shipIsStale(s);
@@ -555,9 +594,7 @@ function drawRadarMap(canvas) {
       const text = String(s.name).slice(0, 18);
       const w = g.measureText(text).width;
       const box = [x + 7, y - 13, w, 11];
-      const clash = boxes.some(b => !(box[0] + box[2] < b[0] || box[0] > b[0] + b[2]
-        || box[1] + box[3] < b[1] || box[1] > b[1] + b[3]));
-      if (!clash) {
+      if (freeSpace(box, boxes)) {
         boxes.push(box);
         g.fillStyle = '#d7e6ee';
         g.fillText(text, x + 7, y - 4);
@@ -567,17 +604,21 @@ function drawRadarMap(canvas) {
 
   // легенда со счётчиками — как в настольной версии
   const newest = shown.reduce((min, s) => Math.min(min, s.age_minutes ?? min), Infinity);
+  const withoutPos = Math.max(0, (Number(ships && ships.total) || 0) - sets.all.length);
   const lines = [
-    'на экране: ' + drawn + ' из ' + shown.length + ' · целей: ' + shown.filter(s => s.target).length,
-    'свежих: ' + (drawn - faded) + ' · приглушены: ' + faded + ' · трафик: ' + traffic.length,
+    'на экране: ' + drawn + ' из ' + shown.length + ' · целей: '
+      + shown.filter(s => s.target).length,
+    'свежих: ' + (drawn - faded) + ' · приглушены (старый сигнал): ' + faded,
   ];
+  if (withoutPos) lines.push('без позиции (только в списках): ' + withoutPos);
+  lines.push('трафик района (точки): ' + traffic.length);
   if (Number.isFinite(newest)) {
-    lines.push('последний сигнал: ' + (newest < 60 ? newest + ' мин назад'
+    lines.push('последний сигнал AIS в районе: ' + (newest < 60 ? newest + ' мин назад'
       : (newest / 60).toFixed(1) + ' ч назад'));
   }
-  lines.push('порог свежести: 15 мин / 9 ч в порту');
-  lines.push('масштаб: ' + mapView.scale.toFixed(2) + ' · район: '
-    + base.centerLat.toFixed(2) + ', ' + base.centerLon.toFixed(2));
+  lines.push('порог свежести: ' + staleLabelText() + ' · масштаб: '
+    + mapView.scale.toFixed(2));
+  lines.push('район: ' + base.centerLat.toFixed(2) + ', ' + base.centerLon.toFixed(2));
   g.font = '9px Consolas, monospace';
   const legendW = Math.min(width - 20, 290), legendH = lines.length * 12 + 10;
   g.fillStyle = 'rgba(10,26,36,.94)'; g.fillRect(10, 10, legendW, legendH);
@@ -609,9 +650,19 @@ function pickShip(canvas, ev) {
     const d = Math.hypot(sx - x, sy - y);
     if (d < bestD) { best = s; bestD = d; }
   });
-  if (!best) return;
+  if (!best) {
+    if (radarSelected) {
+      radarSelected = null;
+      mapShips = radarShown();
+      drawRadar();
+      renderRadarList();
+    }
+    return;
+  }
   radarSelected = best.mmsi;
+  mapShips = radarShown();
   drawRadar();
+  renderRadarList();
   ensureRadarLayers();
   openVessel(best.mmsi);
 }
@@ -1022,6 +1073,7 @@ search.addEventListener('input', () => { if (tab === 'radar') renderRadarList();
 
 refreshAll.addEventListener('click', () => busy(refreshAll, async () => {
   clearCaches(); clearMapLayers(); await loadShips(); render();
+  ensureRadarLayers();
 }, '…'));
 
 view.addEventListener('click', async ev => {
@@ -1035,6 +1087,7 @@ view.addEventListener('click', async ev => {
     if (act === 'refresh') {
       await busy(action, async () => {
         clearCaches(); clearMapLayers(); await loadShips(); render();
+        ensureRadarLayers();
       }, '…');
       return;
     }
