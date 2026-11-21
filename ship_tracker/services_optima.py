@@ -340,6 +340,16 @@ class MarineLinkTypesFeed(base.ServiceFeed):
             try:
                 response = session.get("http://directory.marinelink.com/ships/type-"
                                        + slug, timeout=30)
+                if response.status_code == 429:
+                    # справочник просит сбавить темп: не долбим остальные
+                    # 198 страниц подряд, иначе лимит только углубится
+                    minutes = max(1, int(self.rate_limit_for // 60))
+                    self.blocked_until = max(self.blocked_until,
+                                             time.monotonic() + self.rate_limit_for)
+                    self.set_status(f"лимит запросов, ждём {minutes} мин")
+                    self.log(f"{self.title}: справочник ограничил частоту запросов "
+                             f"(HTTP 429) — пауза {minutes} мин, типы остаются прежние.")
+                    return
                 response.raise_for_status()
             except Exception as error:
                 self.log(f"{self.title}: тип {label} не прочитан ({error})")

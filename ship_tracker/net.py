@@ -21,7 +21,11 @@ import requests
 ATTEMPTS = 3
 BACKOFF_SECONDS = 0.7
 MAX_PAUSE_SECONDS = 6.0
-RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+# 429 не повторяем: это просьба сбавить темп, и повтор только углубляет
+# блокировку (у Open Waters лимит 120 запросов в минуту на адрес). Такие
+# ответы обрабатываются там, где известен источник — паузой на весь сервис.
+RETRY_STATUSES = frozenset({408, 425, 500, 502, 503, 504})
+THROTTLE_STATUSES = frozenset({429})
 
 _installed = False
 _original_request = None
@@ -32,7 +36,8 @@ def is_transient(error) -> bool:
     if isinstance(error, requests.HTTPError):
         status = int(getattr(getattr(error, "response", None),
                              "status_code", 0) or 0)
-        return status in RETRY_STATUSES or status >= 500
+        return (status in RETRY_STATUSES or status in THROTTLE_STATUSES
+                or status >= 500)
     if isinstance(error, requests.RequestException):
         if isinstance(error, (requests.ConnectionError, requests.Timeout)):
             return True

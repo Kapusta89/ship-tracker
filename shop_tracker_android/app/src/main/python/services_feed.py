@@ -473,6 +473,10 @@ def _type_code(value):
     return int(number)
 
 
+class RateLimited(RuntimeError):
+    """Сервис ограничил частоту запросов: пауза вместо потока ошибок."""
+
+
 def cloudflare_block(response) -> bool:
     """Сайт вместо данных отдал проверку Cloudflare («Just a moment…»).
 
@@ -501,6 +505,8 @@ class ServiceFeed(threading.Thread):
     # проверка Cloudflare: сколько ждать до следующей попытки
     blocked_for = 3600.0
     blocked_until = 0.0
+    # ответ 429: сервис просит сбавить темп — пауза короче, чем у Cloudflare
+    rate_limit_for = 300.0
 
     def __init__(self, on_event, log, stop_event, api_key="", bboxes=None,
                  on_status=None, name=None, **options):
@@ -609,12 +615,19 @@ class ServiceFeed(threading.Thread):
         while not self.stop_event.is_set():
             started = time.monotonic()
             if self.is_blocked():
-                # сайт закрыт проверкой Cloudflare: не тратим цикл на запросы
+                # сайт закрыт проверкой Cloudflare или просит сбавить темп:
+                # не тратим цикл на запросы и не держим «обновление при открытии»
+                if not self.first_done.is_set():
+                    self.first_count = self.events
+                    self.first_done.set()
                 if self.sleep_until_next(started):
                     break
                 continue
             try:
                 self.poll_once()
+            except RateLimited:
+                # статус и пауза уже выставлены в request()
+                pass
             except Exception as error:  # сеть, лимит, формат — ждём следующий цикл
                 self.fail(error)
             finally:
@@ -632,6 +645,17 @@ class ServiceFeed(threading.Thread):
         merged = {"User-Agent": "ShipTracker/1.0"}
         merged.update(headers or {})
         response = requests.get(url, params=params, headers=merged, timeout=timeout)
+        if response.status_code == 429:
+            # сервис просит сбавить темп: одна пауза на весь источник, а не
+            # сотня повторов в каждом цикле (раньше 429 только множил запросы)
+            minutes = max(1, int(self.rate_limit_for // 60))
+            self.blocked_until = max(self.blocked_until,
+                                     time.monotonic() + self.rate_limit_for)
+            self.set_status(f"лимит запросов, ждём {minutes} мин")
+            self.log(f"{self.title}: сервис ограничил частоту запросов (HTTP 429) — "
+                     f"пауза {minutes} мин.")
+            self.last_error = "лимит запросов (429)"
+            raise RateLimited("сервис ограничил частоту запросов (HTTP 429)")
         if response.status_code >= 400:
             detail = service_error_text(_json_or_none(response), response.status_code)
             if detail:
@@ -2020,6 +2044,9 @@ class ShipRadarDetailsFeed(ServiceFeed):
         mmsi = str(mmsi or "").strip()
         if not mmsi:
             return None
+        if self.is_blocked():
+            raise RuntimeError("сайт карточек сейчас закрыт (проверка Cloudflare "
+                               "или лимит запросов) — карточка недоступна")
         response = self.http().get(self.url_for(mmsi, name), timeout=30)
         if cloudflare_block(response):
             self.blocked("карточки судов больше не отдаются без проверки браузера")

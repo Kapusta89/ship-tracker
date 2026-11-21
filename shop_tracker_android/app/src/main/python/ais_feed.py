@@ -29,6 +29,99 @@ OPENWATERS_URL = "wss://ais.openwaters.io/v0/stream"
 # Второго адреса (stream.openwaters.io) не существует: DNS отвечает NXDOMAIN,
 # поэтому отдельный поток на него не поднимаем — он давал только ошибки в логе.
 
+# --- общий бюджет запросов к Open Waters -----------------------------------
+# Сайт разрешает 120 запросов в минуту на адрес и считает их вместе: снимок
+# района, карточки судов, треки и проверки. Когда координаты качались по одному
+# запросу на судно (200 судов за проход), бюджет выбирался за секунды — и сайт
+# отвечал «rate limited» всем подряд, включая снимок района. Отсюда и брались
+# «не работающие подключения» и старые данные в карточках.
+# Теперь все запросы идут через одну очередь: не больше 110 в минуту, позиции
+# берутся пачками до 10 MMSI за запрос, а после отказа сайта — пауза.
+OPENWATERS_UA = "ShipTracker/2026.12.73 (Ship Tracker; shiptracker@example.org)"
+OPENWATERS_PER_MINUTE = 110
+OPENWATERS_GAP_SECONDS = 0.2
+OPENWATERS_BATCH = 10          # до 10 MMSI за один запрос (анонимный тариф)
+OPENWATERS_COOLDOWN = 60.0     # пауза после ответа «rate limited»
+
+_ow_lock = threading.Lock()
+_ow_sent = []
+_ow_cooldown_until = 0.0
+_ow_note_at = 0.0
+_ow_log = None
+
+
+def set_openwaters_log(log) -> None:
+    """Куда писать сообщение о лимите: окно передаёт сюда свой журнал."""
+    global _ow_log
+    _ow_log = log
+
+
+def _openwaters_note(text) -> None:
+    """Одно сообщение о лимите в журнал, не чаще раза в 5 минут."""
+    global _ow_note_at
+    moment = time.monotonic()
+    if moment - _ow_note_at < 300:
+        return
+    _ow_note_at = moment
+    if _ow_log:
+        try:
+            _ow_log(text)
+        except Exception:
+            pass
+
+
+def _openwaters_slot() -> None:
+    """Ждёт свободного места в бюджете Open Waters и занимает его."""
+    while True:
+        with _ow_lock:
+            now = time.monotonic()
+            left = _ow_cooldown_until - now
+            if left > 0:
+                delay = min(left, 5.0)
+            else:
+                while _ow_sent and now - _ow_sent[0] >= 60.0:
+                    _ow_sent.pop(0)
+                if len(_ow_sent) < OPENWATERS_PER_MINUTE:
+                    gap = (0.0 if not _ow_sent
+                           else OPENWATERS_GAP_SECONDS - (now - _ow_sent[-1]))
+                    if gap <= 0:
+                        _ow_sent.append(now)
+                        return
+                    delay = gap
+                else:
+                    # бюджет выбран: ждём, пока самый старый запрос выйдет из окна
+                    delay = max(0.5, 60.0 - (now - _ow_sent[0]))
+        time.sleep(min(max(delay, 0.05), 5.0))
+
+
+def _openwaters_cooldown(reason) -> None:
+    global _ow_cooldown_until
+    _ow_cooldown_until = max(_ow_cooldown_until,
+                             time.monotonic() + OPENWATERS_COOLDOWN)
+    _openwaters_note(f"Open Waters: {reason} — запросы к сайту приостановлены на "
+                     f"{OPENWATERS_COOLDOWN:.0f} с, данные идут из других каналов.")
+
+
+def openwaters_get(url, params=None, timeout=25, headers=None):
+    """GET к Open Waters через общий бюджет: 120 запросов в минуту на адрес.
+
+    Один запрос за раз из всего приложения плюс обязательный User-Agent —
+    без него сайт отвечает «rate limited» даже при единичном обращении.
+    """
+    import requests
+
+    merged = {"User-Agent": OPENWATERS_UA}
+    merged.update(headers or {})
+    response = None
+    for _attempt in range(2):
+        _openwaters_slot()
+        response = requests.get(url, params=params, headers=merged, timeout=timeout)
+        if response.status_code != 429:
+            return response
+        response.close()
+        _openwaters_cooldown("сайт ограничил частоту запросов (HTTP 429)")
+    return response
+
 POSITION_TYPES = ("PositionReport", "ExtendedClassBPositionReport", "StandardClassBPositionReport")
 STATIC_TYPES = ("ShipStaticData", "StaticDataReport")
 TANKER_CODES = range(80, 90)
@@ -862,7 +955,7 @@ class SnapshotFeed(threading.Thread):
             self.last_error = "не задан район наблюдения"
             return 0
         try:
-            import requests
+            import requests  # noqa: F401  (проверка наличия библиотеки)
         except ImportError:
             self.last_error = "не установлена библиотека requests"
             self.log("Снимок района: не установлена requests — выполните pip install -r requirements.txt")
@@ -873,7 +966,12 @@ class SnapshotFeed(threading.Thread):
         for box in self.bboxes:
             query = ",".join(f"{value:.3f}" for value in box)
             try:
-                response = requests.get(SNAPSHOT_URL, params={"bbox": query}, timeout=25)
+                response = openwaters_get(SNAPSHOT_URL, params={"bbox": query},
+                                          timeout=25)
+                if response.status_code == 429:
+                    failed = ("снимок района: Open Waters ограничил частоту "
+                              "запросов (HTTP 429), ждём")
+                    continue
                 response.raise_for_status()
                 data = response.json()
             except Exception as error:  # сеть, лимит, формат — просто ждём следующий цикл
@@ -962,9 +1060,8 @@ def snapshot_near(lat, lon, delta=2.0, timeout=25, max_age_hours=6.0):
     box = (lat - delta, lon - delta, lat + delta, lon + delta)
     query = ",".join(f"{value:.3f}" for value in box)
     try:
-        import requests
-
-        response = requests.get(SNAPSHOT_URL, params={"bbox": query}, timeout=timeout)
+        response = openwaters_get(SNAPSHOT_URL, params={"bbox": query},
+                                  timeout=timeout)
         response.raise_for_status()
         data = response.json()
     except Exception:
@@ -981,31 +1078,21 @@ def snapshot_near(lat, lon, delta=2.0, timeout=25, max_age_hours=6.0):
 VESSEL_URL = "https://ais.openwaters.io/v1/vessels/{mmsi}"
 
 
-def fetch_vessel(mmsi, timeout=20) -> dict | None:
-    """Последняя известная позиция и паспорт судна — Open Waters, без ключа.
-
-    Возвращает {lat, lon, sog, cog, seen, near, name, destination, eta,
-    draught, imo, callsign, length, beam} либо None, если судна нет в базе
-    источника (404) или он недоступен.
-    """
-    import requests
-
-    try:
-        response = requests.get(VESSEL_URL.format(mmsi=mmsi), timeout=timeout,
-                                headers={"User-Agent": "ShipTracker/1.0 (study project)"})
-    except Exception:
+def vessel_payload(feature) -> dict | None:
+    """Одна запись GeoJSON от Open Waters → позиция и паспорт судна."""
+    if not isinstance(feature, dict):
         return None
-    if response.status_code != 200:
-        return None
-    try:
-        body = response.json()
-    except ValueError:
-        return None
-    props = body.get("properties") or {}
-    coords = (body.get("geometry") or {}).get("coordinates") or []
+    props = feature.get("properties") or {}
+    coords = (feature.get("geometry") or {}).get("coordinates") or []
     if len(coords) < 2:
         return None
-    return {"lat": float(coords[1]), "lon": float(coords[0]),
+    try:
+        lat, lon = float(coords[1]), float(coords[0])
+    except (TypeError, ValueError):
+        return None
+    mmsi = str(props.get("mmsi") or props.get("MMSI") or feature.get("id") or "").strip()
+    return {"mmsi": mmsi,
+            "lat": lat, "lon": lon,
             "sog": props.get("sog"), "cog": props.get("cog"),
             "seen": props.get("seen"), "near": props.get("near"),
             "name": props.get("name"), "destination": props.get("destination"),
@@ -1014,11 +1101,63 @@ def fetch_vessel(mmsi, timeout=20) -> dict | None:
             "length": props.get("length"), "beam": props.get("beam")}
 
 
+def fetch_vessel(mmsi, timeout=20) -> dict | None:
+    """Последняя известная позиция и паспорт судна — Open Waters, без ключа.
+
+    Возвращает {lat, lon, sog, cog, seen, near, name, destination, eta,
+    draught, imo, callsign, length, beam} либо None, если судна нет в базе
+    источника (404) или он недоступен.
+    """
+    try:
+        response = openwaters_get(VESSEL_URL.format(mmsi=mmsi), timeout=timeout)
+    except Exception:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    found = vessel_payload(body)
+    if not found:
+        return None
+    found.pop("mmsi", None)
+    return found
+
+
+def fetch_vessels(mmsis, timeout=25) -> list:
+    """Позиции и паспорта пачки судов одним запросом: до 10 MMSI за раз.
+
+    Один запрос на десять судов вместо десяти запросов — так координаты
+    обновляются у всех сразу и не выбирают лимит сайта (120 в минуту).
+    """
+    ids = [str(m).strip() for m in (mmsis or []) if str(m or "").strip().isdigit()]
+    if not ids:
+        return []
+    try:
+        response = openwaters_get(SNAPSHOT_URL,
+                                  params={"mmsi": ",".join(ids[:OPENWATERS_BATCH])},
+                                  timeout=timeout)
+    except Exception:
+        return []
+    if response.status_code != 200:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+    features = data.get("features") if isinstance(data, dict) else None
+    result = []
+    for feature in features or []:
+        found = vessel_payload(feature)
+        if found and found.get("mmsi"):
+            result.append(found)
+    return result
+
+
 def fetch_track(mmsi, timeout=25) -> list:
     """История трека судна за сутки — Open Waters, без ключа."""
-    import requests
-
-    response = requests.get(TRACK_URL.format(mmsi=mmsi), timeout=timeout)
+    response = openwaters_get(TRACK_URL.format(mmsi=mmsi), timeout=timeout)
     response.raise_for_status()
     return parse_track(response.json())
 

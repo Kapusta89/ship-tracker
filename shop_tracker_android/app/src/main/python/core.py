@@ -871,6 +871,15 @@ class RadarCore:
         self._source_conflict = {}
         self._feed_lock = None
         self.feed_elsewhere = False
+        # карточки одного судна могли запросить два потока сразу (автообновление
+        # и кнопка) — поток карточек один на всё приложение, с общей сессией
+        self._card_feed = None
+        self._card_feed_lock = threading.Lock()
+        # сообщение о лимите Open Waters пишется в журнал окна
+        try:
+            ais_feed.set_openwaters_log(self.log)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ запуск
     def start(self, feed=True):
@@ -1106,16 +1115,24 @@ class RadarCore:
             return
         started = time.time()
         answered = 0
+        announced = False
         for feed in feeds:
-            left = max(1.0, 180.0 - (time.time() - started))
+            left = max(1.0, 90.0 - (time.time() - started))
             if feed.first_done.wait(left):
                 answered += 1
-                if answered == 1:
+                if not announced:
                     # не ждём самого медленного: на карте уже есть первые данные,
                     # остальные источники досылают свои параллельно
+                    announced = True
                     title = getattr(feed, "title", None) or getattr(feed, "name", "источник")
                     self.log(f"Первые данные при открытии: {title} — карта "
                              f"заполняется по мере ответов остальных источников.")
+                    callback = getattr(self, "on_refresh", None)
+                    if callback:
+                        try:
+                            callback()
+                        except Exception:
+                            pass
         try:
             vessels = len(self.store.vessels(3000))
         except Exception:
@@ -2286,6 +2303,46 @@ class RadarCore:
         data = ais_feed.fetch_vessel(str(mmsi))
         if not data:
             return None
+        return self._apply_vessel_data(mmsi, data)
+
+    def refresh_vessels(self, mmsis) -> int:
+        """Обновляет пачку судов: до 10 MMSI за один запрос Open Waters.
+
+        Сайт разрешает 120 запросов в минуту на адрес, а судов в базе больше
+        двух тысяч. Поэтому позиции берутся пачками: один запрос отвечает
+        сразу за десять судов, и свежие данные успевают ко всем, а не только
+        к первым восьмидесяти.
+        """
+        ids = []
+        for value in mmsis or []:
+            mmsi = str(value or "").strip()
+            if mmsi:
+                ids.append(mmsi)
+        updated = 0
+        size = max(1, int(getattr(ais_feed, "OPENWATERS_BATCH", 10)))
+        for start in range(0, len(ids), size):
+            if self.stop_event.is_set():
+                break
+            try:
+                found = ais_feed.fetch_vessels(ids[start:start + size])
+            except Exception as error:
+                self.log(f"Обновление координат: {error}")
+                continue
+            for data in found:
+                try:
+                    if self._apply_vessel_data(data.get("mmsi"), data):
+                        updated += 1
+                except Exception:
+                    continue
+        return updated
+
+    def _apply_vessel_data(self, mmsi, data) -> dict | None:
+        """Пишет в базу позицию и паспорт из ответа Open Waters."""
+        if not isinstance(data, dict):
+            return None
+        mmsi = str(mmsi or data.get("mmsi") or "").strip()
+        if not mmsi:
+            return None
         # источник отдаёт время в UTC с «Z»: переводим в местное, как в базе
         moment = None
         seen = str(data.get("seen") or "").strip()
@@ -2317,6 +2374,22 @@ class RadarCore:
         self.store.upsert_static(str(mmsi), **self.merged_static(str(mmsi)))
         return dict(data, fresh=bool(fresh))
 
+    def card_feed(self):
+        """Один поток карточек Ship Radar 24 на всё приложение.
+
+        У потока своя сессия с cookies сайта: первое открытие главной
+        страницы стоит несколько секунд, и повторять его на каждую карточку
+        нельзя — карточка в окне должна обновляться быстро.
+        """
+        with self._card_feed_lock:
+            feed = self._card_feed
+            if feed is None:
+                feed = services_feed.build(
+                    "srd", self._receive, self.log, self.stop_event,
+                    vessels=lambda: [])
+                self._card_feed = feed
+            return feed
+
     def refresh_card(self, mmsi, name="") -> dict | None:
         """Разовая карточка судна на Ship Radar 24 — по кнопке «Обновить».
 
@@ -2335,9 +2408,7 @@ class RadarCore:
             return None
         asked[mmsi] = now
         try:
-            feed = services_feed.build(
-                "srd", self._receive, self.log, self.stop_event,
-                vessels=lambda: [])
+            feed = self.card_feed()
         except Exception as error:
             self.log(f"Карточка {mmsi}: {error}")
             return None
@@ -2392,60 +2463,64 @@ class RadarCore:
         return dict(found, updated=bool(updated))
 
     def refresh_vessel_now(self, mmsi) -> dict:
-        """Обновляет одно судно прямо сейчас: Open Waters, затем карточка сайта.
+        """Обновляет одно судно прямо сейчас — все источники одновременно.
 
-        Возвращает короткий отчёт для карточки в окне: что ответило и
-        появилась ли новая позиция.
+        Раньше Open Waters, ShipFinder и карточка сайта спрашивались по
+        очереди, и открытая карточка ждала сумму всех ответов (до минуты и
+        больше). Теперь запросы уходят вместе, и в карточку сразу идёт то,
+        что ответило первым; окно перерисовывает её по свежим данным базы.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         mmsi = str(mmsi or "").strip()
         if not mmsi:
             return {"text": "судно не выбрано", "fresh": False}
-        parts = []
-        fresh = False
-        data = None
-        try:
-            data = self.refresh_vessel(mmsi)
-        except Exception as error:
-            parts.append(f"Open Waters: ошибка ({error})")
-        if data:
-            fresh = bool(data.get("fresh"))
-            parts.append("Open Waters: новая позиция" if fresh
-                         else "Open Waters: позиция без изменений")
-        elif not parts:
-            parts.append("Open Waters: судна нет в базе")
-        if not fresh:
-            found = None
+        row = self.store.vessel(mmsi) or {}
+        name = str(row.get("name") or "")
+        lat, lon = row.get("lat"), row.get("lon")
+
+        def openwaters():
+            try:
+                data = self.refresh_vessel(mmsi)
+            except Exception as error:
+                return "error", f"Open Waters: ошибка ({error})"
+            if not data:
+                return "none", "Open Waters: судна нет в базе"
+            if data.get("fresh"):
+                return "ok", "Open Waters: новая позиция"
+            return "same", "Open Waters: позиция без изменений"
+
+        def shipfinder():
             try:
                 found = self.refresh_shipfinder(mmsi)
             except Exception as error:
-                parts.append(f"ShipFinder: ошибка ({error})")
-            if found and found.get("lat") is not None:
-                point = (f"{float(found['lat']):.5f}, {float(found['lon']):.5f}")
-                stamp = found.get("at")
-                when = f" от {stamp:%d.%m %H:%M}" if stamp else ""
-                if found.get("updated"):
-                    parts.append(f"ShipFinder: позиция обновлена ({point}{when})")
-                    fresh = True
-                else:
-                    parts.append(f"ShipFinder: координаты подтверждены ({point}{when})")
-            elif found is None:
-                parts.append("ShipFinder: позиции нет")
-            row = self.store.vessel(mmsi) or {}
-            name = str(row.get("name") or "")
-            card = self.refresh_card(mmsi, name)
-            if card and card.get("lat") is not None:
-                parts.append("карточка сайта: позиция обновлена")
-                fresh = True
-            elif card:
-                parts.append("карточка сайта: прочитана, позиции нет")
-            elif name:
-                parts.append("карточка сайта: только что запрашивалась")
-            else:
-                parts.append("карточки нет: имя судна неизвестно")
-        # --- остальные источники: спрашиваем всех, кто может знать это судно
-        row = self.store.vessel(mmsi) or {}
-        lat, lon = row.get("lat"), row.get("lon")
-        if lat is not None and lon is not None:
+                return "error", f"ShipFinder: ошибка ({error})"
+            if not found or found.get("lat") is None:
+                return "none", "ShipFinder: позиции нет"
+            point = f"{float(found['lat']):.5f}, {float(found['lon']):.5f}"
+            stamp = found.get("at")
+            when = f" от {stamp:%d.%m %H:%M}" if stamp else ""
+            if found.get("updated"):
+                return "ok", f"ShipFinder: позиция обновлена ({point}{when})"
+            return "same", f"ShipFinder: координаты подтверждены ({point}{when})"
+
+        def card():
+            if not name:
+                return "none", "карточки нет: имя судна неизвестно"
+            try:
+                payload = self.refresh_card(mmsi, name)
+            except Exception as error:
+                return "error", f"карточка сайта: ошибка ({error})"
+            if payload and payload.get("lat") is not None:
+                return "ok", "карточка сайта: позиция обновлена"
+            if payload:
+                return "same", "карточка сайта: прочитана, позиции нет"
+            return "same", "карточка сайта: только что запрашивалась"
+
+        def near():
+            # точечные снимки района: кто из карт знает это судно
+            parts = []
+            fresh_here = False
             for source, title, loader in (
                     ("snapshot", "снимок Open Waters",
                      lambda: ais_feed.snapshot_near(lat, lon)),
@@ -2458,19 +2533,47 @@ class RadarCore:
                 except Exception as error:
                     parts.append(f"{title}: ошибка ({error})")
                     continue
-                found = None
-                for event in events:
-                    if str(event.get("mmsi")) == mmsi:
-                        found = event
-                        break
+                found = next((event for event in events
+                              if str(event.get("mmsi")) == mmsi), None)
                 if not found:
                     parts.append(f"{title}: судна нет в ответе")
                     continue
                 if self._apply_near_found(mmsi, found, source):
-                    fresh = True
+                    fresh_here = True
                     parts.append(f"{title}: новая позиция")
                 else:
                     parts.append(f"{title}: позиция без изменений")
+            return fresh_here, parts
+
+        jobs = {"ow": openwaters, "sfp": shipfinder}
+        if name:
+            jobs["card"] = card
+        if lat is not None and lon is not None:
+            jobs["near"] = near
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = {key: pool.submit(job) for key, job in jobs.items()}
+            for key, future in futures.items():
+                try:
+                    results[key] = future.result(timeout=120)
+                except Exception as error:
+                    results[key] = "error", f"{key}: ошибка ({error})"
+
+        parts = []
+        fresh = False
+        for key in ("ow", "sfp", "card"):
+            item = results.get(key)
+            if not item:
+                continue
+            state, text = item
+            parts.append(text)
+            if state == "ok":
+                fresh = True
+        flashed = results.get("near")
+        if flashed:
+            near_fresh, near_parts = flashed
+            parts.extend(near_parts)
+            fresh = fresh or near_fresh
         return {"text": "; ".join(parts), "fresh": fresh}
 
     def _apply_near_found(self, mmsi, found, source) -> bool:
@@ -2508,31 +2611,16 @@ class RadarCore:
             if not mmsi or mmsi in focus:
                 continue
             focus.append(mmsi)
-        # наши суда обновляются параллельно: последовательный опрос занимал
-        # время, равное сумме ответов, и свежие координаты доходили до базы
-        # по очереди. Теперь все запросы уходят одновременно, как и у источников.
-        from concurrent.futures import ThreadPoolExecutor
-
+        # наши суда и закреплённые обновляются пачками по 10 MMSI: один запрос
+        # отвечает сразу за десять судов, поэтому свежие координаты получают
+        # все, а не только те, кому хватило лимита сайта
         batch = focus[:max(1, int(limit))]
-
-        def one(mmsi):
-            if self.stop_event.is_set():
-                return False
-            try:
-                found = self.refresh_vessel(mmsi)
-            except Exception as error:
-                self.log(f"Обновление {mmsi}: {error}")
-                return False
-            return bool(found and found.get("fresh"))
-
         try:
-            with ThreadPoolExecutor(max_workers=min(8, max(1, len(batch)))) as pool:
-                results = list(pool.map(one, batch))
+            updated = self.refresh_vessels(batch)
         except Exception as error:
             self.log(f"Обновление наших судов: {error}")
             return {"checked": len(batch), "updated": 0}
-        return {"checked": len(batch),
-                "updated": sum(1 for flag in results if flag)}
+        return {"checked": len(batch), "updated": updated}
 
     # ------------------------------------------- координаты «в моменте» (ShipFinder)
     def live_web_candidates(self, limit=12, stale_minutes=5.0) -> list:
@@ -2865,20 +2953,25 @@ class RadarCore:
             slice_ += ordered[:batch - len(slice_)]
         self._bulk_offset = (offset + len(slice_)) % len(ordered)
 
-        def one(row):
+        def one(chunk):
             try:
-                found = self.refresh_vessel(str(row.get("mmsi")))
+                return self.refresh_vessels(chunk)
             except Exception:
-                return False
-            return bool(found and found.get("fresh"))
+                return 0
 
+        size = max(1, int(getattr(ais_feed, "OPENWATERS_BATCH", 10)))
+        # в slice_ лежат строки судов, а запрос идет по MMSI: собираем номера
+        mmsis = [str(row.get("mmsi") or "").strip() for row in slice_]
+        mmsis = [mmsi for mmsi in mmsis if mmsi]
+        chunks = [mmsis[start:start + size]
+                  for start in range(0, len(mmsis), size)]
         try:
-            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-                results = list(pool.map(one, slice_))
+            with ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(chunks)))) as pool:
+                results = list(pool.map(one, chunks))
         except Exception as error:
             self.log(f"Обновление координат: {error}")
             return {"checked": len(slice_), "updated": 0}
-        return {"checked": len(slice_), "updated": sum(1 for flag in results if flag),
+        return {"checked": len(slice_), "updated": sum(results),
                 "total": len(ordered)}
 
     def _bulk_refresh_worker(self):
