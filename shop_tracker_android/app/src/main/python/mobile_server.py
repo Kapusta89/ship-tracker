@@ -240,10 +240,32 @@ class Data:
             ship["near_port"] = nearest if distance is not None and distance <= 25 else None
             ship["distance_km"] = round(distance, 1) if distance is not None else None
             ship["port"] = ship.get("port") or ship.get("near_port")
-            # «Цель» как на настольном радаре: судно связано с нашими портами —
-            # в назначении наш порт, стоит в нём или закреплено.
-            ship["target"] = (self.destination_port(ship) is not None
-                              or bool(ship["near_port"]) or ship["pinned"])
+            # Отборы как на настольном радаре:
+            # target — «цели»: наш порт в назначении или закреплённое судно;
+            # at_port — у причала или на рейде (стоянка в 12 км от геозоны);
+            # focus — своя обстановка: цель, порт, рейд или судно у порта.
+            ours_destination = self.destination_port(ship) is not None
+            at_port = self.port_at(lat, lon) is not None
+            if not at_port:
+                try:
+                    speed = float(ship.get("sog") or 0)
+                except (TypeError, ValueError):
+                    speed = 0.0
+                if speed <= 1.5:
+                    for port in self.ports:
+                        try:
+                            km = haversine_km(lat, lon, float(port["lat"]),
+                                              float(port["lon"]))
+                            radius = float(port.get("radius_km") or 5.0)
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        if km - radius <= 12:
+                            at_port = True
+                            break
+            ship["at_port"] = bool(at_port)
+            ship["target"] = bool(ours_destination or ship["pinned"])
+            ship["focus"] = bool(ship["target"] or at_port
+                                 or ship.get("port") or ship["near_port"])
             ships.append(ship)
         ships.sort(key=lambda item: (
             item["age_minutes"] if item["age_minutes"] is not None else 10 ** 9,

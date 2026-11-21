@@ -243,7 +243,10 @@ function shipCard(s, extra) {
    выбранного судна, схематический вид, «Наши суда» и легенда со счётчиками. */
 function radarSets() {
   const all = ((ships && ships.ships) || []).filter(s => s.age_minutes !== null);
-  return { all, ours: all.filter(s => s.target), traffic: all.filter(s => !s.target) };
+  // Своя обстановка — как port_focus_vessels на ПК: цель, порт, рейд
+  // или судно у порта. Остальное — чужой трафик мелкой точкой.
+  const ours = all.filter(s => s.focus || s.target);
+  return { all, ours, traffic: all.filter(s => !(s.focus || s.target)) };
 }
 function staleLimit(s) {
   const parked = !!s.near_port && Number(s.sog || 0) < 0.5;
@@ -260,8 +263,9 @@ function radarFiltered(s) {
   // выбранное судно остаётся на карте при любом фильтре — как на ПК
   if (String(s.mmsi) === String(radarSelected)) return true;
   if ((s.age_minutes ?? 99999) > 720) return false;
+  // «только цели» и «в порту / ждёт лоцмана» — те же отборы, что на ПК
   if (targetsOnly && !s.target) return false;
-  if (portOnly && !s.near_port) return false;
+  if (portOnly && !(s.at_port || s.near_port)) return false;
   return true;
 }
 
@@ -332,6 +336,11 @@ function renderRadar() {
         try { forecastPts = await api('/api/forecast_all'); } catch (e) { forecastPts = {rows: []}; }
         chip.textContent = text;
       }
+    }
+    // на ПК включение отбора сразу переводит кадр на наши суда
+    if (key === 'targets' || key === 'port') {
+      fitMode = 'vessels';
+      mapView = {scale: 1, dx: 0, dy: 0};
     }
     redraw();
   }));
