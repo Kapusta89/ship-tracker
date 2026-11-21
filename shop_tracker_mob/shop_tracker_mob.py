@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from mobile_page import PAGE
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
 

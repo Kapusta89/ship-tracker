@@ -117,7 +117,7 @@ nav svg { width: 21px; height: 21px; }
   background: #13263a; color: #9fd0ff; text-decoration: none; }
 canvas { width: 100%; display: block; border-radius: 15px; background: #08131e; }
 .maplayer { position: relative; margin-top: 4px; }
-.maplayer #map { height: calc(100vh - 400px); min-height: 220px; max-height: 520px; }
+.maplayer #map { height: calc(100vh - 420px); min-height: 300px; max-height: 620px; }
 .zoom { position: absolute; right: 8px; bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
 .zoom button { width: 38px; height: 38px; border-radius: 11px; border: 1px solid #26425c;
   background: rgba(13,27,39,.92); color: #dbe9f6; font-size: 17px; line-height: 1; }
@@ -163,14 +163,11 @@ let tab = 'radar', ships = null, ports = [], seaRows = null, planRows = null,
     servicesRows = null, settingsData = null, logRows = null, sourcesRows = null,
     tracks = null, forecastPts = null;
 let trafficSort = 'age', expectedFilter = 'all', alertFilter = 'all';
-let seaFilter = '', chipFilter = 'all', mapShips = [];
-let showTracks = false, showForecast = false;
+let seaFilter = '', mapShips = [];
+let showTracks = true, showForecast = true, showSchematic = false;
+let targetsOnly = false, portOnly = false, fitMode = 'ports', radarSelected = null;
 let mapView = {scale: 1, dx: 0, dy: 0};
 const SUBTABS = ['traffic', 'expected', 'alerts', 'services', 'settings', 'log'];
-const FILTERS = [
-  ['all', 'Все'], ['target', 'Только цели'], ['port', 'В порту'],
-  ['moving', 'В ходу'], ['pinned', '★ Закреплённые'],
-];
 
 const esc = v => String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 function ago(m) {
@@ -239,64 +236,84 @@ function shipCard(s, extra) {
     <div class="meta">${tags.join('')}</div></article>`;
 }
 
-function matchesFilter(s) {
-  if (chipFilter === 'target') return !!s.target;
-  if (chipFilter === 'port') return !!s.near_port;
-  if (chipFilter === 'moving') return (s.sog || 0) >= 0.5;
-  if (chipFilter === 'pinned') return !!s.pinned;
+/* ------------------------------------------------------------ радар */
+/* Радар повторяет настольный: карта с сеткой координат, порты с радиусом,
+   суда с линией курса и подписями без наложений, приглушённые старые
+   позиции, «только цели», «в порту / ждёт лоцмана», трек и прогноз
+   выбранного судна, схематический вид, «Наши суда» и легенда со счётчиками. */
+function radarSets() {
+  const all = ((ships && ships.ships) || []).filter(s => s.age_minutes !== null);
+  return { all, ours: all.filter(s => s.target), traffic: all.filter(s => !s.target) };
+}
+function staleLimit(s) {
+  const parked = !!s.near_port && Number(s.sog || 0) < 0.5;
+  if (parked) return 540;            // в порту и на рейде — 9 часов, как berth_stale_hours
+  const setting = settingsData && (settingsData.numbers || [])
+    .find(n => n.key === 'stale_minutes');
+  const minutes = setting ? Number(setting.value) : 15;
+  return minutes > 0 ? minutes : 99999;
+}
+function shipIsStale(s) {
+  return (s.age_minutes ?? 99999) > staleLimit(s);
+}
+function radarFiltered(s) {
+  if ((s.age_minutes ?? 99999) > 720) return false;
+  if (targetsOnly && !s.target) return false;
+  if (portOnly && !s.near_port) return false;
   return true;
 }
 
-/* ------------------------------------------------------------ радар */
 function renderRadar() {
   if (!ships) return;
-  const shown = (ports || []).filter(p => p.lat && p.lon);
-  mapShips = ships.ships.filter(s => s.age_minutes !== null && s.age_minutes <= 720 && matchesFilter(s));
+  mapShips = radarSets().ours.filter(radarFiltered);
   view.innerHTML = `
     <div class="bar">
       <button data-act="refresh">⟳ Обновить</button>
       <button data-act="fit">Наши суда</button>
     </div>
-    <div class="chips" id="radarChips">
-      ${FILTERS.map(([key, title]) => `<button class="chip ${chipFilter === key ? 'on' : ''}" data-chip="${key}">${title}</button>`).join('')}
-    </div>
-    <div class="chips" id="radarToggles">
-      <button class="chip toggle ${showTracks ? 'on' : ''}" data-toggle="tracks">Трек</button>
-      <button class="chip toggle ${showForecast ? 'on' : ''}" data-toggle="forecast">Прогноз 3 дня</button>
+    <div class="chips" id="radarChecks">
+      <button class="chip toggle ${targetsOnly ? 'on' : ''}" data-check="targets">только цели</button>
+      <button class="chip toggle ${portOnly ? 'on' : ''}" data-check="port">в порту / ждёт лоцмана</button>
+      <button class="chip toggle ${showTracks ? 'on' : ''}" data-check="tracks">трек</button>
+      <button class="chip toggle ${showForecast ? 'on' : ''}" data-check="forecast">прогноз 3 дня</button>
+      <button class="chip toggle ${showSchematic ? 'on' : ''}" data-check="schematic">схематический вид</button>
     </div>
     <div class="maplayer"><canvas id="map"></canvas>
       <div class="zoom"><button data-zoom="in">+</button><button data-zoom="out">−</button><button data-zoom="reset">⤢</button></div>
     </div>
     <div class="legend">
-      <span class="tag ok">● у порта</span><span class="tag">● в море</span>
-      <span class="tag bad">● сигнал старше 3 ч</span>
-      <span class="tag">● цель</span></div>
+      <span class="tag bad">● цель</span><span class="tag">· трафик района</span>
+      <span class="tag ok">▣ порт</span><span class="tag warn">— прогноз выбранного</span>
+    </div>
+    <div class="hint">Кнопки и перетаскивание — масштаб и сдвиг, нажатие по точке — карточка судна.</div>
     <div class="hint" id="radarCount"></div>
     <div id="radarList"></div>`;
   drawRadar();
   bindMap();
-  document.querySelectorAll('#radarChips .chip').forEach(chip => chip.addEventListener('click', () => {
-    chipFilter = chip.dataset.chip;
-    mapView = {scale: 1, dx: 0, dy: 0};
-    renderRadar();
-  }));
-  document.querySelectorAll('#radarToggles .chip').forEach(chip => chip.addEventListener('click', async () => {
-    if (chip.dataset.toggle === 'tracks') {
+  const redraw = () => { renderRadar(); };
+  document.querySelectorAll('#radarChecks .chip').forEach(chip => chip.addEventListener('click', async () => {
+    const key = chip.dataset.check;
+    if (key === 'targets') targetsOnly = !targetsOnly;
+    else if (key === 'port') portOnly = !portOnly;
+    else if (key === 'schematic') showSchematic = !showSchematic;
+    else if (key === 'tracks') {
       showTracks = !showTracks;
       if (showTracks && !tracks) {
-        chip.textContent = 'Трек…';
+        const text = chip.textContent;
+        chip.textContent = 'трек…';
         try { tracks = await api('/api/tracks?hours=24'); } catch (e) { tracks = {}; }
-        chip.textContent = 'Трек';
+        chip.textContent = text;
       }
-    } else {
+    } else if (key === 'forecast') {
       showForecast = !showForecast;
       if (showForecast && !forecastPts) {
-        chip.textContent = 'Прогноз…';
+        const text = chip.textContent;
+        chip.textContent = 'прогноз…';
         try { forecastPts = await api('/api/forecast_all'); } catch (e) { forecastPts = {rows: []}; }
-        chip.textContent = 'Прогноз 3 дня';
+        chip.textContent = text;
       }
     }
-    renderRadar();
+    redraw();
   }));
   renderRadarList();
 }
@@ -305,11 +322,14 @@ function renderRadarList() {
   const box = document.getElementById('radarList');
   if (!box) return;
   const q = search.value.trim().toLowerCase();
-  let list = ships.ships.filter(matchesFilter);
+  let list = mapShips;
   if (q) list = list.filter(s => (s.name || '').toLowerCase().includes(q)
     || (s.destination || '').toLowerCase().includes(q) || s.mmsi === q);
+  const sets = radarSets();
   const counter = document.getElementById('radarCount');
-  if (counter) counter.textContent = `На карте: ${mapShips.length} · в списке: ${list.length}`;
+  if (counter) counter.textContent = `На карте: ${mapShips.length} из ${sets.ours.length} наших`
+    + ` · трафик района: ${sets.traffic.length} · в списке: ${list.length}`
+    + (radarSelected ? ` · выбрано: ${radarSelected}` : '');
   box.innerHTML = list.length
     ? list.slice(0, 300).map(s => shipCard(s)).join('')
     : '<div class="empty">Под этот фильтр судов нет</div>';
@@ -317,10 +337,10 @@ function renderRadarList() {
 
 function drawRadar() {
   const canvas = document.getElementById('map');
-  if (!canvas) return;
-  drawMap(canvas, (ports || []).filter(p => p.lat && p.lon), mapShips);
+  if (canvas) drawRadarMap(canvas);
 }
 
+/* Сдвиг и масштаб: как колесо и перетаскивание в настольной версии. */
 function bindMap() {
   const canvas = document.getElementById('map');
   if (!canvas) return;
@@ -341,7 +361,7 @@ function bindMap() {
     drag = null;
     if (!wasDrag) pickShip(canvas, ev);
   });
-  document.querySelectorAll('.zoom button').forEach(button => button.addEventListener('click', () => {
+  view.querySelectorAll('[data-zoom]').forEach(button => button.addEventListener('click', () => {
     const act = button.dataset.zoom;
     if (act === 'reset') mapView = {scale: 1, dx: 0, dy: 0};
     else mapView.scale = Math.min(9, Math.max(0.6,
@@ -350,116 +370,250 @@ function bindMap() {
   }));
 }
 
-function baseProjection(width, height, ports, ships) {
-  const pts = ports.map(p => [Number(p.lat), Number(p.lon)])
-    .concat(ships.map(s => [s.lat, s.lon]));
+/* Первый кадр — по портам; кнопка «Наши суда» — по всем нашим судам,
+   включая те, что идут к нам через всё Чёрное и Средиземное море. */
+function radarBase(width, height) {
+  const allPorts = (ports || []).filter(p => p.lat && p.lon);
+  const sets = radarSets();
+  const pts = [];
+  if (fitMode === 'vessels') sets.ours.forEach(s => pts.push([Number(s.lat), Number(s.lon)]));
+  if (!pts.length) allPorts.forEach(p => pts.push([Number(p.lat), Number(p.lon)]));
+  if (!pts.length) sets.ours.forEach(s => pts.push([Number(s.lat), Number(s.lon)]));
+  if (!pts.length) return null;
   let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
-  pts.forEach(([la, lo]) => { minLat = Math.min(minLat, la); maxLat = Math.max(maxLat, la);
-    minLon = Math.min(minLon, lo); maxLon = Math.max(maxLon, lo); });
-  const padLat = Math.max(0.25, (maxLat - minLat) * 0.12);
-  const padLon = Math.max(0.25, (maxLon - minLon) * 0.12);
+  pts.forEach(([la, lo]) => {
+    minLat = Math.min(minLat, la); maxLat = Math.max(maxLat, la);
+    minLon = Math.min(minLon, lo); maxLon = Math.max(maxLon, lo);
+  });
+  const padLat = Math.max(0.15, (maxLat - minLat) * 0.18);
+  const padLon = Math.max(0.15, (maxLon - minLon) * 0.18);
   minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
-  return ([la, lo]) => [ (lo - minLon) / (maxLon - minLon) * width,
-                         height - (la - minLat) / (maxLat - minLat) * height ];
+  return {
+    minLat, maxLat, minLon, maxLon,
+    centerLat: (minLat + maxLat) / 2, centerLon: (minLon + maxLon) / 2,
+    project: ([la, lo]) => [(lo - minLon) / (maxLon - minLon) * width,
+                            height - (la - minLat) / (maxLat - minLat) * height],
+  };
 }
 
 function forecastPoint(row, day) {
-  const text = row[day] || '';
-  const match = /^(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)$/.exec(text);
-  return match ? [Number(match[1]), Number(match[2])] : null;
+  const parts = String(row[day] || '').split(',');
+  if (parts.length !== 2) return null;
+  const lat = Number(parts[0]), lon = Number(parts[1]);
+  return Number.isFinite(lat) && Number.isFinite(lon) ? [lat, lon] : null;
 }
 
-function drawMap(canvas, ports, ships) {
+function drawRadarMap(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth || 360;
-  const height = Math.max(240, Math.round(canvas.clientHeight || 340));
+  const height = Math.max(280, Math.round(canvas.clientHeight || 360));
   canvas.width = width * dpr; canvas.height = height * dpr;
   const g = canvas.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, width, height);
-  const base = baseProjection(width, height, ports, ships);
+  const base = radarBase(width, height);
+  if (!base) { canvas._project = null; return; }
   const project = ([la, lo]) => {
-    const [x, y] = base([la, lo]);
+    const [x, y] = base.project([la, lo]);
     return [width / 2 + (x - width / 2) * mapView.scale + mapView.dx,
             height / 2 + (y - height / 2) * mapView.scale + mapView.dy];
   };
-  g.strokeStyle = 'rgba(70,110,145,.16)';
-  for (let i = 0; i <= 6; i++) {
-    g.beginPath(); g.moveTo(0, i * height / 6); g.lineTo(width, i * height / 6); g.stroke();
-    g.beginPath(); g.moveTo(i * width / 6, 0); g.lineTo(i * width / 6, height); g.stroke();
+  canvas._project = project;
+  const sets = radarSets();
+  const shown = sets.ours.filter(radarFiltered);
+  const traffic = sets.traffic.filter(s => (s.age_minutes ?? 99999) <= 720);
+  const pxPerKm = height / ((base.maxLat - base.minLat) * 111.32 || 1);
+  const toGeo = (x, y) => [base.minLat + (1 - y / height) * (base.maxLat - base.minLat),
+                           base.minLon + (x / width) * (base.maxLon - base.minLon)];
+
+  // сетка с подписями широты и долготы
+  g.strokeStyle = 'rgba(70,110,145,.20)'; g.lineWidth = 1;
+  g.fillStyle = '#2f5b6e'; g.font = '9px Consolas, monospace';
+  const steps = showSchematic ? 4 : 6;
+  for (let i = 0; i <= steps; i++) {
+    const y = i * height / steps, x = i * width / steps;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(width, y); g.stroke();
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x, height); g.stroke();
+    if (i && i < steps) {
+      g.fillText(toGeo(0, y)[0].toFixed(1), 3, y - 3);
+      g.fillText(toGeo(x, 0)[1].toFixed(1), x + 3, height - 5);
+    }
   }
-  if (showTracks && tracks) {
-    g.strokeStyle = 'rgba(74,168,255,.35)'; g.lineWidth = 1;
-    ships.forEach(s => {
-      const points = tracks[s.mmsi];
-      if (!points || points.length < 2) return;
-      g.beginPath();
-      points.forEach((p, i) => { const [x, y] = project(p);
-        i ? g.lineTo(x, y) : g.moveTo(x, y); });
-      g.stroke();
-    });
-  }
-  if (showForecast && forecastPts && forecastPts.rows) {
-    const byMmsi = {};
-    forecastPts.rows.forEach(row => { byMmsi[row.mmsi] = row; });
-    g.setLineDash([4, 4]); g.lineWidth = 1.4; g.strokeStyle = 'rgba(255,209,102,.75)';
-    ships.forEach(s => {
-      if (!s.target) return;   // прогноз рисуем только по нашим целям
-      const row = byMmsi[s.mmsi];
-      if (!row) return;
-      const target = forecastPoint(row, 'day2') || forecastPoint(row, 'day1');
-      if (!target) return;
-      const [x1, y1] = project([s.lat, s.lon]);
-      const [x2, y2] = project(target);
-      g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
-      g.beginPath(); g.arc(x2, y2, 3, 0, Math.PI * 2);
-      g.fillStyle = 'rgba(255,209,102,.8)'; g.fill();
-    });
+
+  // порты: пунктирный радиус и подпись, как на настольном радаре
+  (ports || []).forEach(p => {
+    if (!p.lat || !p.lon) return;
+    const [x, y] = project([Number(p.lat), Number(p.lon)]);
+    if (x < -20 || x > width + 20 || y < -20 || y > height + 20) return;
+    const radius = Math.max(3, Number(p.radius_km || 5) * pxPerKm * mapView.scale);
+    g.strokeStyle = showSchematic ? '#1c6b42' : 'rgba(31,122,82,.9)';
+    g.setLineDash(showSchematic ? [] : [3, 3]);
+    g.beginPath(); g.arc(x, y, radius, 0, Math.PI * 2); g.stroke();
     g.setLineDash([]);
-  }
-  ships.forEach(s => {
-    const [x, y] = project([s.lat, s.lon]);
-    const near = !!s.near_port;
-    g.beginPath(); g.arc(x, y, s.target ? 4.4 : near ? 4 : 3, 0, Math.PI * 2);
-    g.fillStyle = (s.age_minutes ?? 999) > 180 ? '#ff9c94'
-      : s.target ? '#c9a6ff' : near ? '#8ee0ab' : '#7cc4ff';
-    g.globalAlpha = 0.9; g.fill(); g.globalAlpha = 1;
-  });
-  const boxes = [];
-  const labels = ports.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
-  ports.forEach(p => {
-    const [x, y] = project([Number(p.lat), Number(p.lon)]);
-    g.fillStyle = '#ffd166'; g.fillRect(x - 3, y - 3, 6, 6);
-  });
-  labels.forEach(p => {
-    const [x, y] = project([Number(p.lat), Number(p.lon)]);
-    g.font = '600 10px -apple-system, Segoe UI, sans-serif';
-    const w = g.measureText(p.name).width;
-    for (const [dx, dy] of [[7, 4], [7, -12], [7, 20], [7, -28], [7, 36]]) {
-      const box = [x + dx - 2, y + dy - 10, x + dx + w + 3, y + dy + 4];
-      if (box[0] < 0 || box[2] > width) continue;
-      const clash = boxes.some(b => !(box[2] < b[0] || box[0] > b[2] || box[3] < b[1] || box[1] > b[3]));
-      if (clash) continue;
-      boxes.push(box);
-      g.fillStyle = 'rgba(8,19,30,.82)';
-      g.fillRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
-      g.fillStyle = '#e8f1fa'; g.fillText(p.name, x + dx, y + dy);
-      break;
+    g.fillStyle = '#35d08a'; g.fillRect(x - 2, y - 2, 4, 4);
+    if (!showSchematic) {
+      g.font = '600 10px -apple-system, Segoe UI, sans-serif';
+      g.fillStyle = '#7fe0b3';
+      g.fillText(p.name, x + 6, y + 13);
     }
   });
-  canvas._project = project;
+
+  // трек выбранного судна
+  if (showTracks && tracks && radarSelected && tracks[radarSelected]) {
+    const points = tracks[radarSelected];
+    if (points.length > 1) {
+      g.strokeStyle = '#c8a24a'; g.lineWidth = 1.4;
+      g.beginPath();
+      points.forEach((p, i) => { const [x, y] = project(p); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      g.stroke();
+    }
+  }
+
+  // прогноз — только по выбранному судну, как на настольном радаре
+  if (showForecast && forecastPts && forecastPts.rows && radarSelected) {
+    const row = forecastPts.rows.find(r => String(r.mmsi) === String(radarSelected));
+    const ship = sets.ours.find(s => String(s.mmsi) === String(radarSelected));
+    const day1 = row ? forecastPoint(row, 'day1') : null;
+    const day2 = row ? forecastPoint(row, 'day2') : null;
+    if (ship && day1) {
+      const color = row.guessed ? '#ffc247' : '#39d3ff';
+      g.strokeStyle = color; g.lineWidth = 1.8; g.setLineDash([4, 4]);
+      const [x0, y0] = project([ship.lat, ship.lon]);
+      const [x1, y1] = project(day1);
+      g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1);
+      if (day2) { const [x2, y2] = project(day2); g.lineTo(x2, y2); }
+      g.stroke(); g.setLineDash([]);
+      g.fillStyle = color;
+      g.font = '9px Consolas, monospace';
+      [[day1, 'через день'], [day2, 'через 2 дня']].forEach(([pt, label]) => {
+        if (!pt) return;
+        const [x, y] = project(pt);
+        g.beginPath(); g.arc(x, y, 3, 0, Math.PI * 2); g.stroke();
+        g.fillText(label, x + 6, y - 5);
+      });
+      const [xe, ye] = project(day2 || day1);
+      g.fillText(String(row.eta_text || ''), xe + 6, ye + 12);
+    }
+  }
+
+  // остальной трафик района — мелкие точки
+  traffic.forEach(s => {
+    const [x, y] = project([s.lat, s.lon]);
+    if (x < 0 || x > width || y < 0 || y > height) return;
+    g.fillStyle = Number(s.sog) > 0.5 ? '#3f6f88' : '#4a4f52';
+    g.beginPath(); g.arc(x, y, 1.4, 0, Math.PI * 2); g.fill();
+  });
+
+  // наши суда
+  const boxes = [];
+  let faded = 0, drawn = 0;
+  shown.forEach(s => {
+    const fresh = !shipIsStale(s);
+    if (!fresh) faded++;
+    const [x, y] = project([Number(s.lat), Number(s.lon)]);
+    if (x < -20 || x > width + 20 || y < -20 || y > height + 20) return;
+    drawn++;
+    const selected = String(s.mmsi) === String(radarSelected);
+    const color = !fresh ? '#5d7786'
+      : showSchematic ? '#c62828' : (s.target ? '#ff3b30' : '#7fa8bf');
+    const course = s.cog ?? s.heading;
+    if (course !== null && course !== undefined) {
+      const angle = Number(course) * Math.PI / 180;
+      g.strokeStyle = color; g.lineWidth = 1.2;
+      g.beginPath(); g.moveTo(x, y);
+      g.lineTo(x + Math.sin(angle) * 14, y - Math.cos(angle) * 14);
+      g.stroke();
+    }
+    g.fillStyle = color;
+    g.beginPath(); g.arc(x, y, s.target ? 4.5 : 3, 0, Math.PI * 2); g.fill();
+    if (selected) {
+      g.strokeStyle = '#ffffff'; g.lineWidth = 2;
+      g.beginPath(); g.arc(x, y, 11, 0, Math.PI * 2); g.stroke();
+    }
+    const age = s.age_minutes ?? 0;
+    if (!fresh) {
+      g.fillStyle = '#5d7786'; g.font = '9px Consolas, monospace';
+      g.fillText(Math.round(age / 60) + ' ч назад', x + 7, y + 10);
+    }
+    if (selected) {
+      const parts = [s.name || s.mmsi];
+      if (s.sog !== null && s.sog !== undefined) parts.push(Number(s.sog).toFixed(1) + ' уз');
+      if (s.destination) parts.push(s.destination);
+      const label = parts.join(' · ');
+      g.font = '600 10px Consolas, monospace';
+      const w = g.measureText(label).width;
+      const bx = Math.max(10, Math.min(width - w - 6, x + 9));
+      const by = Math.max(18, y - 16);
+      g.fillStyle = 'rgba(8,19,30,.88)'; g.fillRect(bx - 3, by - 11, w + 6, 15);
+      g.fillStyle = '#ffffff'; g.fillText(label, bx, by);
+      if (!fresh) {
+        g.fillStyle = '#ffd166'; g.font = '9px Consolas, monospace';
+        g.fillText('позиция ' + (age / 60).toFixed(1) + ' ч назад', bx, by + 20);
+      }
+    } else if (s.name && !showSchematic) {
+      g.font = '9px -apple-system, Segoe UI, sans-serif';
+      const text = String(s.name).slice(0, 18);
+      const w = g.measureText(text).width;
+      const box = [x + 7, y - 13, w, 11];
+      const clash = boxes.some(b => !(box[0] + box[2] < b[0] || box[0] > b[0] + b[2]
+        || box[1] + box[3] < b[1] || box[1] > b[1] + b[3]));
+      if (!clash) {
+        boxes.push(box);
+        g.fillStyle = '#d7e6ee';
+        g.fillText(text, x + 7, y - 4);
+      }
+    }
+  });
+
+  // легенда со счётчиками — как в настольной версии
+  const newest = shown.reduce((min, s) => Math.min(min, s.age_minutes ?? min), Infinity);
+  const lines = [
+    'на экране: ' + drawn + ' из ' + shown.length + ' · целей: ' + shown.filter(s => s.target).length,
+    'свежих: ' + (drawn - faded) + ' · приглушены: ' + faded + ' · трафик: ' + traffic.length,
+  ];
+  if (Number.isFinite(newest)) {
+    lines.push('последний сигнал: ' + (newest < 60 ? newest + ' мин назад'
+      : (newest / 60).toFixed(1) + ' ч назад'));
+  }
+  lines.push('порог свежести: 15 мин / 9 ч в порту');
+  lines.push('масштаб: ' + mapView.scale.toFixed(2) + ' · район: '
+    + base.centerLat.toFixed(2) + ', ' + base.centerLon.toFixed(2));
+  g.font = '9px Consolas, monospace';
+  const legendW = Math.min(width - 20, 290), legendH = lines.length * 12 + 10;
+  g.fillStyle = 'rgba(10,26,36,.94)'; g.fillRect(10, 10, legendW, legendH);
+  g.strokeStyle = '#1d3d4f'; g.lineWidth = 1; g.strokeRect(10, 10, legendW, legendH);
+  g.fillStyle = '#9fc4d6';
+  lines.forEach((line, i) => g.fillText(line, 18, 25 + i * 12));
 }
+
+async function ensureRadarLayers() {
+  let loaded = false;
+  if (showTracks && !tracks) {
+    try { tracks = await api('/api/tracks?hours=24'); } catch (e) { tracks = {}; }
+    loaded = true;
+  }
+  if (showForecast && !forecastPts) {
+    try { forecastPts = await api('/api/forecast_all'); } catch (e) { forecastPts = {rows: []}; }
+    loaded = true;
+  }
+  if (loaded) drawRadar();
+}
+
 function pickShip(canvas, ev) {
   if (!canvas._project) return;
   const rect = canvas.getBoundingClientRect();
   const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
-  let best = null, bestD = 24;
+  let best = null, bestD = 18;
   mapShips.forEach(s => {
     const [sx, sy] = canvas._project([s.lat, s.lon]);
     const d = Math.hypot(sx - x, sy - y);
     if (d < bestD) { best = s; bestD = d; }
   });
-  if (best) openVessel(best.mmsi);
+  if (!best) return;
+  radarSelected = best.mmsi;
+  drawRadar();
+  ensureRadarLayers();
+  openVessel(best.mmsi);
 }
 
 /* ----------------------------------------------------------- в море */
@@ -909,8 +1063,8 @@ view.addEventListener('click', async ev => {
       return;
     }
     if (act === 'fit') {
+      fitMode = 'vessels';
       mapView = {scale: 1, dx: 0, dy: 0};
-      chipFilter = 'target';
       renderRadar();
       return;
     }
