@@ -1,0 +1,54 @@
+# Ship Tracker Android (автономное)
+
+Приложение для телефона без компьютера: внутри APK работает Python 3.11
+(Chaquopy), который сам собирает данные и отдаёт страницу в WebView.
+
+## Что внутри
+
+- `app/src/main/python/` — модули настольной версии (`core.py`, `store.py`,
+  `services_feed.py`, `services_optima.py`, `forecast.py`, …) и три файла
+  Android-слоя:
+  - `android_main.py` — точка входа: память приложения, настройки, запуск сбора;
+  - `android_server.py` — локальный сервер `127.0.0.1:8080` с экраном ключей;
+  - `setup_page.py` — HTML экрана настроек;
+  - `android_defaults.py` — шаблон настроек из `ship_tracker/data/config.json`
+    с пустыми ключами (генерируется, не правится руками).
+- `app/src/main/java/com/kapusta/shiptracker/MainActivity.java` — WebView.
+
+Код настольной версии не копируется вручную: `sync_python.sh` берёт его из
+`../ship_tracker` и `../shop_tracker_mob`.
+
+## Сборка
+
+Нужны JDK 17, Android SDK (platforms;android-34, build-tools;34.0.0) и Gradle 8.7.
+Путь проекта не должен содержать кириллицу — поэтому `build_apk.sh` копирует
+проект в `C:/Users/Public/st-android-build`, собирает там и возвращает APK.
+
+```bash
+bash sync_python.sh
+JAVA_HOME="C:/Users/Дима/jdk-17.0.21.1+2" \
+ANDROID_HOME="C:/Users/Дима/android-sdk" \
+GRADLE="/c/Users/Дима/gradle-8.7/bin/gradle" \
+bash build_apk.sh
+```
+
+Результат — `ShipTracker-autonomous.apk`.
+
+## Предпросмотр на компьютере
+
+Тот же код можно запустить на ПК, без APK:
+
+```bash
+python preview_host.py 8080
+```
+
+Откроется `http://127.0.0.1:8080/`; данные пишутся в `.preview/data`, ключи
+берутся из `../ship_tracker/data/config.json` (Telegram отключён).
+
+## Установка на телефон
+
+1. Скопировать `ShipTracker-autonomous.apk` на телефон и разрешить установку
+   из неизвестных источников.
+2. Открыть приложение: первый экран — настройки, вставить ключ AISStream
+   (остальные ключи по желанию) и сохранить.
+3. Дальше сбор данных идёт сам; шестерёнка в шапке открывает настройки снова.

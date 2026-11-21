@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Сборка автономного APK.
+#
+# Android-сборка не работает, если в пути есть кириллица (aapt2 и проверка
+# AGP), поэтому проект копируется в ASCII-путь и собирается там, а готовый
+# APK возвращается в папку проекта.
+#
+# Нужны: JDK 17 (JAVA_HOME), Android SDK с platforms/android-34 и
+# build-tools/34.0.0 (ANDROID_HOME), Gradle 8.x (GRADLE или gradle в PATH).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+: "${JAVA_HOME:?задайте JAVA_HOME (JDK 17)}"
+: "${ANDROID_HOME:?задайте ANDROID_HOME (папка Android SDK)}"
+GRADLE_BIN="${GRADLE:-gradle}"
+BUILD_DIR="${SHIPTRACKER_BUILD_DIR:-C:/Users/Public/st-android-build}"
+OUT="$HERE/ShipTracker-autonomous.apk"
+
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+cp -r "$HERE/app" "$HERE/build.gradle" "$HERE/settings.gradle" \
+      "$HERE/gradle.properties" "$BUILD_DIR/"
+
+SDK_POSIX="$(cd "$ANDROID_HOME" && pwd -W 2>/dev/null || echo "$ANDROID_HOME")"
+printf 'sdk.dir=%s\n' "$SDK_POSIX" > "$BUILD_DIR/local.properties"
+
+cd "$BUILD_DIR"
+"$GRADLE_BIN" --no-daemon --console=plain assembleDebug
+
+APK="$BUILD_DIR/app/build/outputs/apk/debug/app-debug.apk"
+[ -f "$APK" ] || { echo "APK не собран: $APK" >&2; exit 1; }
+cp "$APK" "$OUT"
+ls -la "$OUT"
+echo "Готово: $OUT"
