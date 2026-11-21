@@ -16,6 +16,12 @@ GRADLE_BIN="${GRADLE:-gradle}"
 BUILD_DIR="${SHIPTRACKER_BUILD_DIR:-C:/Users/Public/st-android-build}"
 OUT="$HERE/ShipTracker-autonomous.apk"
 
+# Модули и шаблон настроек (android_defaults.py) генерируются из исходников;
+# в git его нет, потому что в нём остаются рабочие ключи без ограничений.
+if [ -f "$HERE/sync_python.sh" ] && [ -f "$HERE/../ship_tracker/data/config.json" ]; then
+  bash "$HERE/sync_python.sh" >/dev/null
+fi
+
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cp -r "$HERE/app" "$HERE/build.gradle" "$HERE/settings.gradle" \

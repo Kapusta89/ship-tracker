@@ -12,7 +12,8 @@
   - `android_server.py` — локальный сервер `127.0.0.1:8080` с экраном ключей;
   - `setup_page.py` — HTML экрана настроек;
   - `android_defaults.py` — шаблон настроек из `ship_tracker/data/config.json`
-    с пустыми ключами (генерируется, не правится руками).
+    (генерируется `sync_python.sh`, не правится руками и не хранится в git:
+    в нём остаются рабочие ключи без ограничений).
 - `app/src/main/java/com/kapusta/shiptracker/MainActivity.java` — WebView.
 
 Код настольной версии не копируется вручную: `sync_python.sh` берёт его из
@@ -44,6 +45,15 @@ python preview_host.py 8080
 
 Откроется `http://127.0.0.1:8080/`; данные пишутся в `.preview/data`, ключи
 берутся из `../ship_tracker/data/config.json` (Telegram отключён).
+
+## Ключи в сборке
+
+В APK остаётся только ключ без привязки к устройству — токен Global Fishing
+Watch (`gfw_key`). Остальные ключи пустые, их вводит пользователь на экране
+настроек: AISStream (`api_key`, обязателен для живых позиций), Open Waters,
+VesselFinder, MarineTraffic, MyShipTracking, Datalastic, AISHub, ShipNext,
+Telegram. Список исключений задан в `sync_python.sh` (`PUBLIC_KEYS` и
+`secrets`).
 
 ## Установка на телефон
 

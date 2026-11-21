@@ -10,7 +10,7 @@
 | Ship Tracker для Windows | `ship_tracker.exe/ship_tracker.exe` | **2026.12.71** | 2026-11-20 |
 | Ship Tracker Mobile (телефон) | `shop_tracker_mob/shop_tracker_mob.exe` | **2.1.1** | 2026-11-21 |
 | Ship Tracker APK (Android, Wi-Fi) | `shop_tracker_mob/ShipTracker.apk` | **2.0.1** (201) | 2026-11-20 |
-| Ship Tracker Android (автономное) | `shop_tracker_android/ShipTracker-autonomous.apk` | **3.0.0** (300) | 2026-11-21 |
+| Ship Tracker Android (автономное) | `shop_tracker_android/ShipTracker-autonomous.apk` | **3.0.1** (301) | 2026-11-21 |
 
 Версия видна: в заголовке окна (обе настольные копии), на вкладке
 «Подключение» рядом с путём к папке, а в мобильной версии — в подвале
@@ -35,6 +35,20 @@
 Собранная копия показывает об этом подсказку на вкладке «Подключение».
 
 ## Журнал
+
+### 2026-11-21 (ключи в автономном APK)
+
+- В сборке остался только ключ без привязки к устройству — токен Global
+  Fishing Watch (`gfw_key`). Ключи с ограничениями пустые и вводятся
+  пользователем на экране настроек: AISStream (`api_key`), Open Waters,
+  VesselFinder, MarineTraffic, MyShipTracking, Datalastic, AISHub, ShipNext,
+  Telegram. Без ключа AISStream приложение открывает экран настроек, но
+  бесплатные источники (Goradar, MarineTraffic.live, ShipFinder, Ship Radar 24,
+  AIS-catcher, Maritime Optima, ShipAtlas, MarineLink) работают и так.
+- Исправлена ошибка генератора `android_defaults.py`: настройки записывались
+  JSON-литералами (`true`/`false`), из-за чего Python не читал файл и все
+  настройки по умолчанию (порты, районы, фильтры) молча терялись. Теперь
+  пишется валидный Python — проверено на чистой установке: 102 поля.
 
 ### 2026-11-21 (автономное приложение для Android)
 

@@ -1,75 +1,151 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-
-# Виртуальные окружения: создаются на каждом компьютере заново
-.venv/
-.venv_old/
-**/.venv/
-**/.venv_old/
-
-# Данные и секреты (ключи API, токен бота, база, фото, логи)
-**/data/config.json
-**/data/*.db
-**/data/*.db-*
-**/data/photos/
-**/data/*.lock
-**/data/*.log
-**/data/*.err
-**/data/bot_messages.json
-**/data/credits*.json
-**/data/shipradar_cards.json
-**/data/errors.log
-**/data/headless_check.log
-**/data/diagnose.txt
-
-# Служебное Freebuff и артефакты сборки
-.freebuff/
-.cloud-attachments/
-build/
-dist/
-output.txt
-
-# Кэши внешних источников (обновляются на каждом компьютере)
-**/data/expected.json
-**/data/gfw.json
-**/data/portcalls.json
-
-# Кэш проверки источников без ключа и журнал отправленных уведомлений
-**/data/sources.json
-**/data/aci_seen.json
-**/data/map.png
-
-# готовая сборка приложения (exe + данные)
-ship_tracker.exe/
-
-# Промежуточные файлы PyInstaller
-build_exe/
-
-# Мобильная версия: собранный exe и локальные журналы не храним в репозитории
-shop_tracker_mob/*.exe
-shop_tracker_mob/*.log
-shop_tracker_mob/*.lock
-shop_tracker_mob/build/
-shop_tracker_mob/*.idsig
-shop_tracker_mob/android/build/
-build_mob/
-build_mob.log
-build_exe.log
-
-# Автономная Android-сборка: промежуточные файлы Gradle и готовый APK
-shop_tracker_android/.gradle/
-shop_tracker_android/**/build/
-shop_tracker_android/local.properties
-shop_tracker_android/*.apk
-shop_tracker_android/.preview/
-shop_tracker_android/app/src/main/python/__pycache__/
-build_android.log
-preview_host.log
-
-# Служебный каталог агента
-.continue/
-.tmp/
-**/data/maritimeoptima.json
-**/data/shipatlas.json
+# Python
+
+__pycache__/
+
+*.py[cod]
+
+*.egg-info/
+
+
+
+# Виртуальные окружения: создаются на каждом компьютере заново
+
+.venv/
+
+.venv_old/
+
+**/.venv/
+
+**/.venv_old/
+
+
+
+# Данные и секреты (ключи API, токен бота, база, фото, логи)
+
+**/data/config.json
+
+**/data/*.db
+
+**/data/*.db-*
+
+**/data/photos/
+
+**/data/*.lock
+
+**/data/*.log
+
+**/data/*.err
+
+**/data/bot_messages.json
+
+**/data/credits*.json
+
+**/data/shipradar_cards.json
+
+**/data/errors.log
+
+**/data/headless_check.log
+
+**/data/diagnose.txt
+
+
+
+# Служебное Freebuff и артефакты сборки
+
+.freebuff/
+
+.cloud-attachments/
+
+build/
+
+dist/
+
+output.txt
+
+
+
+# Кэши внешних источников (обновляются на каждом компьютере)
+
+**/data/expected.json
+
+**/data/gfw.json
+
+**/data/portcalls.json
+
+
+
+# Кэш проверки источников без ключа и журнал отправленных уведомлений
+
+**/data/sources.json
+
+**/data/aci_seen.json
+
+**/data/map.png
+
+
+
+# готовая сборка приложения (exe + данные)
+
+ship_tracker.exe/
+
+
+
+# Промежуточные файлы PyInstaller
+
+build_exe/
+
+
+
+# Мобильная версия: собранный exe и локальные журналы не храним в репозитории
+
+shop_tracker_mob/*.exe
+
+shop_tracker_mob/*.log
+
+shop_tracker_mob/*.lock
+
+shop_tracker_mob/build/
+
+shop_tracker_mob/*.idsig
+
+shop_tracker_mob/android/build/
+
+build_mob/
+
+build_mob.log
+
+build_exe.log
+
+
+
+# Автономная Android-сборка: промежуточные файлы Gradle и готовый APK
+
+shop_tracker_android/.gradle/
+
+shop_tracker_android/**/build/
+
+shop_tracker_android/local.properties
+
+shop_tracker_android/*.apk
+
+shop_tracker_android/.preview/
+
+shop_tracker_android/app/src/main/python/__pycache__/
+shop_tracker_android/app/src/main/python/android_defaults.py
+
+build_android.log
+
+preview_host.log
+
+
+
+# Служебный каталог агента
+
+.continue/
+
+.tmp/
+
+**/data/maritimeoptima.json
+
+**/data/shipatlas.json
+

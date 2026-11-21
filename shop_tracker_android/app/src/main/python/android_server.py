@@ -68,7 +68,7 @@ class Handler(mobile_server.Handler):
         if path == "/api/setup-status":
             self.send_json({"key": android_main.has_key(),
                             "database": str(android_main.db_path()),
-                            "version": "3.0.0"})
+                            "version": "3.0.1"})
             return
         super().do_GET()
 
