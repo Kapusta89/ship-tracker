@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Копирует слой данных настольной версии в Android-проект.
-# Запускать после правок ship_tracker/*.py или shop_tracker_mob/*.py.
+# Запускать после правок ship_tracker/*.py.
+# Страница и сервер мобильной версии правятся прямо здесь:
+# app/src/main/python/mobile_page.py и mobile_server.py.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -14,8 +16,6 @@ for name in "${MODULES[@]}"; do
   cp "$ROOT/ship_tracker/$name.py" "$PY/$name.py"
 done
 
-cp "$ROOT/shop_tracker_mob/shop_tracker_mob.py" "$PY/mobile_server.py"
-cp "$ROOT/shop_tracker_mob/mobile_page.py" "$PY/mobile_page.py"
 
 # Шаблон настроек: берём рабочие порты и фильтры, ключи вычищаем полностью.
 #

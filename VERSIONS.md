@@ -8,8 +8,6 @@
 |---|---|---|---|
 | Ship Tracker (исходное, Python) | `ship_tracker/ship_tracker.py` | **2026.12.71** | 2026-11-20 |
 | Ship Tracker для Windows | `ship_tracker.exe/ship_tracker.exe` | **2026.12.71** | 2026-11-20 |
-| Ship Tracker Mobile (телефон) | `shop_tracker_mob/shop_tracker_mob.exe` | **2.5.1** | 2026-11-21 |
-| Ship Tracker APK (Android, Wi-Fi) | `shop_tracker_mob/ShipTracker.apk` | **2.0.1** (201) | 2026-11-20 |
 | Ship Tracker Android (автономное) | `shop_tracker_android/ShipTracker-autonomous.apk` | **3.4.1** (341) | 2026-11-21 |
 
 Версия видна: в заголовке окна (обе настольные копии), на вкладке
@@ -21,9 +19,10 @@
 1. Изменение делается в исходнике `ship_tracker/`.
 2. Номер версии поднимается у каждого затронутого приложения и записывается
    строкой в журнал ниже; exe пересобирается из того же исходника, поэтому
-   версия исходника и exe совпадают. Если доработка касается телефона, она
-   повторяется в `shop_tracker_mob/` (страница `mobile_page.py` и сервер
-   `shop_tracker_mob.py`) и получает свой номер.
+   версия исходника и exe совпадают. Мобильная версия одна — автономная
+   `shop_tracker_android/`: страница `mobile_page.py` и сервер
+   `mobile_server.py` лежат прямо в `app/src/main/python`, рядом же — готовый
+   `ShipTracker-autonomous.apk`.
 3. В таблице выше обновляются версия и дата сборки.
 
 ## Где живут ключи
@@ -35,6 +34,18 @@
 Собранная копия показывает об этом подсказку на вкладке «Подключение».
 
 ## Журнал
+
+### 2026-11-21 (одна мобильная папка)
+
+- Оставлена одна мобильная папка — `shop_tracker_android/`: в ней исходники
+  страницы и сервера (`app/src/main/python/mobile_page.py`,
+  `mobile_server.py`) и готовый `ShipTracker-autonomous.apk`.
+- Удалена старая Wi-Fi-версия `shop_tracker_mob/` (сервер `shop_tracker_mob.exe`
+  и APK 2.0.1): для заказчика нужна только автономная программа, а исходники
+  страницы и сервера уже лежат в Android-проекте без расхождений.
+- `sync_python.sh` больше не копирует два файла из `shop_tracker_mob` — их
+  правят прямо в Android-проекте.
+- Версия автономного APK не менялась — 3.4.1 (341).
 
 ### 2026-11-21 (мелочи радара под настольную версию)
 
