@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from mobile_page import PAGE
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
 
@@ -240,6 +240,10 @@ class Data:
             ship["near_port"] = nearest if distance is not None and distance <= 25 else None
             ship["distance_km"] = round(distance, 1) if distance is not None else None
             ship["port"] = ship.get("port") or ship.get("near_port")
+            # «Цель» как на настольном радаре: судно связано с нашими портами —
+            # в назначении наш порт, стоит в нём или закреплено.
+            ship["target"] = (self.destination_port(ship) is not None
+                              or bool(ship["near_port"]) or ship["pinned"])
             ships.append(ship)
         ships.sort(key=lambda item: (
             item["age_minutes"] if item["age_minutes"] is not None else 10 ** 9,
@@ -762,6 +766,23 @@ class Data:
         return {"rows": rows, "total": len(rows),
                 "note": "Журнал алертов: что отправлено и с каким результатом."}
 
+    def tracks(self, hours: float = 24.0, points: int = 14) -> dict:
+        """Треки для карты: по каждому судну не больше `points` точек.
+
+        Возвращаются только координаты — этого хватает, чтобы нарисовать
+        линию пути на радаре, и ответ не раздувается до мегабайт.
+        """
+        raw = self.tracks_map(hours)
+        out = {}
+        for mmsi, track in raw.items():
+            if len(track) < 2:
+                continue
+            step = max(1, len(track) // max(2, points))
+            chunk = track[::step][-max(2, points):]
+            out[str(mmsi)] = [[point.get("lat"), point.get("lon")] for point in chunk
+                              if point.get("lat") is not None]
+        return out
+
     def vessel(self, mmsi) -> dict:
         """Судно целиком: паспорт, позиция, последние точки и стоянки."""
         mmsi = str(mmsi or "").strip()
@@ -962,6 +983,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/alerts":
             self.send_json(self.data.memo("alerts", 15.0, self.data.alerts))
+            return
+        if path == "/api/tracks":
+            try:
+                hours = float((params.get("hours") or ["24"])[0])
+            except ValueError:
+                hours = 24.0
+            self.send_json(self.data.memo("tracks", 60.0,
+                                          lambda: self.data.tracks(hours)))
             return
         self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
 

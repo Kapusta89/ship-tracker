@@ -2,8 +2,8 @@
 
 Здесь только разметка, стили и сценарий: данные приходят из
 `shop_tracker_mob.py` по /api/… — те же расчёты, что в настольной версии.
-Вкладка «Ещё» открывает то, что в настольной версии разложено по отдельным
-вкладкам: трафик района, ожидаемые, алерты, сервисы, настройки и журнал.
+Фильтры радара повторяют настольные: «только цели», «в порту / ждёт
+лоцмана», «в ходу», «закреплённые», трек и прогноз на 3 дня.
 """
 
 PAGE = """<!doctype html>
@@ -16,89 +16,114 @@ PAGE = """<!doctype html>
 <title>Ship Tracker</title>
 <link rel="manifest" href="/manifest.webmanifest">
 <style>
-:root { color-scheme: dark; --bg: #0b1622; --card: #10202e; --line: #1d3144;
-  --text: #e8f1fa; --dim: #7d95ad; --accent: #4aa8ff; }
+:root { color-scheme: dark; --bg: #08111b; --bg2: #0b1622; --card: #10202e;
+  --card2: #0d1b27; --line: #1d3144; --text: #e8f1fa; --dim: #7d95ad;
+  --accent: #4aa8ff; --ok: #8ee0ab; --warn: #ffcf7d; --bad: #ff9c94; }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
-body { font: 15px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif;
-  padding-bottom: calc(70px + env(safe-area-inset-bottom)); }
-header { position: sticky; top: 0; z-index: 8; background: rgba(11,22,34,.96);
-  backdrop-filter: blur(8px); padding: calc(8px + env(safe-area-inset-top)) 12px 8px; }
-h1 { font-size: 18px; margin: 0 0 2px; font-weight: 650; }
-.sub { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: #34c759; flex: none; }
-.dot.stale { background: #ff9f0a; } .dot.off { background: #ff453a; }
-main { padding: 0 12px 12px; }
-input[type=search] { width: 100%; padding: 12px 14px; font-size: 16px; border-radius: 14px;
-  border: 1px solid var(--line); background: #12222f; color: var(--text); outline: none; margin-top: 8px; }
+html, body { margin: 0; height: 100%; }
+body { background: radial-gradient(1200px 600px at 50% -200px, #12283c 0%, var(--bg) 62%);
+  color: var(--text); font: 15px/1.42 -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding-bottom: calc(74px + env(safe-area-inset-bottom)); }
+header { position: sticky; top: 0; z-index: 8; background: rgba(9,17,26,.92);
+  backdrop-filter: blur(12px); border-bottom: 1px solid rgba(29,49,68,.65);
+  padding: calc(9px + env(safe-area-inset-top)) 12px 9px; }
+.hrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+h1 { font-size: 18px; margin: 0; font-weight: 700; letter-spacing: .2px; }
+.sub { font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #34c759; flex: none;
+  box-shadow: 0 0 0 3px rgba(52,199,89,.14); }
+.dot.stale { background: #ff9f0a; box-shadow: 0 0 0 3px rgba(255,159,10,.14); }
+.dot.off { background: #ff453a; box-shadow: 0 0 0 3px rgba(255,69,58,.14); }
+main { padding: 10px 12px 14px; }
+input[type=search] { width: 100%; padding: 11px 14px; font-size: 16px; border-radius: 13px;
+  border: 1px solid var(--line); background: #0e1d2a; color: var(--text); outline: none; margin-top: 9px; }
 input[type=search]::placeholder { color: #6d8299; }
-.chips { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0 4px; scrollbar-width: none; }
+.chips { display: flex; gap: 7px; overflow-x: auto; padding: 2px 0 6px; scrollbar-width: none; }
 .chips::-webkit-scrollbar { display: none; }
 .chip { flex: 0 0 auto; padding: 7px 13px; border-radius: 999px; border: 1px solid var(--line);
-  background: #0f1e2b; color: #a9c2d8; font-size: 13px; }
-.chip.on { background: #1e4f7a; border-color: #2f6c9e; color: #fff; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
-  padding: 12px 14px; margin-bottom: 9px; }
+  background: #0f1e2b; color: #a9c2d8; font-size: 13px; transition: background .15s, border-color .15s; }
+.chip.on { background: linear-gradient(180deg, #2564a3, #1b4d7a); border-color: #3a7dbb; color: #fff;
+  box-shadow: 0 2px 8px rgba(37,100,163,.35); }
+.chip.toggle.on { background: linear-gradient(180deg, #1d5c46, #154f3a); border-color: #2c7d5f; }
+.card { background: linear-gradient(180deg, var(--card), var(--card2));
+  border: 1px solid var(--line); border-radius: 15px; padding: 12px 14px; margin-bottom: 9px;
+  box-shadow: 0 3px 12px rgba(0,0,0,.22); transition: transform .12s ease, border-color .15s; }
+.card:active { transform: scale(.99); }
 .card.pinned { border-color: #3f7fae; }
 .card.tap { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 .row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
 .name { font-size: 16px; font-weight: 650; }
 .star { color: #ffd166; margin-left: 4px; }
-.small { font-size: 11px; color: #6f879e; }
-.sog { font-size: 15px; font-weight: 600; color: #9fd0ff; white-space: nowrap; }
-.meta { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
-.tag { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #162a3b; color: #a9c2d8; }
-.tag.warn { background: #3a2a12; color: #ffcf7d; }
-.tag.bad { background: #3a1a1a; color: #ff9c94; }
-.tag.ok { background: #12301f; color: #8ee0ab; }
+.small { font-size: 11.5px; color: #7590a8; }
+.sog { font-size: 15px; font-weight: 650; color: #9fd0ff; white-space: nowrap; }
+.meta { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { font-size: 11.5px; padding: 3px 9px; border-radius: 999px; background: #162a3b;
+  color: #a9c2d8; border: 1px solid rgba(45,74,101,.55); }
+.tag.warn { background: #2f2511; color: var(--warn); border-color: #4a3a17; }
+.tag.bad { background: #31191a; color: var(--bad); border-color: #4d2626; }
+.tag.ok { background: #112a1d; color: var(--ok); border-color: #1d4532; }
 .hint { font-size: 12px; color: var(--dim); margin: 6px 2px 10px; }
-.note { font-size: 12px; color: #9db6cc; background: #10202e; border: 1px solid var(--line);
-  border-radius: 12px; padding: 9px 11px; margin: 0 0 10px; }
-.empty { text-align: center; color: var(--dim); padding: 40px 10px; font-size: 14px; }
-.back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0;
-  color: var(--accent); font-size: 14px; padding: 8px 2px; }
-.toolbar { display: flex; gap: 8px; align-items: center; margin: 4px 0 10px; }
-.toolbar button { flex: 1; padding: 11px; font-size: 14px; border-radius: 12px; border: 1px solid var(--line);
-  background: #13263a; color: var(--text); }
-.toolbar button.primary { background: #1e4f7a; border-color: #2f6c9e; color: #fff; font-weight: 600; }
-.field { margin-bottom: 12px; }
+.note { font-size: 12px; color: #9db6cc; background: #0e1d2a; border: 1px solid var(--line);
+  border-radius: 12px; padding: 10px 12px; margin: 0 0 10px; line-height: 1.45; }
+.empty { text-align: center; color: var(--dim); padding: 42px 12px; font-size: 14px; }
+.bar { display: flex; gap: 8px; align-items: center; margin: 2px 0 10px; flex-wrap: wrap; }
+.bar button { flex: 1 1 auto; padding: 10px 12px; font-size: 13.5px; border-radius: 12px;
+  border: 1px solid var(--line); background: linear-gradient(180deg, #13263a, #0f1e2c);
+  color: var(--text); font-weight: 550; }
+.bar button:active { background: #1a3550; }
+.bar button.primary { background: linear-gradient(180deg, #2a6ba8, #1d517d);
+  border-color: #3a7dbb; color: #fff; }
+.bar button:disabled { opacity: .6; }
+.titlebar { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; }
+.titlebar h2 { font-size: 17px; margin: 0; flex: 1; }
+.iconbtn { width: 38px; height: 38px; border-radius: 12px; border: 1px solid var(--line);
+  background: #10202e; color: var(--text); font-size: 16px; display: grid; place-items: center; }
+.back { background: none; border: 0; color: var(--accent); font-size: 14px; padding: 8px 4px;
+  white-space: nowrap; flex: none; }
+.field { margin-bottom: 11px; }
 .field label { display: block; font-size: 12px; color: #a9c2d8; margin-bottom: 5px; }
 .field input { width: 100%; padding: 11px 13px; font-size: 16px; border-radius: 12px;
-  border: 1px solid var(--line); background: #12222f; color: var(--text); outline: none; }
-.check { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #16283a; }
+  border: 1px solid var(--line); background: #0e1d2a; color: var(--text); outline: none; }
+.check { display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid rgba(29,49,68,.55); }
 .check:last-child { border-bottom: 0; }
 .check input { width: 20px; height: 20px; accent-color: #4aa8ff; flex: none; }
 .check span { font-size: 14px; }
-pre.log { white-space: pre-wrap; word-break: break-word; font: 11px/1.45 Consolas, monospace;
-  color: #a9c2d8; background: #0a1522; border: 1px solid var(--line); border-radius: 12px;
-  padding: 10px; max-height: 65vh; overflow: auto; margin: 0; }
+pre.log { white-space: pre-wrap; word-break: break-word; font: 11px/1.5 Consolas, monospace;
+  color: #a9c2d8; background: #08131d; border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px; max-height: 62vh; overflow: auto; margin: 0; }
 nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 9; display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  background: rgba(13,26,38,.98); border-top: 1px solid var(--line);
-  padding: 6px 2px calc(6px + env(safe-area-inset-bottom)); }
-nav button { min-width: 0; background: none; border: 0; color: #7d95ad; font-size: 9px;
-  display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 0;
-  white-space: nowrap; }
-nav button.on { color: var(--accent); }
+  grid-template-columns: repeat(7, minmax(0, 1fr)); background: rgba(10,20,30,.97);
+  border-top: 1px solid rgba(29,49,68,.8); backdrop-filter: blur(12px);
+  padding: 7px 2px calc(7px + env(safe-area-inset-bottom)); }
+nav button { min-width: 0; background: none; border: 0; color: #7790a7; font-size: 9px;
+  display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 3px 0;
+  white-space: nowrap; transition: color .15s; }
+nav button.on { color: #6fbdff; }
+nav button.on svg { filter: drop-shadow(0 0 6px rgba(74,168,255,.45)); }
 nav svg { width: 21px; height: 21px; }
 .sheet { position: fixed; inset: 0; z-index: 20; display: none; }
 .sheet.open { display: block; }
 .sheet .backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.55); }
 .sheet .panel { position: absolute; left: 0; right: 0; bottom: 0; max-height: 88%;
-  overflow-y: auto; background: #0e1c29; border-radius: 18px 18px 0 0;
+  overflow-y: auto; background: #0c1926; border-radius: 20px 20px 0 0;
   padding: 14px 14px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); }
 .sheet .handle { width: 42px; height: 4px; border-radius: 2px; background: #2b4256;
   margin: 0 auto 10px; }
-.kv { display: grid; grid-template-columns: 128px 1fr; gap: 4px 8px; font-size: 14px; margin-top: 10px; }
+.kv { display: grid; grid-template-columns: 122px 1fr; gap: 5px 10px; font-size: 14px; margin-top: 10px; }
 .kv dt { color: var(--dim); } .kv dd { margin: 0; }
 .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .links a { font-size: 13px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
   background: #13263a; color: #9fd0ff; text-decoration: none; }
-canvas { width: 100%; display: block; border-radius: 16px; background: #0a1a27; }
-#map { height: calc(100vh - 370px); min-height: 220px; max-height: 560px; }
+canvas { width: 100%; display: block; border-radius: 15px; background: #08131e; }
+.maplayer { position: relative; margin-top: 4px; }
+.maplayer #map { height: calc(100vh - 400px); min-height: 220px; max-height: 520px; }
+.zoom { position: absolute; right: 8px; bottom: 8px; display: flex; flex-direction: column; gap: 6px; }
+.zoom button { width: 38px; height: 38px; border-radius: 11px; border: 1px solid #26425c;
+  background: rgba(13,27,39,.92); color: #dbe9f6; font-size: 17px; line-height: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
 .plan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
-.plan div { background: #0d1c29; border: 1px solid var(--line); border-radius: 10px;
-  padding: 6px 8px; }
+.plan div { background: #0c1a26; border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; }
 .plan b { display: block; font-size: 13px; color: #cfe3f5; }
 .plan span { font-size: 10px; color: var(--dim); }
 a { color: #7cc4ff; }
@@ -106,7 +131,8 @@ a { color: #7cc4ff; }
 </head>
 <body>
 <header>
-  <h1>Ship Tracker</h1>
+  <div class="hrow"><h1>Ship Tracker</h1>
+    <button class="iconbtn" id="refreshAll" title="Обновить">⟳</button></div>
   <div class="sub"><span class="dot" id="dot"></span><span id="status">подключаюсь…</span></div>
   <input id="search" type="search" placeholder="Поиск: имя, назначение, MMSI" autocomplete="off">
 </header>
@@ -130,12 +156,20 @@ const dot = document.getElementById('dot');
 const search = document.getElementById('search');
 const sheet = document.getElementById('sheet');
 const sheetBody = document.getElementById('sheetBody');
+const refreshAll = document.getElementById('refreshAll');
 let tab = 'radar', ships = null, ports = [], seaRows = null, planRows = null,
     allRows = null, visitRows = null, visitHistory = false, linkRows = null,
     trafficRows = null, expectedRows = null, alertsRows = null,
-    servicesRows = null, settingsData = null, logRows = null;
-let portFilter = '', seaFilter = '', chipFilter = 'all', mapShips = [];
+    servicesRows = null, settingsData = null, logRows = null,
+    tracks = null, forecastPts = null;
+let seaFilter = '', chipFilter = 'all', mapShips = [];
+let showTracks = false, showForecast = false;
+let mapView = {scale: 1, dx: 0, dy: 0};
 const SUBTABS = ['traffic', 'expected', 'alerts', 'services', 'settings', 'log'];
+const FILTERS = [
+  ['all', 'Все'], ['target', 'Только цели'], ['port', 'В порту'],
+  ['moving', 'В ходу'], ['pinned', '★ Закреплённые'],
+];
 
 const esc = v => String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 function ago(m) {
@@ -155,6 +189,13 @@ async function post(url, data) {
   const r = await fetch(url, {method: 'POST', body: data || ''});
   return r.json();
 }
+function clearCaches() {
+  ships = seaRows = planRows = allRows = visitRows = linkRows = trafficRows =
+    alertsRows = servicesRows = logRows = null;
+}
+/* Треки и прогноз для карты — тяжёлые: не сбрасываем их каждые 30 секунд,
+   только по кнопке «Обновить». */
+function clearMapLayers() { tracks = null; forecastPts = null; }
 async function loadShips() {
   try {
     const data = await api('/api/ships?limit=2000');
@@ -169,6 +210,16 @@ async function loadShips() {
     statusEl.textContent = 'нет связи с приложением';
     view.innerHTML = '<div class="empty">Нет связи с приложением.<br>Перезапустите Ship Tracker и обновите страницу.</div>';
   }
+}
+async function busy(button, work, label) {
+  const text = button.textContent;
+  button.disabled = true;
+  if (label) button.textContent = label;
+  try { await work(); } finally { button.disabled = false; button.textContent = text; }
+}
+function head(title, extra) {
+  return `<div class="titlebar"><button class="back" data-back="1">‹ Ещё</button>
+    <h2>${esc(title)}</h2>${extra || ''}</div>`;
 }
 
 function shipCard(s, extra) {
@@ -187,30 +238,64 @@ function shipCard(s, extra) {
     <div class="meta">${tags.join('')}</div></article>`;
 }
 
+function matchesFilter(s) {
+  if (chipFilter === 'target') return !!s.target;
+  if (chipFilter === 'port') return !!s.near_port;
+  if (chipFilter === 'moving') return (s.sog || 0) >= 0.5;
+  if (chipFilter === 'pinned') return !!s.pinned;
+  return true;
+}
+
 /* ------------------------------------------------------------ радар */
 function renderRadar() {
   if (!ships) return;
   const shown = (ports || []).filter(p => p.lat && p.lon);
-  mapShips = ships.ships.filter(s => s.age_minutes !== null && s.age_minutes <= 720);
-  view.innerHTML = `<div class="hint">Порты и суда за последние 12 часов. Нажмите на точку или карточку.</div>
-    <canvas id="map"></canvas>
-    <div class="meta" style="margin:10px 2px">
-      <span class="tag ok">● у порта</span><span class="tag">● в море</span>
-      <span class="tag bad">● сигнал старше 3 ч</span></div>
-    <div class="chips" id="radarChips">
-      <button class="chip on" data-chip="all">Все</button>
-      <button class="chip" data-chip="moving">В ходу</button>
-      <button class="chip" data-chip="near">У порта</button>
-      <button class="chip" data-chip="pinned">★ Закреплённые</button>
+  mapShips = ships.ships.filter(s => s.age_minutes !== null && s.age_minutes <= 720 && matchesFilter(s));
+  view.innerHTML = `
+    <div class="bar">
+      <button data-act="refresh">⟳ Обновить</button>
+      <button data-act="fit">Наши суда</button>
     </div>
+    <div class="chips" id="radarChips">
+      ${FILTERS.map(([key, title]) => `<button class="chip ${chipFilter === key ? 'on' : ''}" data-chip="${key}">${title}</button>`).join('')}
+    </div>
+    <div class="chips" id="radarToggles">
+      <button class="chip toggle ${showTracks ? 'on' : ''}" data-toggle="tracks">Трек</button>
+      <button class="chip toggle ${showForecast ? 'on' : ''}" data-toggle="forecast">Прогноз 3 дня</button>
+    </div>
+    <div class="maplayer"><canvas id="map"></canvas>
+      <div class="zoom"><button data-zoom="in">+</button><button data-zoom="out">−</button><button data-zoom="reset">⤢</button></div>
+    </div>
+    <div class="legend">
+      <span class="tag ok">● у порта</span><span class="tag">● в море</span>
+      <span class="tag bad">● сигнал старше 3 ч</span>
+      <span class="tag">● цель</span></div>
+    <div class="hint" id="radarCount"></div>
     <div id="radarList"></div>`;
-  const canvas = document.getElementById('map');
-  drawMap(canvas, shown, mapShips);
-  canvas.addEventListener('click', ev => pickShip(canvas, ev));
+  drawRadar();
+  bindMap();
   document.querySelectorAll('#radarChips .chip').forEach(chip => chip.addEventListener('click', () => {
     chipFilter = chip.dataset.chip;
-    document.querySelectorAll('#radarChips .chip').forEach(c => c.classList.toggle('on', c === chip));
-    renderRadarList();
+    mapView = {scale: 1, dx: 0, dy: 0};
+    renderRadar();
+  }));
+  document.querySelectorAll('#radarToggles .chip').forEach(chip => chip.addEventListener('click', async () => {
+    if (chip.dataset.toggle === 'tracks') {
+      showTracks = !showTracks;
+      if (showTracks && !tracks) {
+        chip.textContent = 'Трек…';
+        try { tracks = await api('/api/tracks?hours=24'); } catch (e) { tracks = {}; }
+        chip.textContent = 'Трек';
+      }
+    } else {
+      showForecast = !showForecast;
+      if (showForecast && !forecastPts) {
+        chip.textContent = 'Прогноз…';
+        try { forecastPts = await api('/api/forecast_all'); } catch (e) { forecastPts = {rows: []}; }
+        chip.textContent = 'Прогноз 3 дня';
+      }
+    }
+    renderRadar();
   }));
   renderRadarList();
 }
@@ -219,18 +304,52 @@ function renderRadarList() {
   const box = document.getElementById('radarList');
   if (!box) return;
   const q = search.value.trim().toLowerCase();
-  let list = ships.ships;
-  if (chipFilter === 'moving') list = list.filter(s => (s.sog || 0) >= 0.5);
-  if (chipFilter === 'near') list = list.filter(s => s.near_port);
-  if (chipFilter === 'pinned') list = list.filter(s => s.pinned);
+  let list = ships.ships.filter(matchesFilter);
   if (q) list = list.filter(s => (s.name || '').toLowerCase().includes(q)
     || (s.destination || '').toLowerCase().includes(q) || s.mmsi === q);
+  const counter = document.getElementById('radarCount');
+  if (counter) counter.textContent = `На карте: ${mapShips.length} · в списке: ${list.length}`;
   box.innerHTML = list.length
     ? list.slice(0, 300).map(s => shipCard(s)).join('')
-    : '<div class="empty">Ничего не найдено</div>';
+    : '<div class="empty">Под этот фильтр судов нет</div>';
 }
 
-function mapProjection(canvas, ports, ships) {
+function drawRadar() {
+  const canvas = document.getElementById('map');
+  if (!canvas) return;
+  drawMap(canvas, (ports || []).filter(p => p.lat && p.lon), mapShips);
+}
+
+function bindMap() {
+  const canvas = document.getElementById('map');
+  if (!canvas) return;
+  let drag = null;
+  canvas.addEventListener('pointerdown', ev => {
+    drag = {x: ev.clientX, y: ev.clientY, dx: mapView.dx, dy: mapView.dy, moved: false};
+    canvas.setPointerCapture(ev.pointerId);
+  });
+  canvas.addEventListener('pointermove', ev => {
+    if (!drag) return;
+    const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+    if (Math.hypot(dx, dy) > 5) drag.moved = true;
+    mapView.dx = drag.dx + dx; mapView.dy = drag.dy + dy;
+    drawRadar();
+  });
+  canvas.addEventListener('pointerup', ev => {
+    const wasDrag = drag && drag.moved;
+    drag = null;
+    if (!wasDrag) pickShip(canvas, ev);
+  });
+  document.querySelectorAll('.zoom button').forEach(button => button.addEventListener('click', () => {
+    const act = button.dataset.zoom;
+    if (act === 'reset') mapView = {scale: 1, dx: 0, dy: 0};
+    else mapView.scale = Math.min(9, Math.max(0.6,
+      mapView.scale * (act === 'in' ? 1.35 : 1 / 1.35)));
+    drawRadar();
+  }));
+}
+
+function baseProjection(width, height, ports, ships) {
   const pts = ports.map(p => [Number(p.lat), Number(p.lon)])
     .concat(ships.map(s => [s.lat, s.lon]));
   let minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
@@ -239,30 +358,71 @@ function mapProjection(canvas, ports, ships) {
   const padLat = Math.max(0.25, (maxLat - minLat) * 0.12);
   const padLon = Math.max(0.25, (maxLon - minLon) * 0.12);
   minLat -= padLat; maxLat += padLat; minLon -= padLon; maxLon += padLon;
-  const w = canvas.width, h = canvas.height;
-  return ([la, lo]) => [ (lo - minLon) / (maxLon - minLon) * w,
-                         h - (la - minLat) / (maxLat - minLat) * h ];
+  return ([la, lo]) => [ (lo - minLon) / (maxLon - minLon) * width,
+                         height - (la - minLat) / (maxLat - minLat) * height ];
 }
+
+function forecastPoint(row, day) {
+  const text = row[day] || '';
+  const match = /^(-?\\d+\\.\\d+),\\s*(-?\\d+\\.\\d+)$/.exec(text);
+  return match ? [Number(match[1]), Number(match[2])] : null;
+}
+
 function drawMap(canvas, ports, ships) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth || 360;
-  const height = Math.max(260, Math.round(canvas.clientHeight || 340));
+  const height = Math.max(240, Math.round(canvas.clientHeight || 340));
   canvas.width = width * dpr; canvas.height = height * dpr;
   const g = canvas.getContext('2d');
-  g.scale(dpr, dpr);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, width, height);
-  const project = mapProjection({width, height}, ports, ships);
-  g.strokeStyle = 'rgba(70,110,145,.18)';
+  const base = baseProjection(width, height, ports, ships);
+  const project = ([la, lo]) => {
+    const [x, y] = base([la, lo]);
+    return [width / 2 + (x - width / 2) * mapView.scale + mapView.dx,
+            height / 2 + (y - height / 2) * mapView.scale + mapView.dy];
+  };
+  g.strokeStyle = 'rgba(70,110,145,.16)';
   for (let i = 0; i <= 6; i++) {
     g.beginPath(); g.moveTo(0, i * height / 6); g.lineTo(width, i * height / 6); g.stroke();
     g.beginPath(); g.moveTo(i * width / 6, 0); g.lineTo(i * width / 6, height); g.stroke();
   }
+  if (showTracks && tracks) {
+    g.strokeStyle = 'rgba(74,168,255,.35)'; g.lineWidth = 1;
+    ships.forEach(s => {
+      const points = tracks[s.mmsi];
+      if (!points || points.length < 2) return;
+      g.beginPath();
+      points.forEach((p, i) => { const [x, y] = project(p);
+        i ? g.lineTo(x, y) : g.moveTo(x, y); });
+      g.stroke();
+    });
+  }
+  if (showForecast && forecastPts && forecastPts.rows) {
+    const byMmsi = {};
+    forecastPts.rows.forEach(row => { byMmsi[row.mmsi] = row; });
+    g.setLineDash([4, 4]); g.lineWidth = 1.4; g.strokeStyle = 'rgba(255,209,102,.75)';
+    ships.forEach(s => {
+      if (!s.target) return;   // прогноз рисуем только по нашим целям
+      const row = byMmsi[s.mmsi];
+      if (!row) return;
+      const target = forecastPoint(row, 'day2') || forecastPoint(row, 'day1');
+      if (!target) return;
+      const [x1, y1] = project([s.lat, s.lon]);
+      const [x2, y2] = project(target);
+      g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+      g.beginPath(); g.arc(x2, y2, 3, 0, Math.PI * 2);
+      g.fillStyle = 'rgba(255,209,102,.8)'; g.fill();
+    });
+    g.setLineDash([]);
+  }
   ships.forEach(s => {
     const [x, y] = project([s.lat, s.lon]);
     const near = !!s.near_port;
-    g.beginPath(); g.arc(x, y, near ? 4 : 3, 0, Math.PI * 2);
-    g.fillStyle = (s.age_minutes ?? 999) > 180 ? '#ff9c94' : near ? '#8ee0ab' : '#7cc4ff';
-    g.globalAlpha = 0.85; g.fill(); g.globalAlpha = 1;
+    g.beginPath(); g.arc(x, y, s.target ? 4.4 : near ? 4 : 3, 0, Math.PI * 2);
+    g.fillStyle = (s.age_minutes ?? 999) > 180 ? '#ff9c94'
+      : s.target ? '#c9a6ff' : near ? '#8ee0ab' : '#7cc4ff';
+    g.globalAlpha = 0.9; g.fill(); g.globalAlpha = 1;
   });
   const boxes = [];
   const labels = ports.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
@@ -280,7 +440,7 @@ function drawMap(canvas, ports, ships) {
       const clash = boxes.some(b => !(box[2] < b[0] || box[0] > b[2] || box[3] < b[1] || box[1] > b[3]));
       if (clash) continue;
       boxes.push(box);
-      g.fillStyle = 'rgba(11,22,34,.82)';
+      g.fillStyle = 'rgba(8,19,30,.82)';
       g.fillRect(box[0], box[1], box[2] - box[0], box[3] - box[1]);
       g.fillStyle = '#e8f1fa'; g.fillText(p.name, x + dx, y + dy);
       break;
@@ -292,7 +452,7 @@ function pickShip(canvas, ev) {
   if (!canvas._project) return;
   const rect = canvas.getBoundingClientRect();
   const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
-  let best = null, bestD = 22;
+  let best = null, bestD = 24;
   mapShips.forEach(s => {
     const [sx, sy] = canvas._project([s.lat, s.lon]);
     const d = Math.hypot(sx - x, sy - y);
@@ -310,7 +470,8 @@ async function renderSea() {
   if (tab !== 'sea') return;
   const rows = seaRows.rows || [];
   const chips = ['', ...(seaRows.ports || [])];
-  view.innerHTML = `<div class="note">${esc(seaRows.note || '')}</div>
+  view.innerHTML = `<div class="bar"><button data-act="refresh">⟳ Обновить</button></div>
+    <div class="note">${esc(seaRows.note || '')}</div>
     <div class="chips" id="seaChips">${chips.map(p => `<button class="chip ${p === seaFilter ? 'on' : ''}" data-port="${esc(p)}">${esc(p || 'Все порты')}</button>`).join('')}</div>
     <div id="seaList"></div>`;
   document.querySelectorAll('#seaChips .chip').forEach(chip => chip.addEventListener('click', () => {
@@ -337,7 +498,8 @@ async function renderPlan() {
   }
   if (tab !== 'plan') return;
   const rows = planRows.rows || [];
-  view.innerHTML = `<div class="note">${esc(planRows.note || '')}</div>`
+  view.innerHTML = `<div class="bar"><button data-act="refresh">⟳ Пересчитать</button></div>
+    <div class="note">${esc(planRows.note || '')}</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi)}">
       <div class="row"><div><div class="name">${esc(r.name || 'Без имени')}</div>
       <div class="small">${esc(r.route)}</div></div>
@@ -361,7 +523,8 @@ async function renderAll() {
   }
   if (tab !== 'all') return;
   const rows = allRows.rows || [];
-  view.innerHTML = `<div class="note">${esc(allRows.note || '')}</div>`
+  view.innerHTML = `<div class="bar"><button data-act="refresh">⟳ Пересчитать</button></div>
+    <div class="note">${esc(allRows.note || '')}</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi)}">
       <div class="row"><div><div class="name">${esc(r.name || 'Без имени')}</div>
       <div class="small">${esc(r.type_label || '')} · назначение ${esc(r.destination || '—')}</div></div>
@@ -389,7 +552,8 @@ async function renderVisits() {
   }
   if (tab !== 'visits') return;
   const rows = visitRows.rows || [];
-  view.innerHTML = `<div class="chips" id="visitChips">
+  view.innerHTML = `<div class="bar"><button data-act="refresh">⟳ Обновить</button></div>
+    <div class="chips" id="visitChips">
       <button class="chip ${visitHistory ? '' : 'on'}" data-history="0">Стоят сейчас</button>
       <button class="chip ${visitHistory ? 'on' : ''}" data-history="1">История</button>
     </div><div id="visitList"></div>`;
@@ -414,21 +578,23 @@ async function renderLink() {
   }
   if (tab !== 'link') return;
   const rows = linkRows.rows || [];
-  view.innerHTML = `<div class="note">${esc(linkRows.note || '')}</div>`
+  view.innerHTML = `<div class="bar"><button data-act="refresh">⟳ Обновить</button></div>
+    <div class="note">${esc(linkRows.note || '')}</div>`
     + rows.map(r => `<article class="card">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.title)}</div>
       <div class="small">${esc(r.detail || '')}</div></div>
       <span class="tag ${r.state === 'on' ? 'ok' : r.state === 'off' ? 'bad' : 'warn'}">${esc(r.state_text)}</span></div>
       </article>`).join('')
-    + `<div class="toolbar"><button onclick="restartCore(this)">Перезапустить сбор</button></div>`
+    + `<div class="bar"><button class="primary" data-act="restart">Перезапустить сбор</button></div>`
     + `<div class="hint">База: ${esc(linkRows.database || '')}<br>Версия мобильной: ${esc(linkRows.version || '')} · версия программы на компьютере: ${esc(linkRows.desktop_version || '—')}</div>`;
 }
 
 async function restartCore(button) {
-  button.disabled = true; button.textContent = 'Перезапускаю…';
-  try { await post('/api/restart'); button.textContent = 'Сбор перезапущен'; }
-  catch (e) { button.textContent = 'Не удалось перезапустить'; }
-  setTimeout(() => { button.disabled = false; button.textContent = 'Перезапустить сбор'; }, 2500);
+  await busy(button, async () => {
+    try { await post('/api/restart'); button.textContent = 'Сбор перезапущен'; }
+    catch (e) { button.textContent = 'Не удалось'; }
+  });
+  setTimeout(() => { if (button) button.textContent = 'Перезапустить сбор'; }, 2200);
 }
 
 /* ------------------------------------------------------------- ещё */
@@ -440,10 +606,6 @@ const MORE = [
   ['settings', 'Настройки', 'Порты, фильтры и источники — как вкладка «Фильтры»'],
   ['log', 'Журнал', 'Последние строки журнала приложения'],
 ];
-function backBar(title) {
-  return `<button class="back" onclick="setTab('more')">‹ Ещё</button>
-    <h2 style="font-size:17px;margin:2px 0 8px">${esc(title)}</h2>`;
-}
 function renderMore() {
   view.innerHTML = `<div class="note">Всё, что в настольной версии разложено по отдельным вкладкам.</div>`
     + MORE.map(([name, title, detail]) => `<article class="card tap" data-more="${name}">
@@ -456,11 +618,11 @@ async function renderTraffic() {
   if (!trafficRows) {
     view.innerHTML = '<div class="empty">Считаю трафик района…</div>';
     try { trafficRows = await api('/api/traffic'); } catch (e) {
-      view.innerHTML = backBar('Трафик района') + '<div class="empty">Не удалось получить список</div>'; return; }
+      view.innerHTML = head('Трафик района') + '<div class="empty">Не удалось получить список</div>'; return; }
   }
   if (tab !== 'traffic') return;
   const rows = trafficRows.rows || [];
-  view.innerHTML = backBar('Трафик района')
+  view.innerHTML = head('Трафик района', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(trafficRows.note || '')}</div>`
     + `<div class="hint">Судов в районе: ${trafficRows.total ?? rows.length}</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi)}">
@@ -481,14 +643,14 @@ async function renderExpected() {
   if (!expectedRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
     try { expectedRows = await api('/api/expected'); } catch (e) {
-      view.innerHTML = backBar('Ожидаемые') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+      view.innerHTML = head('Ожидаемые') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'expected') return;
   const rows = expectedRows.rows || [];
-  view.innerHTML = backBar('Ожидаемые')
+  view.innerHTML = head('Ожидаемые', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(expectedRows.note || '')}</div>`
     + (expectedRows.stale ? `<div class="note">Страницы сейчас недоступны: показаны прошлые данные${expectedRows.stale_reason ? ' (' + esc(expectedRows.stale_reason) + ')' : ''}.</div>` : '')
-    + `<div class="toolbar"><button class="primary" id="expRefresh">${expectedRows.loading ? 'Обновляю…' : 'Обновить сейчас'}</button></div>`
+    + `<div class="bar"><button class="primary" data-act="expected-refresh">${expectedRows.loading ? 'Обновляю…' : 'Обновить с портов'}</button></div>`
     + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · судов ${rows.length}</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi || '')}">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || 'Без имени')}</div>
@@ -499,18 +661,6 @@ async function renderExpected() {
         <span class="tag ${r.stale ? 'warn' : 'ok'}">${r.stale ? 'устарело' : 'ожидается'}</span>
         ${r.mmsi ? `<span class="tag">MMSI ${esc(r.mmsi)}</span>` : ''}
       </div></article>`).join('') : '<div class="empty">Пока никто не заявил наш порт</div>');
-  const button = document.getElementById('expRefresh');
-  if (button) button.addEventListener('click', async () => {
-    button.disabled = true; button.textContent = 'Запрашиваю порты…';
-    try {
-      await post('/api/expected/refresh');
-      setTimeout(async () => {
-        expectedRows = null;
-        try { expectedRows = await api('/api/expected'); } catch (e) {}
-        if (tab === 'expected') renderExpected();
-      }, 12000);
-    } catch (e) { button.textContent = 'Не удалось'; button.disabled = false; }
-  });
 }
 
 /* ---------------------------------------------------------- алерты */
@@ -518,11 +668,11 @@ async function renderAlerts() {
   if (!alertsRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
     try { alertsRows = await api('/api/alerts'); } catch (e) {
-      view.innerHTML = backBar('Алерты') + '<div class="empty">Не удалось получить журнал</div>'; return; }
+      view.innerHTML = head('Алерты') + '<div class="empty">Не удалось получить журнал</div>'; return; }
   }
   if (tab !== 'alerts') return;
   const rows = alertsRows.rows || [];
-  view.innerHTML = backBar('Алерты')
+  view.innerHTML = head('Алерты', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(alertsRows.note || '')}</div>`
     + (rows.length ? rows.map(r => `<article class="card">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || r.mmsi || '—')}</div>
@@ -538,11 +688,11 @@ async function renderServices() {
   if (!servicesRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
     try { servicesRows = await api('/api/services'); } catch (e) {
-      view.innerHTML = backBar('Сервисы') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+      view.innerHTML = head('Сервисы') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'services') return;
   const rows = servicesRows.rows || [];
-  view.innerHTML = backBar('Сервисы')
+  view.innerHTML = head('Сервисы', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(servicesRows.note || '')}</div>`
     + `<div class="hint">Сбор данных: ${servicesRows.running ? 'запущен' : 'остановлен'} · версия ${esc(servicesRows.version || '')}</div>`
     + rows.map(r => `<article class="card">
@@ -550,7 +700,7 @@ async function renderServices() {
       <div class="small">${esc(r.detail || '')}</div></div>
       <span class="tag ${r.state === 'on' ? 'ok' : r.state === 'off' ? 'bad' : 'warn'}">${esc(r.state_text)}</span></div>
       </article>`).join('')
-    + `<div class="toolbar"><button onclick="restartCore(this)">Перезапустить сбор</button></div>`;
+    + `<div class="bar"><button class="primary" data-act="restart">Перезапустить сбор</button></div>`;
 }
 
 /* -------------------------------------------------------- настройки */
@@ -558,12 +708,12 @@ async function renderSettings() {
   if (!settingsData) {
     view.innerHTML = '<div class="empty">Загружаю настройки…</div>';
     try { settingsData = await api('/api/settings'); } catch (e) {
-      view.innerHTML = backBar('Настройки') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+      view.innerHTML = head('Настройки') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'settings') return;
   const ports = settingsData.ports || [], numbers = settingsData.numbers || [],
         sources = settingsData.sources || [];
-  view.innerHTML = backBar('Настройки')
+  view.innerHTML = head('Настройки', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<form id="setForm">
       <div class="card">
         <div class="name" style="font-size:15px;margin-bottom:4px">Отслеживать суда, идущие в порты</div>
@@ -579,7 +729,7 @@ async function renderSettings() {
         <div class="name" style="font-size:15px;margin-bottom:4px">Источники данных</div>
         ${sources.map(s => `<label class="check"><input type="checkbox" name="src" value="${esc(s.flag)}" ${s.on ? 'checked' : ''}><span>${esc(s.title)}</span></label>`).join('')}
       </div>
-      <div class="toolbar"><button class="primary" type="submit">Сохранить и перезапустить</button></div>
+      <div class="bar"><button class="primary" type="submit">Сохранить и перезапустить</button></div>
       <div class="hint" id="setInfo">База: ${esc(settingsData.database || '')}</div>
     </form>`;
   document.getElementById('setForm').addEventListener('submit', async ev => {
@@ -601,19 +751,12 @@ async function renderLog() {
   if (!logRows) {
     view.innerHTML = '<div class="empty">Загружаю журнал…</div>';
     try { logRows = await api('/api/log'); } catch (e) {
-      view.innerHTML = backBar('Журнал') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+      view.innerHTML = head('Журнал') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'log') return;
-  view.innerHTML = backBar('Журнал')
-    + `<div class="toolbar"><button id="logRefresh">Обновить</button></div>`
+  view.innerHTML = head('Журнал', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="hint">${esc(logRows.path || '')}</div>`
     + `<pre class="log">${esc((logRows.rows || []).join('\\n') || 'журнал пуст')}</pre>`;
-  const button = document.getElementById('logRefresh');
-  if (button) button.addEventListener('click', async () => {
-    button.disabled = true;
-    try { logRows = await api('/api/log'); } catch (e) {}
-    renderLog();
-  });
 }
 
 /* ------------------------------------------------------------ общее */
@@ -634,14 +777,57 @@ function render() {
 }
 function setTab(name) {
   tab = name;
-  const hash = SUBTABS.includes(name) ? 'more' : name;
+  const active = SUBTABS.includes(name) ? 'more' : name;
   if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
-  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === hash));
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === active));
   search.style.display = name === 'radar' ? 'block' : 'none';
   render();
 }
 document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
 search.addEventListener('input', () => { if (tab === 'radar') renderRadarList(); });
+
+refreshAll.addEventListener('click', () => busy(refreshAll, async () => {
+  clearCaches(); clearMapLayers(); await loadShips(); render();
+}, '…'));
+
+view.addEventListener('click', async ev => {
+  const more = ev.target.closest('[data-more]');
+  if (more) { setTab(more.dataset.more); return; }
+  const back = ev.target.closest('[data-back]');
+  if (back) { setTab('more'); return; }
+  const action = ev.target.closest('[data-act]');
+  if (action) {
+    const act = action.dataset.act;
+    if (act === 'refresh') {
+      await busy(action, async () => {
+        clearCaches(); clearMapLayers(); await loadShips(); render();
+      }, '…');
+      return;
+    }
+    if (act === 'restart') { await restartCore(action); clearCaches(); return; }
+    if (act === 'expected-refresh') {
+      await busy(action, async () => {
+        await post('/api/expected/refresh');
+        action.textContent = 'Запрашиваю порты…';
+        setTimeout(async () => {
+          expectedRows = null;
+          try { expectedRows = await api('/api/expected'); } catch (e) {}
+          if (tab === 'expected') renderExpected();
+        }, 12000);
+      });
+      return;
+    }
+    if (act === 'fit') {
+      mapView = {scale: 1, dx: 0, dy: 0};
+      chipFilter = 'target';
+      renderRadar();
+      return;
+    }
+    return;
+  }
+  const card = ev.target.closest('[data-mmsi]');
+  if (card && card.dataset.mmsi) openVessel(card.dataset.mmsi);
+});
 
 async function openVessel(mmsi) {
   sheet.classList.add('open');
@@ -705,12 +891,6 @@ function drawTrack(canvas, points) {
   g.fillStyle = '#ffd166'; g.beginPath(); g.arc(sx(last.lon), sy(last.lat), 4, 0, 7); g.fill();
 }
 sheet.addEventListener('click', e => { if (e.target.dataset.close !== undefined) sheet.classList.remove('open'); });
-view.addEventListener('click', e => {
-  const more = e.target.closest('[data-more]');
-  if (more) { setTab(more.dataset.more); return; }
-  const card = e.target.closest('[data-mmsi]');
-  if (card && card.dataset.mmsi) openVessel(card.dataset.mmsi);
-});
 
 search.style.display = 'block';
 if (location.hash) {
@@ -718,8 +898,7 @@ if (location.hash) {
   if (['radar', 'sea', 'plan', 'all', 'visits', 'link', 'more', ...SUBTABS].includes(name)) setTab(name);
 }
 loadShips();
-setInterval(() => { ships = null; seaRows = null; planRows = null; allRows = null; visitRows = null; linkRows = null;
-  trafficRows = null; alertsRows = null; servicesRows = null; logRows = null; loadShips(); }, 30000);
+setInterval(() => { clearCaches(); loadShips(); }, 30000);
 </script>
 </body>
 </html>

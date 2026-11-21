@@ -16,7 +16,7 @@ import mobile_server
 import portcalls
 import setup_page
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 
 class Server(ThreadingHTTPServer):
