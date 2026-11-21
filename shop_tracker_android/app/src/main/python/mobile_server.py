@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from mobile_page import PAGE
 
 APP_NAME = "Ship Tracker Mobile"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 DEFAULT_PORT = 8080
 DISCOVERY_PORT = 50505
 
@@ -648,6 +648,120 @@ class Data:
             row["open"] = not row.get("left_at")
         return rows
 
+    def nearest_port(self, lat, lon):
+        """Ближайший наш порт: (имя, км) или (None, None)."""
+        best, best_km = None, None
+        for port in self.ports:
+            try:
+                km = haversine_km(lat, lon, float(port["lat"]), float(port["lon"]))
+            except (TypeError, ValueError):
+                continue
+            if best_km is None or km < best_km:
+                best, best_km = port, km
+        return (best.get("name") if best else None), best_km
+
+    # ------------------------------------------------- трафик района
+    def traffic(self, limit: int = 400) -> dict:
+        """Всё, что плавает в рабочем районе, с путём за сутки.
+
+        Как в настольной вкладке «Трафик района»: без отбора по типу и без
+        привязки к нашим портам, зато с разбором пути по своим позициям:
+        сколько прошло за 24 часа, с какой средней скоростью на ходу и
+        откуда судно пришло в район.
+        """
+        boxes = []
+        for box in self.config.get("bounding_boxes") or []:
+            try:
+                (south, west), (north, east) = box
+                boxes.append((float(south), float(west), float(north), float(east)))
+            except (TypeError, ValueError):
+                continue
+
+        def inside(lat, lon):
+            if not boxes:
+                return True
+            return any(s <= lat <= n and w <= lon <= e for s, w, n, e in boxes)
+
+        fresh = []
+        for ship in self.query():
+            try:
+                lat, lon = float(ship["lat"]), float(ship["lon"])
+            except (TypeError, ValueError):
+                continue
+            age = ship.get("age_minutes")
+            if age is None or age > MAX_VIEW_AGE_HOURS * 60 or not inside(lat, lon):
+                continue
+            fresh.append(ship)
+
+        tracks = self.tracks_map(24.0)
+        rows = []
+        for ship in fresh:
+            points = tracks.get(ship["mmsi"]) or []
+            path_km = 0.0
+            moving_hours = 0.0
+            origin = ""
+            for previous, current in zip(points, points[1:]):
+                try:
+                    step = haversine_km(previous["lat"], previous["lon"],
+                                        current["lat"], current["lon"])
+                except (TypeError, ValueError):
+                    continue
+                first = parse_moment(previous.get("ts"))
+                last = parse_moment(current.get("ts"))
+                if first is None or last is None:
+                    continue
+                gap = (last - first).total_seconds() / 3600
+                # пропуски больше 12 ч — разрыв AIS, а не ход судна
+                if gap <= 0 or gap > 12:
+                    continue
+                path_km += step
+                if step >= MIN_SPEED_KNOTS * KNOT_KMH * gap:
+                    moving_hours += gap
+            if points:
+                start = points[0]
+                port = self.port_at(start["lat"], start["lon"])
+                origin = (str(port.get("name")) if port else
+                          f'{float(start["lat"]):.2f}, {float(start["lon"]):.2f}')
+            near_name, near_km = self.nearest_port(float(ship["lat"]), float(ship["lon"]))
+            rows.append(dict(
+                ship,
+                near_port=near_name,
+                near_km=(round(near_km) if near_km is not None else None),
+                path_km=round(path_km),
+                avg_knots=(round(path_km / moving_hours / KNOT_KMH, 1)
+                           if moving_hours > 0.05 else None),
+                origin=origin,
+            ))
+        rows.sort(key=lambda row: row.get("age_minutes") or 10 ** 6)
+        return {
+            "rows": rows[:max(1, min(limit, 1000))],
+            "total": len(rows),
+            "note": ("Всё, что плавает в рабочем районе — Дунай и Чёрное море: без "
+                     "отбора по типу и без привязки к нашим портам. «Путь 24 ч» — "
+                     "сумма отрезков между нашими позициями за сутки (пропуски больше "
+                     "12 ч не соединяются). «Средний ход» — только время на ходу. "
+                     "«Откуда» — первая позиция за сутки. «До порта» — до ближайшего "
+                     "из наших портов."),
+        }
+
+    # ---------------------------------------------------------- алерты
+    def alerts(self, limit: int = 200) -> dict:
+        """Журнал алертов: что отправлено и с каким результатом."""
+        rows = []
+        try:
+            con = self.connect()
+            rows = [dict(row) for row in con.execute(
+                "SELECT sent_at, mmsi, name, origin, destination, ok, error "
+                "FROM alerts ORDER BY id DESC LIMIT ?",
+                (max(1, min(limit, 500)),)).fetchall()]
+            con.close()
+        except sqlite3.Error:
+            pass
+        for row in rows:
+            row["ok"] = bool(row.get("ok"))
+        return {"rows": rows, "total": len(rows),
+                "note": "Журнал алертов: что отправлено и с каким результатом."}
+
     def vessel(self, mmsi) -> dict:
         """Судно целиком: паспорт, позиция, последние точки и стоянки."""
         mmsi = str(mmsi or "").strip()
@@ -837,6 +951,17 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = 80
             self.send_json({"rows": self.data.visits(limit)})
+            return
+        if path == "/api/traffic":
+            try:
+                limit = int((params.get("limit") or ["400"])[0])
+            except ValueError:
+                limit = 400
+            self.send_json(self.data.memo("traffic", 45.0,
+                                          lambda: self.data.traffic(limit)))
+            return
+        if path == "/api/alerts":
+            self.send_json(self.data.memo("alerts", 15.0, self.data.alerts))
             return
         self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
 

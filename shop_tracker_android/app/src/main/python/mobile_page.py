@@ -2,6 +2,8 @@
 
 Здесь только разметка, стили и сценарий: данные приходят из
 `shop_tracker_mob.py` по /api/… — те же расчёты, что в настольной версии.
+Вкладка «Ещё» открывает то, что в настольной версии разложено по отдельным
+вкладкам: трафик района, ожидаемые, алерты, сервисы, настройки и журнал.
 """
 
 PAGE = """<!doctype html>
@@ -38,6 +40,7 @@ input[type=search]::placeholder { color: #6d8299; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
   padding: 12px 14px; margin-bottom: 9px; }
 .card.pinned { border-color: #3f7fae; }
+.card.tap { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
 .row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
 .name { font-size: 16px; font-weight: 650; }
 .star { color: #ffd166; margin-left: 4px; }
@@ -52,11 +55,28 @@ input[type=search]::placeholder { color: #6d8299; }
 .note { font-size: 12px; color: #9db6cc; background: #10202e; border: 1px solid var(--line);
   border-radius: 12px; padding: 9px 11px; margin: 0 0 10px; }
 .empty { text-align: center; color: var(--dim); padding: 40px 10px; font-size: 14px; }
+.back { display: inline-flex; align-items: center; gap: 6px; background: none; border: 0;
+  color: var(--accent); font-size: 14px; padding: 8px 2px; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin: 4px 0 10px; }
+.toolbar button { flex: 1; padding: 11px; font-size: 14px; border-radius: 12px; border: 1px solid var(--line);
+  background: #13263a; color: var(--text); }
+.toolbar button.primary { background: #1e4f7a; border-color: #2f6c9e; color: #fff; font-weight: 600; }
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; color: #a9c2d8; margin-bottom: 5px; }
+.field input { width: 100%; padding: 11px 13px; font-size: 16px; border-radius: 12px;
+  border: 1px solid var(--line); background: #12222f; color: var(--text); outline: none; }
+.check { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid #16283a; }
+.check:last-child { border-bottom: 0; }
+.check input { width: 20px; height: 20px; accent-color: #4aa8ff; flex: none; }
+.check span { font-size: 14px; }
+pre.log { white-space: pre-wrap; word-break: break-word; font: 11px/1.45 Consolas, monospace;
+  color: #a9c2d8; background: #0a1522; border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px; max-height: 65vh; overflow: auto; margin: 0; }
 nav { position: fixed; left: 0; right: 0; bottom: 0; z-index: 9; display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   background: rgba(13,26,38,.98); border-top: 1px solid var(--line);
-  padding: 6px 3px calc(6px + env(safe-area-inset-bottom)); }
-nav button { min-width: 0; background: none; border: 0; color: #7d95ad; font-size: 9.5px;
+  padding: 6px 2px calc(6px + env(safe-area-inset-bottom)); }
+nav button { min-width: 0; background: none; border: 0; color: #7d95ad; font-size: 9px;
   display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 0;
   white-space: nowrap; }
 nav button.on { color: var(--accent); }
@@ -71,6 +91,9 @@ nav svg { width: 21px; height: 21px; }
   margin: 0 auto 10px; }
 .kv { display: grid; grid-template-columns: 128px 1fr; gap: 4px 8px; font-size: 14px; margin-top: 10px; }
 .kv dt { color: var(--dim); } .kv dd { margin: 0; }
+.links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.links a { font-size: 13px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: #13263a; color: #9fd0ff; text-decoration: none; }
 canvas { width: 100%; display: block; border-radius: 16px; background: #0a1a27; }
 #map { height: calc(100vh - 370px); min-height: 220px; max-height: 560px; }
 .plan { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
@@ -95,6 +118,7 @@ a { color: #7cc4ff; }
   <button data-tab="all"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h16"/></svg>Все суда</button>
   <button data-tab="visits"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17h18M5 17V9l7-5 7 5v8"/><path d="M9 17v-4h6v4"/></svg>Стоянки</button>
   <button data-tab="link"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="2.5"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/><circle cx="12" cy="12" r="9"/></svg>Связь</button>
+  <button data-tab="more"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>Ещё</button>
 </nav>
 <div class="sheet" id="sheet"><div class="backdrop" data-close></div>
   <div class="panel"><div class="handle"></div><div id="sheetBody"></div></div>
@@ -107,8 +131,11 @@ const search = document.getElementById('search');
 const sheet = document.getElementById('sheet');
 const sheetBody = document.getElementById('sheetBody');
 let tab = 'radar', ships = null, ports = [], seaRows = null, planRows = null,
-    allRows = null, visitRows = null, visitHistory = false, linkRows = null;
+    allRows = null, visitRows = null, visitHistory = false, linkRows = null,
+    trafficRows = null, expectedRows = null, alertsRows = null,
+    servicesRows = null, settingsData = null, logRows = null;
 let portFilter = '', seaFilter = '', chipFilter = 'all', mapShips = [];
+const SUBTABS = ['traffic', 'expected', 'alerts', 'services', 'settings', 'log'];
 
 const esc = v => String(v ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s]));
 function ago(m) {
@@ -124,6 +151,10 @@ async function api(url) {
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }
+async function post(url, data) {
+  const r = await fetch(url, {method: 'POST', body: data || ''});
+  return r.json();
+}
 async function loadShips() {
   try {
     const data = await api('/api/ships?limit=2000');
@@ -135,8 +166,8 @@ async function loadShips() {
     if (tab === 'radar') renderRadar();
   } catch (e) {
     dot.className = 'dot off';
-    statusEl.textContent = 'нет связи с компьютером';
-    view.innerHTML = '<div class="empty">Нет связи.<br>Проверьте, что Ship Tracker запущен на компьютере,<br>и телефон в той же Wi-Fi сети.</div>';
+    statusEl.textContent = 'нет связи с приложением';
+    view.innerHTML = '<div class="empty">Нет связи с приложением.<br>Перезапустите Ship Tracker и обновите страницу.</div>';
   }
 }
 
@@ -389,7 +420,200 @@ async function renderLink() {
       <div class="small">${esc(r.detail || '')}</div></div>
       <span class="tag ${r.state === 'on' ? 'ok' : r.state === 'off' ? 'bad' : 'warn'}">${esc(r.state_text)}</span></div>
       </article>`).join('')
+    + `<div class="toolbar"><button onclick="restartCore(this)">Перезапустить сбор</button></div>`
     + `<div class="hint">База: ${esc(linkRows.database || '')}<br>Версия мобильной: ${esc(linkRows.version || '')} · версия программы на компьютере: ${esc(linkRows.desktop_version || '—')}</div>`;
+}
+
+async function restartCore(button) {
+  button.disabled = true; button.textContent = 'Перезапускаю…';
+  try { await post('/api/restart'); button.textContent = 'Сбор перезапущен'; }
+  catch (e) { button.textContent = 'Не удалось перезапустить'; }
+  setTimeout(() => { button.disabled = false; button.textContent = 'Перезапустить сбор'; }, 2500);
+}
+
+/* ------------------------------------------------------------- ещё */
+const MORE = [
+  ['traffic', 'Трафик района', 'Всё, что плавает в Дунае и Чёрном море: путь за 24 ч, средний ход, откуда пришло'],
+  ['expected', 'Ожидаемые', 'Кто указал наш порт пунктом назначения (страницы AIS-catcher)'],
+  ['alerts', 'Алерты', 'Журнал: что отправлено и с каким результатом'],
+  ['services', 'Сервисы', 'Источники: включены ли, есть ли ключ, что говорит сбор'],
+  ['settings', 'Настройки', 'Порты, фильтры и источники — как вкладка «Фильтры»'],
+  ['log', 'Журнал', 'Последние строки журнала приложения'],
+];
+function backBar(title) {
+  return `<button class="back" onclick="setTab('more')">‹ Ещё</button>
+    <h2 style="font-size:17px;margin:2px 0 8px">${esc(title)}</h2>`;
+}
+function renderMore() {
+  view.innerHTML = `<div class="note">Всё, что в настольной версии разложено по отдельным вкладкам.</div>`
+    + MORE.map(([name, title, detail]) => `<article class="card tap" data-more="${name}">
+      <div><div class="name" style="font-size:15px">${esc(title)}</div>
+      <div class="small">${esc(detail)}</div></div><div class="sog">›</div></article>`).join('');
+}
+
+/* --------------------------------------------------- трафик района */
+async function renderTraffic() {
+  if (!trafficRows) {
+    view.innerHTML = '<div class="empty">Считаю трафик района…</div>';
+    try { trafficRows = await api('/api/traffic'); } catch (e) {
+      view.innerHTML = backBar('Трафик района') + '<div class="empty">Не удалось получить список</div>'; return; }
+  }
+  if (tab !== 'traffic') return;
+  const rows = trafficRows.rows || [];
+  view.innerHTML = backBar('Трафик района')
+    + `<div class="note">${esc(trafficRows.note || '')}</div>`
+    + `<div class="hint">Судов в районе: ${trafficRows.total ?? rows.length}</div>`
+    + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi)}">
+      <div class="row"><div><div class="name">${esc(r.name || 'Без имени')}</div>
+      <div class="small">MMSI ${esc(r.mmsi)}${r.type_label ? ' · ' + esc(r.type_label) : ''}${r.destination ? ' · → ' + esc(r.destination) : ''}</div></div>
+      <div class="sog">${r.sog == null ? '—' : Number(r.sog).toFixed(1)} уз</div></div>
+      <div class="meta">
+        ${r.near_km != null ? `<span class="tag">${esc(r.near_port)} · ${r.near_km} км</span>` : ''}
+        <span class="tag">путь 24 ч: ${r.path_km ?? 0} км</span>
+        ${r.avg_knots != null ? `<span class="tag">ср. ход ${r.avg_knots} уз</span>` : ''}
+        ${r.origin ? `<span class="tag">откуда ${esc(r.origin)}</span>` : ''}
+        <span class="tag ${(r.age_minutes ?? 0) > 180 ? 'bad' : ''}">${ago(r.age_minutes)}</span>
+      </div></article>`).join('') : '<div class="empty">В районе нет судов с позицией</div>');
+}
+
+/* ------------------------------------------------------ ожидаемые */
+async function renderExpected() {
+  if (!expectedRows) {
+    view.innerHTML = '<div class="empty">Загружаю…</div>';
+    try { expectedRows = await api('/api/expected'); } catch (e) {
+      view.innerHTML = backBar('Ожидаемые') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+  }
+  if (tab !== 'expected') return;
+  const rows = expectedRows.rows || [];
+  view.innerHTML = backBar('Ожидаемые')
+    + `<div class="note">${esc(expectedRows.note || '')}</div>`
+    + (expectedRows.stale ? `<div class="note">Страницы сейчас недоступны: показаны прошлые данные${expectedRows.stale_reason ? ' (' + esc(expectedRows.stale_reason) + ')' : ''}.</div>` : '')
+    + `<div class="toolbar"><button class="primary" id="expRefresh">${expectedRows.loading ? 'Обновляю…' : 'Обновить сейчас'}</button></div>`
+    + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · судов ${rows.length}</div>`
+    + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi || '')}">
+      <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || 'Без имени')}</div>
+      <div class="small">${esc(r.port)}${r.type ? ' · ' + esc(r.type) : ''}</div></div>
+      <div class="sog" style="font-size:12px">${esc(r.eta || 'ETA —')}</div></div>
+      <div class="meta">
+        ${r.last_heard ? `<span class="tag">сигнал ${esc(r.last_heard)}</span>` : ''}
+        <span class="tag ${r.stale ? 'warn' : 'ok'}">${r.stale ? 'устарело' : 'ожидается'}</span>
+        ${r.mmsi ? `<span class="tag">MMSI ${esc(r.mmsi)}</span>` : ''}
+      </div></article>`).join('') : '<div class="empty">Пока никто не заявил наш порт</div>');
+  const button = document.getElementById('expRefresh');
+  if (button) button.addEventListener('click', async () => {
+    button.disabled = true; button.textContent = 'Запрашиваю порты…';
+    try {
+      await post('/api/expected/refresh');
+      setTimeout(async () => {
+        expectedRows = null;
+        try { expectedRows = await api('/api/expected'); } catch (e) {}
+        if (tab === 'expected') renderExpected();
+      }, 12000);
+    } catch (e) { button.textContent = 'Не удалось'; button.disabled = false; }
+  });
+}
+
+/* ---------------------------------------------------------- алерты */
+async function renderAlerts() {
+  if (!alertsRows) {
+    view.innerHTML = '<div class="empty">Загружаю…</div>';
+    try { alertsRows = await api('/api/alerts'); } catch (e) {
+      view.innerHTML = backBar('Алерты') + '<div class="empty">Не удалось получить журнал</div>'; return; }
+  }
+  if (tab !== 'alerts') return;
+  const rows = alertsRows.rows || [];
+  view.innerHTML = backBar('Алерты')
+    + `<div class="note">${esc(alertsRows.note || '')}</div>`
+    + (rows.length ? rows.map(r => `<article class="card">
+      <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || r.mmsi || '—')}</div>
+      <div class="small">${esc(r.origin || '—')} → ${esc(r.destination || '—')}</div></div>
+      <span class="tag ${r.ok ? 'ok' : 'bad'}">${r.ok ? 'отправлен' : 'ошибка'}</span></div>
+      <div class="meta"><span class="tag">${esc((r.sent_at || '').slice(0, 16).replace('T', ' '))}</span>
+        ${r.error ? `<span class="tag bad">${esc(r.error)}</span>` : ''}</div>
+      </article>`).join('') : '<div class="empty">Журнал пуст</div>');
+}
+
+/* --------------------------------------------------------- сервисы */
+async function renderServices() {
+  if (!servicesRows) {
+    view.innerHTML = '<div class="empty">Загружаю…</div>';
+    try { servicesRows = await api('/api/services'); } catch (e) {
+      view.innerHTML = backBar('Сервисы') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+  }
+  if (tab !== 'services') return;
+  const rows = servicesRows.rows || [];
+  view.innerHTML = backBar('Сервисы')
+    + `<div class="note">${esc(servicesRows.note || '')}</div>`
+    + `<div class="hint">Сбор данных: ${servicesRows.running ? 'запущен' : 'остановлен'} · версия ${esc(servicesRows.version || '')}</div>`
+    + rows.map(r => `<article class="card">
+      <div class="row"><div><div class="name" style="font-size:15px">${esc(r.title)}</div>
+      <div class="small">${esc(r.detail || '')}</div></div>
+      <span class="tag ${r.state === 'on' ? 'ok' : r.state === 'off' ? 'bad' : 'warn'}">${esc(r.state_text)}</span></div>
+      </article>`).join('')
+    + `<div class="toolbar"><button onclick="restartCore(this)">Перезапустить сбор</button></div>`;
+}
+
+/* -------------------------------------------------------- настройки */
+async function renderSettings() {
+  if (!settingsData) {
+    view.innerHTML = '<div class="empty">Загружаю настройки…</div>';
+    try { settingsData = await api('/api/settings'); } catch (e) {
+      view.innerHTML = backBar('Настройки') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+  }
+  if (tab !== 'settings') return;
+  const ports = settingsData.ports || [], numbers = settingsData.numbers || [],
+        sources = settingsData.sources || [];
+  view.innerHTML = backBar('Настройки')
+    + `<form id="setForm">
+      <div class="card">
+        <div class="name" style="font-size:15px;margin-bottom:4px">Отслеживать суда, идущие в порты</div>
+        <div class="small" style="margin-bottom:6px">Если не отмечено ни одного — берутся все наши порты.</div>
+        ${ports.map(p => `<label class="check"><input type="checkbox" name="port" value="${esc(p.name)}" ${p.on ? 'checked' : ''}><span>${esc(p.label || p.name)}</span></label>`).join('')}
+      </div>
+      <div class="card">
+        <div class="name" style="font-size:15px;margin-bottom:8px">Пороги</div>
+        ${numbers.map(n => `<div class="field"><label>${esc(n.label)}</label>
+          <input type="number" step="any" name="${esc(n.key)}" value="${esc(n.value)}"></div>`).join('')}
+      </div>
+      <div class="card">
+        <div class="name" style="font-size:15px;margin-bottom:4px">Источники данных</div>
+        ${sources.map(s => `<label class="check"><input type="checkbox" name="src" value="${esc(s.flag)}" ${s.on ? 'checked' : ''}><span>${esc(s.title)}</span></label>`).join('')}
+      </div>
+      <div class="toolbar"><button class="primary" type="submit">Сохранить и перезапустить</button></div>
+      <div class="hint" id="setInfo">База: ${esc(settingsData.database || '')}</div>
+    </form>`;
+  document.getElementById('setForm').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const info = document.getElementById('setInfo');
+    const body = new URLSearchParams(new FormData(ev.target));
+    info.textContent = 'Сохраняю…';
+    try {
+      const result = await post('/api/settings', body);
+      if (!result.ok) throw new Error(result.error || 'не сохранилось');
+      info.textContent = 'Сохранено, сбор данных перезапускается.';
+      settingsData = null; linkRows = null; servicesRows = null;
+    } catch (e) { info.textContent = 'Ошибка: ' + e.message; }
+  });
+}
+
+/* ----------------------------------------------------------- журнал */
+async function renderLog() {
+  if (!logRows) {
+    view.innerHTML = '<div class="empty">Загружаю журнал…</div>';
+    try { logRows = await api('/api/log'); } catch (e) {
+      view.innerHTML = backBar('Журнал') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
+  }
+  if (tab !== 'log') return;
+  view.innerHTML = backBar('Журнал')
+    + `<div class="toolbar"><button id="logRefresh">Обновить</button></div>`
+    + `<div class="hint">${esc(logRows.path || '')}</div>`
+    + `<pre class="log">${esc((logRows.rows || []).join('\\n') || 'журнал пуст')}</pre>`;
+  const button = document.getElementById('logRefresh');
+  if (button) button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { logRows = await api('/api/log'); } catch (e) {}
+    renderLog();
+  });
 }
 
 /* ------------------------------------------------------------ общее */
@@ -399,12 +623,20 @@ function render() {
   else if (tab === 'plan') renderPlan();
   else if (tab === 'all') renderAll();
   else if (tab === 'visits') renderVisits();
-  else renderLink();
+  else if (tab === 'link') renderLink();
+  else if (tab === 'more') renderMore();
+  else if (tab === 'traffic') renderTraffic();
+  else if (tab === 'expected') renderExpected();
+  else if (tab === 'alerts') renderAlerts();
+  else if (tab === 'services') renderServices();
+  else if (tab === 'settings') renderSettings();
+  else if (tab === 'log') renderLog();
 }
 function setTab(name) {
   tab = name;
+  const hash = SUBTABS.includes(name) ? 'more' : name;
   if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
-  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === hash));
   search.style.display = name === 'radar' ? 'block' : 'none';
   render();
 }
@@ -420,6 +652,15 @@ async function openVessel(mmsi) {
     const mapUrl = `https://www.google.com/maps?q=${v.lat},${v.lon}`;
     const hist = (v.history || []).slice().reverse();
     const visits = (v.visits || []).map(p => `<div>${esc(p.port)} · ${esc((p.entered_at || '').slice(0, 16).replace('T', ' '))}${p.left_at ? ' → ' + esc((p.left_at || '').slice(0, 16).replace('T', ' ')) : ' · стоит'}</div>`).join('');
+    const name = encodeURIComponent(v.name || '');
+    const links = [
+      ['MarineTraffic', `https://www.marinetraffic.com/en/ais/details/ships/mmsi:${v.mmsi}`],
+      ['VesselFinder', `https://www.vesselfinder.com/vessels?name=${name}`],
+      ['ShipFinder', `https://shipfinder.co/`],
+      ['MyShipTracking', `https://www.myshiptracking.com/?mmsi=${v.mmsi}`],
+      ['Open Waters', `https://openwaters.io/ais/`],
+      ['Google Maps', mapUrl],
+    ];
     sheetBody.innerHTML = `
       <div class="row"><div><div class="name" style="font-size:19px">${esc(v.name || 'Без имени')}</div>
       <div class="small">MMSI ${esc(v.mmsi)}${v.imo ? ' · IMO ' + esc(v.imo) : ''}${v.callsign ? ' · ' + esc(v.callsign) : ''}</div></div>
@@ -439,6 +680,7 @@ async function openVessel(mmsi) {
         <dt>Тип</dt><dd>${esc(v.type_label || '—')}</dd>
         <dt>До порта</dt><dd>${v.distance_km ?? '—'} км</dd>
       </dl>
+      <div class="links">${links.map(([title, url]) => `<a href="${url}" target="_blank" rel="noopener">${esc(title)}</a>`).join('')}</div>
       <div class="hint" style="margin-top:14px">История позиций (${hist.length})</div>
       <canvas id="track" height="110"></canvas>
       <div class="hint" style="margin-top:14px">Стоянки</div>
@@ -464,17 +706,20 @@ function drawTrack(canvas, points) {
 }
 sheet.addEventListener('click', e => { if (e.target.dataset.close !== undefined) sheet.classList.remove('open'); });
 view.addEventListener('click', e => {
+  const more = e.target.closest('[data-more]');
+  if (more) { setTab(more.dataset.more); return; }
   const card = e.target.closest('[data-mmsi]');
-  if (card) openVessel(card.dataset.mmsi);
+  if (card && card.dataset.mmsi) openVessel(card.dataset.mmsi);
 });
 
 search.style.display = 'block';
 if (location.hash) {
   const name = location.hash.slice(1);
-  if (['radar', 'sea', 'plan', 'all', 'visits', 'link'].includes(name)) setTab(name);
+  if (['radar', 'sea', 'plan', 'all', 'visits', 'link', 'more', ...SUBTABS].includes(name)) setTab(name);
 }
 loadShips();
-setInterval(() => { ships = null; seaRows = null; planRows = null; allRows = null; visitRows = null; linkRows = null; loadShips(); }, 30000);
+setInterval(() => { ships = null; seaRows = null; planRows = null; allRows = null; visitRows = null; linkRows = null;
+  trafficRows = null; alertsRows = null; servicesRows = null; logRows = null; loadShips(); }, 30000);
 </script>
 </body>
 </html>

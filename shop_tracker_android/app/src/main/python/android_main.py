@@ -190,6 +190,21 @@ def restart_core() -> None:
     start_core()
 
 
+def core_running() -> bool:
+    return _core is not None
+
+
+def core_status() -> dict:
+    """Что сбор говорит о каждом источнике: ключ — имя сервиса."""
+    if _core is None:
+        return {}
+    status = getattr(_core, "service_status", None) or {}
+    try:
+        return {str(key): str(value) for key, value in status.items()}
+    except Exception:
+        return {}
+
+
 def _start_server() -> None:
     global _server
     import android_server
