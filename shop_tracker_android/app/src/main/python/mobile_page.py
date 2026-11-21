@@ -160,8 +160,9 @@ const refreshAll = document.getElementById('refreshAll');
 let tab = 'radar', ships = null, ports = [], seaRows = null, planRows = null,
     allRows = null, visitRows = null, visitHistory = false, linkRows = null,
     trafficRows = null, expectedRows = null, alertsRows = null,
-    servicesRows = null, settingsData = null, logRows = null,
+    servicesRows = null, settingsData = null, logRows = null, sourcesRows = null,
     tracks = null, forecastPts = null;
+let trafficSort = 'age', expectedFilter = 'all', alertFilter = 'all';
 let seaFilter = '', chipFilter = 'all', mapShips = [];
 let showTracks = false, showForecast = false;
 let mapView = {scale: 1, dx: 0, dy: 0};
@@ -191,7 +192,7 @@ async function post(url, data) {
 }
 function clearCaches() {
   ships = seaRows = planRows = allRows = visitRows = linkRows = trafficRows =
-    alertsRows = servicesRows = logRows = null;
+    alertsRows = servicesRows = logRows = sourcesRows = null;
 }
 /* Треки и прогноз для карты — тяжёлые: не сбрасываем их каждые 30 секунд,
    только по кнопке «Обновить». */
@@ -614,6 +615,8 @@ function renderMore() {
 }
 
 /* --------------------------------------------------- трафик района */
+const TRAFFIC_SORTS = [['age', 'Свежие'], ['path', 'Длинный путь'],
+                       ['speed', 'Быстрый ход'], ['near', 'Ближе к порту']];
 async function renderTraffic() {
   if (!trafficRows) {
     view.innerHTML = '<div class="empty">Считаю трафик района…</div>';
@@ -621,24 +624,38 @@ async function renderTraffic() {
       view.innerHTML = head('Трафик района') + '<div class="empty">Не удалось получить список</div>'; return; }
   }
   if (tab !== 'traffic') return;
-  const rows = trafficRows.rows || [];
+  const rows = (trafficRows.rows || []).slice();
+  const moving = rows.filter(r => Number(r.sog) >= 0.5).length;
+  const sorters = {
+    age: (a, b) => (a.age_minutes ?? 1e9) - (b.age_minutes ?? 1e9),
+    path: (a, b) => (b.path_km || 0) - (a.path_km || 0),
+    speed: (a, b) => (b.avg_knots || 0) - (a.avg_knots || 0),
+    near: (a, b) => (a.near_km ?? 1e9) - (b.near_km ?? 1e9),
+  };
+  rows.sort(sorters[trafficSort] || sorters.age);
+  const sortTitle = (TRAFFIC_SORTS.find(s => s[0] === trafficSort) || ['', 'свежие'])[1];
   view.innerHTML = head('Трафик района', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(trafficRows.note || '')}</div>`
-    + `<div class="hint">Судов в районе: ${trafficRows.total ?? rows.length}</div>`
+    + `<div class="chips">${TRAFFIC_SORTS.map(([key, title]) =>
+        `<button class="chip ${trafficSort === key ? 'on' : ''}" data-traffic-sort="${key}">${esc(title)}</button>`).join('')}</div>`
+    + `<div class="hint">В районе: ${trafficRows.total ?? rows.length} · в ходу: ${moving} · на экране: ${rows.length} · порядок: ${esc(sortTitle.toLowerCase())}</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi)}">
       <div class="row"><div><div class="name">${esc(r.name || 'Без имени')}</div>
       <div class="small">MMSI ${esc(r.mmsi)}${r.type_label ? ' · ' + esc(r.type_label) : ''}${r.destination ? ' · → ' + esc(r.destination) : ''}</div></div>
       <div class="sog">${r.sog == null ? '—' : Number(r.sog).toFixed(1)} уз</div></div>
       <div class="meta">
+        <span class="tag ${Number(r.sog) >= 0.5 ? 'ok' : ''}">${Number(r.sog) >= 0.5 ? 'в ходу' : 'стоит'}</span>
         ${r.near_km != null ? `<span class="tag">${esc(r.near_port)} · ${r.near_km} км</span>` : ''}
         <span class="tag">путь 24 ч: ${r.path_km ?? 0} км</span>
         ${r.avg_knots != null ? `<span class="tag">ср. ход ${r.avg_knots} уз</span>` : ''}
         ${r.origin ? `<span class="tag">откуда ${esc(r.origin)}</span>` : ''}
+        ${r.cog != null ? `<span class="tag">курс ${esc(r.cog)}°</span>` : ''}
         <span class="tag ${(r.age_minutes ?? 0) > 180 ? 'bad' : ''}">${ago(r.age_minutes)}</span>
       </div></article>`).join('') : '<div class="empty">В районе нет судов с позицией</div>');
 }
 
 /* ------------------------------------------------------ ожидаемые */
+const EXPECTED_FILTERS = [['all', 'Все'], ['fresh', 'Актуальные'], ['stale', 'Устаревшие']];
 async function renderExpected() {
   if (!expectedRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
@@ -646,12 +663,19 @@ async function renderExpected() {
       view.innerHTML = head('Ожидаемые') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'expected') return;
-  const rows = expectedRows.rows || [];
+  const all = expectedRows.rows || [];
+  const staleCount = all.filter(r => r.stale).length;
+  const rows = expectedFilter === 'stale' ? all.filter(r => r.stale)
+    : expectedFilter === 'fresh' ? all.filter(r => !r.stale) : all;
   view.innerHTML = head('Ожидаемые', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(expectedRows.note || '')}</div>`
     + (expectedRows.stale ? `<div class="note">Страницы сейчас недоступны: показаны прошлые данные${expectedRows.stale_reason ? ' (' + esc(expectedRows.stale_reason) + ')' : ''}.</div>` : '')
+    + `<div class="chips">${EXPECTED_FILTERS.map(([key, title]) => {
+        const count = key === 'all' ? all.length : key === 'stale' ? staleCount : all.length - staleCount;
+        return `<button class="chip ${expectedFilter === key ? 'on' : ''}" data-expected-filter="${key}">${esc(title)} · ${count}</button>`;
+      }).join('')}</div>`
     + `<div class="bar"><button class="primary" data-act="expected-refresh">${expectedRows.loading ? 'Обновляю…' : 'Обновить с портов'}</button></div>`
-    + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · судов ${rows.length}</div>`
+    + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · автообновление раз в минуту</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi || '')}">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || 'Без имени')}</div>
       <div class="small">${esc(r.port)}${r.type ? ' · ' + esc(r.type) : ''}</div></div>
@@ -664,6 +688,7 @@ async function renderExpected() {
 }
 
 /* ---------------------------------------------------------- алерты */
+const ALERT_FILTERS = [['all', 'Все'], ['ok', 'Доставлены'], ['bad', 'Ошибки']];
 async function renderAlerts() {
   if (!alertsRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
@@ -671,19 +696,43 @@ async function renderAlerts() {
       view.innerHTML = head('Алерты') + '<div class="empty">Не удалось получить журнал</div>'; return; }
   }
   if (tab !== 'alerts') return;
-  const rows = alertsRows.rows || [];
+  const all = alertsRows.rows || [];
+  const badCount = all.filter(r => !r.ok).length;
+  const rows = alertFilter === 'ok' ? all.filter(r => r.ok)
+    : alertFilter === 'bad' ? all.filter(r => !r.ok) : all;
   view.innerHTML = head('Алерты', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(alertsRows.note || '')}</div>`
+    + `<div class="chips">${ALERT_FILTERS.map(([key, title]) => {
+        const count = key === 'all' ? all.length : key === 'bad' ? badCount : all.length - badCount;
+        return `<button class="chip ${alertFilter === key ? 'on' : ''}" data-alert-filter="${key}">${esc(title)} · ${count}</button>`;
+      }).join('')}</div>`
+    + `<div class="hint">Отправлено: ${all.length - badCount} · с ошибкой: ${badCount}</div>`
     + (rows.length ? rows.map(r => `<article class="card">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || r.mmsi || '—')}</div>
       <div class="small">${esc(r.origin || '—')} → ${esc(r.destination || '—')}</div></div>
       <span class="tag ${r.ok ? 'ok' : 'bad'}">${r.ok ? 'отправлен' : 'ошибка'}</span></div>
       <div class="meta"><span class="tag">${esc((r.sent_at || '').slice(0, 16).replace('T', ' '))}</span>
+        ${r.mmsi ? `<span class="tag">MMSI ${esc(r.mmsi)}</span>` : ''}
         ${r.error ? `<span class="tag bad">${esc(r.error)}</span>` : ''}</div>
       </article>`).join('') : '<div class="empty">Журнал пуст</div>');
 }
 
 /* --------------------------------------------------------- сервисы */
+const SERVICE_LINKS = [
+  ['VesselFinder', 'https://www.vesselfinder.com/'],
+  ['MarineTraffic', 'https://www.marinetraffic.com/'],
+  ['MyShipTracking', 'https://www.myshiptracking.com/'],
+  ['AIS Marine Traffic', 'https://www.aismarinetraffic.com/'],
+  ['Equasis (тип, дедвейт)', 'https://www.equasis.org/'],
+  ['IMO GISIS (реестр)', 'https://gisis.imo.org/'],
+  ['Open Waters (карта и API)', 'https://openwaters.io/ais/'],
+];
+function sourceTag(result) {
+  if (!result) return '<span class="tag">не проверялся</span>';
+  const state = result.warn ? 'warn' : result.ok ? 'ok' : 'bad';
+  const text = result.warn ? 'только в браузере' : result.ok ? 'работает' : 'не отвечает';
+  return `<span class="tag ${state}">${text}</span>`;
+}
 async function renderServices() {
   if (!servicesRows) {
     view.innerHTML = '<div class="empty">Загружаю…</div>';
@@ -691,15 +740,39 @@ async function renderServices() {
       view.innerHTML = head('Сервисы') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'services') return;
+  if (sourcesRows === null) {
+    api('/api/sources').then(data => {
+      sourcesRows = data;
+      if (tab === 'services') renderServices();
+    }).catch(() => { sourcesRows = {rows: [], unavailable: true}; });
+  }
   const rows = servicesRows.rows || [];
+  const online = sourcesRows && !sourcesRows.unavailable ? (sourcesRows.rows || []) : null;
   view.innerHTML = head('Сервисы', '<button class="iconbtn" data-act="refresh">⟳</button>')
     + `<div class="note">${esc(servicesRows.note || '')}</div>`
     + `<div class="hint">Сбор данных: ${servicesRows.running ? 'запущен' : 'остановлен'} · версия ${esc(servicesRows.version || '')}</div>`
     + rows.map(r => `<article class="card">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.title)}</div>
-      <div class="small">${esc(r.detail || '')}</div></div>
+      <div class="small">${esc(r.detail || '')}${r.needs_key ? (r.has_key ? ' · ключ есть' : ' · ключа нет') : ''}</div></div>
       <span class="tag ${r.state === 'on' ? 'ok' : r.state === 'off' ? 'bad' : 'warn'}">${esc(r.state_text)}</span></div>
       </article>`).join('')
+    + `<div class="hint" style="margin-top:12px">Онлайн-сервисы для проверки судна</div>`
+    + `<div class="links">${SERVICE_LINKS.map(([title, url]) =>
+        `<a href="${url}" target="_blank" rel="noopener">${esc(title)}</a>`).join('')}</div>`
+    + `<div class="hint" style="margin-top:14px">Источники без ключа — проверка вручную${sourcesRows && sourcesRows.updated ? ' · обновлено ' + esc(String(sourcesRows.updated).slice(0, 16).replace('T', ' ')) : ''}</div>`
+    + (online === null ? '<div class="small">Проверка источников доступна в автономной версии.</div>'
+      : online.map(s => `<article class="card">
+        <div class="row"><div><div class="name" style="font-size:15px">${esc(s.title)}</div>
+        <div class="small">${esc(s.how || '')}</div></div>${sourceTag(s.result)}</div>
+        ${s.result ? `<div class="meta">
+          ${s.result.detail ? `<span class="tag">${esc(s.result.detail)}</span>` : ''}
+          ${s.result.seconds != null ? `<span class="tag">${esc(s.result.seconds)} с</span>` : ''}
+          ${s.result.checked ? `<span class="tag">${esc(String(s.result.checked).slice(0, 16).replace('T', ' '))}</span>` : ''}
+        </div>` : ''}
+        <div class="bar" style="margin:8px 0 0">
+          <button data-source-check="${esc(s.key)}">Проверить</button>
+          ${s.url ? `<a class="chip" style="text-decoration:none" href="${esc(s.url)}" target="_blank" rel="noopener">Открыть сайт</a>` : ''}
+        </div></article>`).join(''))
     + `<div class="bar"><button class="primary" data-act="restart">Перезапустить сбор</button></div>`;
 }
 
@@ -719,6 +792,11 @@ async function renderSettings() {
         <div class="name" style="font-size:15px;margin-bottom:4px">Отслеживать суда, идущие в порты</div>
         <div class="small" style="margin-bottom:6px">Если не отмечено ни одного — берутся все наши порты.</div>
         ${ports.map(p => `<label class="check"><input type="checkbox" name="port" value="${esc(p.name)}" ${p.on ? 'checked' : ''}><span>${esc(p.label || p.name)}</span></label>`).join('')}
+      </div>
+      <div class="card">
+        <div class="name" style="font-size:15px;margin-bottom:4px">Только из портов отправления</div>
+        <div class="small" style="margin-bottom:6px">Если не отмечено ни одного — ограничения нет.</div>
+        ${ports.map(p => `<label class="check"><input type="checkbox" name="origin" value="${esc(p.name)}" ${p.origin_on ? 'checked' : ''}><span>${esc(p.label || p.name)}</span></label>`).join('')}
       </div>
       <div class="card">
         <div class="name" style="font-size:15px;margin-bottom:8px">Пороги</div>
@@ -754,9 +832,11 @@ async function renderLog() {
       view.innerHTML = head('Журнал') + '<div class="empty">На телефоне этот экран работает в автономной версии</div>'; return; }
   }
   if (tab !== 'log') return;
+  const rows = logRows.rows || [];
   view.innerHTML = head('Журнал', '<button class="iconbtn" data-act="refresh">⟳</button>')
-    + `<div class="hint">${esc(logRows.path || '')}</div>`
-    + `<pre class="log">${esc((logRows.rows || []).join('\\n') || 'журнал пуст')}</pre>`;
+    + `<div class="hint">${esc(logRows.path || '')} · строк ${rows.length}</div>`
+    + `<div class="bar"><button data-act="log-clear">Очистить журнал</button></div>`
+    + `<pre class="log">${esc(rows.join(String.fromCharCode(10)) || 'журнал пуст')}</pre>`;
 }
 
 /* ------------------------------------------------------------ общее */
@@ -804,6 +884,17 @@ view.addEventListener('click', async ev => {
       }, '…');
       return;
     }
+    if (act === 'log-clear') {
+      await busy(action, async () => {
+        try {
+          const result = await post('/api/log/clear');
+          if (!result.ok) throw new Error(result.error || 'не очистилось');
+        } catch (e) { statusEl.textContent = 'Журнал не очищен: ' + e.message; return; }
+        logRows = null;
+      }, '…');
+      render();
+      return;
+    }
     if (act === 'restart') { await restartCore(action); clearCaches(); return; }
     if (act === 'expected-refresh') {
       await busy(action, async () => {
@@ -823,6 +914,26 @@ view.addEventListener('click', async ev => {
       renderRadar();
       return;
     }
+    return;
+  }
+  const trafficSortBtn = ev.target.closest('[data-traffic-sort]');
+  if (trafficSortBtn) { trafficSort = trafficSortBtn.dataset.trafficSort; renderTraffic(); return; }
+  const expectedBtn = ev.target.closest('[data-expected-filter]');
+  if (expectedBtn) { expectedFilter = expectedBtn.dataset.expectedFilter; renderExpected(); return; }
+  const alertBtn = ev.target.closest('[data-alert-filter]');
+  if (alertBtn) { alertFilter = alertBtn.dataset.alertFilter; renderAlerts(); return; }
+  const sourceBtn = ev.target.closest('[data-source-check]');
+  if (sourceBtn) {
+    await busy(sourceBtn, async () => {
+      try {
+        await post('/api/sources/check',
+                   new URLSearchParams({key: sourceBtn.dataset.sourceCheck}));
+      } catch (e) { statusEl.textContent = 'Проверка не запустилась: ' + e.message; }
+      setTimeout(async () => {
+        sourcesRows = null;
+        if (tab === 'services') await renderServices();
+      }, 8000);
+    }, 'Проверяю…');
     return;
   }
   const card = ev.target.closest('[data-mmsi]');
@@ -866,6 +977,8 @@ async function openVessel(mmsi) {
         <dt>Тип</dt><dd>${esc(v.type_label || '—')}</dd>
         <dt>До порта</dt><dd>${v.distance_km ?? '—'} км</dd>
       </dl>
+      <div class="bar" style="margin-top:12px"><button data-vessel-refresh="${esc(v.mmsi)}">Обновить карточку</button></div>
+      <div class="hint" id="cardInfo">Обновление запрашивает судно у источников и пишет новые данные в базу.</div>
       <div class="links">${links.map(([title, url]) => `<a href="${url}" target="_blank" rel="noopener">${esc(title)}</a>`).join('')}</div>
       <div class="hint" style="margin-top:14px">История позиций (${hist.length})</div>
       <canvas id="track" height="110"></canvas>
@@ -890,7 +1003,23 @@ function drawTrack(canvas, points) {
   const last = points[points.length - 1];
   g.fillStyle = '#ffd166'; g.beginPath(); g.arc(sx(last.lon), sy(last.lat), 4, 0, 7); g.fill();
 }
-sheet.addEventListener('click', e => { if (e.target.dataset.close !== undefined) sheet.classList.remove('open'); });
+sheet.addEventListener('click', async e => {
+  if (e.target.dataset.close !== undefined) { sheet.classList.remove('open'); return; }
+  const refresh = e.target.closest('[data-vessel-refresh]');
+  if (!refresh) return;
+  const info = document.getElementById('cardInfo');
+  refresh.disabled = true; refresh.textContent = 'Обновляю…';
+  try {
+    const result = await post('/api/vessel/refresh',
+                              new URLSearchParams({mmsi: refresh.dataset.vesselRefresh}));
+    if (info) info.textContent = result.text || result.error
+      || (result.ok ? 'Карточка обновлена.' : 'Обновить не удалось.');
+    if (result.ok) { ships = null; trafficRows = null; allRows = null; }
+  } catch (err) {
+    if (info) info.textContent = 'Ошибка: ' + err.message;
+  }
+  refresh.disabled = false; refresh.textContent = 'Обновить карточку';
+});
 
 search.style.display = 'block';
 if (location.hash) {
@@ -899,6 +1028,12 @@ if (location.hash) {
 }
 loadShips();
 setInterval(() => { clearCaches(); loadShips(); }, 30000);
+/* «Ожидаемые» — как настольная вкладка: файл AIS-catcher перечитывается сам. */
+setInterval(() => {
+  if (tab !== 'expected' || (expectedRows && expectedRows.loading)) return;
+  expectedRows = null;
+  renderExpected();
+}, 60000);
 </script>
 </body>
 </html>

@@ -194,6 +194,19 @@ def core_running() -> bool:
     return _core is not None
 
 
+def refresh_vessel(mmsi) -> dict:
+    """Обновить одно судно сейчас — как кнопка «Обновить карточку» на ПК."""
+    mmsi = str(mmsi or "").strip()
+    if not mmsi:
+        return {"text": "судно не выбрано"}
+    if _core is None:
+        return {"text": "сбор данных не запущен"}
+    try:
+        return dict(_core.refresh_vessel_now(mmsi))
+    except Exception as error:
+        return {"text": f"ошибка: {error}"}
+
+
 def core_status() -> dict:
     """Что сбор говорит о каждом источнике: ключ — имя сервиса."""
     if _core is None:

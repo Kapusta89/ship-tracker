@@ -16,7 +16,7 @@ import mobile_server
 import portcalls
 import setup_page
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 
 class Server(ThreadingHTTPServer):
@@ -55,6 +55,8 @@ NUMBERS = [
     ("history_days", "Глубина истории, дней", 7.0),
     ("position_interval_seconds", "Запись трека, с", 60.0),
     ("stale_minutes", "Сигнал устарел через, мин", 15.0),
+    ("trip_window_hours", "Окно рейса, ч", 96.0),
+    ("area_radius_km", "Радиус района, км", 900.0),
 ]
 
 _expected_loading = False
@@ -163,8 +165,12 @@ def settings_payload() -> dict:
         name = str(port.get("name") or "")
         if not name:
             continue
+        chosen_origin = {str(name).lower()
+                         for name in (config.get("filter_origins") or [])}
         ports.append({"name": name, "label": port.get("label") or name,
-                      "on": (not chosen) or name.lower() in chosen})
+                      "on": (not chosen) or name.lower() in chosen,
+                      "origin_on": (not chosen_origin)
+                                  or name.lower() in chosen_origin})
     numbers = [{"key": key, "label": label,
                 "value": config.get(key, default)} for key, label, default in NUMBERS]
     sources = [{"flag": flag, "title": title,
@@ -183,6 +189,8 @@ def apply_settings(form: dict) -> dict:
                  if isinstance(port, dict) and port.get("name")]
     # все отмечены — значит ограничения нет, пишем пустой список
     config["filter_destinations"] = [] if set(names) >= set(all_ports) else names
+    origins = [name.strip() for name in form.get("origin", []) if name.strip()]
+    config["filter_origins"] = ([] if set(origins) >= set(all_ports) else origins)
 
     for key, _, default in NUMBERS:
         raw = (form.get(key) or [""])[0].replace(",", ".").strip()
@@ -201,6 +209,46 @@ def apply_settings(form: dict) -> dict:
     android_main.save_config(config)
     threading.Thread(target=android_main.restart_core, name="core-restart",
                      daemon=True).start()
+    return {"ok": True}
+
+
+def sources_payload() -> dict:
+    """Альтернативные источники без ключа и результат их ручной проверки."""
+    saved = portcalls.load_sources()
+    results = {str(row.get("key")): row
+               for row in (saved.get("sources") or []) if isinstance(row, dict)}
+    rows = []
+    for source in portcalls.SOURCES:
+        key = str(source.get("key") or "")
+        rows.append({"key": key, "title": source.get("title") or key,
+                     "how": source.get("how") or "", "url": source.get("url") or "",
+                     "result": results.get(key)})
+    return {"rows": rows, "updated": saved.get("updated") or ""}
+
+
+def check_source(key: str) -> bool:
+    """Проверка источника в фоне: один запрос и отчёт в журнал."""
+    source = portcalls.SOURCES_BY_KEY.get(key)
+    if not source:
+        return False
+
+    def worker():
+        try:
+            portcalls.check_sources([key], log=android_main.log_line)
+        except Exception as error:
+            android_main.log_line(f"Проверка источника {key}: ошибка {error}")
+
+    threading.Thread(target=worker, name=f"check-{key}", daemon=True).start()
+    return True
+
+
+def clear_log() -> dict:
+    path = android_main.log_path()
+    try:
+        path.write_text("", encoding="utf-8")
+    except OSError as error:
+        return {"ok": False, "error": str(error)}
+    android_main.log_line("Журнал очищен пользователем.")
     return {"ok": True}
 
 
@@ -259,12 +307,16 @@ class Handler(mobile_server.Handler):
         if path == "/api/log":
             self.send_json(log_tail())
             return
+        if path == "/api/sources":
+            self.send_json(sources_payload())
+            return
         super().do_GET()
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         allowed = {"/api/setup", "/api/expected/refresh", "/api/settings",
-                   "/api/restart"}
+                   "/api/restart", "/api/log/clear", "/api/sources/check",
+                   "/api/vessel/refresh"}
         if path not in allowed:
             self.send_bytes(b"not found", "text/plain; charset=utf-8", status=404)
             return
@@ -285,6 +337,20 @@ class Handler(mobile_server.Handler):
             threading.Thread(target=android_main.restart_core,
                              name="core-restart", daemon=True).start()
             self.send_json({"ok": True})
+            return
+        if path == "/api/log/clear":
+            self.send_json(clear_log())
+            return
+        if path == "/api/sources/check":
+            key = (form.get("key") or [""])[0].strip()
+            started = check_source(key)
+            self.send_json({"ok": started,
+                            "error": "" if started else "этот источник не проверяется вручную"})
+            return
+        if path == "/api/vessel/refresh":
+            mmsi = (form.get("mmsi") or [""])[0].strip()
+            result = android_main.refresh_vessel(mmsi)
+            self.send_json({"ok": bool(result.get("text")), **result})
             return
         if path == "/api/settings":
             try:
