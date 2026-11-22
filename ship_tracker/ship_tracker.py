@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.75"
+APP_VERSION = "2026.12.76"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -3949,10 +3949,16 @@ class App:
         finally:
             self._auto_busy = False
             self._auto_state = {"mmsi": mmsi, "at": datetime.now(), "text": text}
+            # в подписи у карточки — короткая строка: полный ответ по шести
+            # источникам растягивал панель на несколько строк
+            note = text or "ответа нет"
+            if len(note) > 120:
+                cut = note[:120].rsplit(";", 1)[0]
+                note = (cut or note[:117]).rstrip(" ;,") + "…"
             try:
                 stamp = datetime.now().strftime("%H:%M:%S")
                 self.root.after(0, lambda: self.card_note_var.set(
-                    f"{stamp}: {text}" if text else "ответа нет"))
+                    f"{stamp}: {note}"))
             except Exception:
                 pass
 

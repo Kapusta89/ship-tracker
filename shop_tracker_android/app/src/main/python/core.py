@@ -2484,11 +2484,27 @@ class RadarCore:
         name = str(row.get("name") or "")
         lat, lon = row.get("lat"), row.get("lon")
 
+        def brief(error) -> str:
+            """Короткая причина вместо простыни «403 Client Error for url…»."""
+            text = str(error or "").split(" for url:")[0].strip()
+            low = text.lower()
+            if "403" in low or "cloudflare" in low or "forbidden" in low:
+                return "недоступен: Cloudflare"
+            if "429" in low or "too many requests" in low or "rate limited" in low:
+                return "недоступен: лимит запросов"
+            if "timed out" in low or "timeout" in low:
+                return "не ответил вовремя"
+            if "404" in low or "not found" in low:
+                return "судна нет на сайте"
+            if "connect" in low:
+                return "нет связи"
+            return text[:60] or "не ответил"
+
         def openwaters():
             try:
                 data = self.refresh_vessel(mmsi)
             except Exception as error:
-                return "error", f"Open Waters: ошибка ({error})"
+                return "error", f"Open Waters: {brief(error)}"
             if not data:
                 return "none", "Open Waters: судна нет в базе"
             if data.get("fresh"):
@@ -2499,7 +2515,7 @@ class RadarCore:
             try:
                 found = self.refresh_shipfinder(mmsi)
             except Exception as error:
-                return "error", f"ShipFinder: ошибка ({error})"
+                return "error", f"ShipFinder: {brief(error)}"
             if not found or found.get("lat") is None:
                 return "none", "ShipFinder: позиции нет"
             point = f"{float(found['lat']):.5f}, {float(found['lon']):.5f}"
@@ -2515,12 +2531,12 @@ class RadarCore:
             try:
                 payload = self.refresh_card(mmsi, name)
             except Exception as error:
-                return "error", f"карточка сайта: ошибка ({error})"
+                return "error", f"карточка сайта: {brief(error)}"
             if payload and payload.get("lat") is not None:
                 return "ok", "карточка сайта: позиция обновлена"
             if payload:
                 return "same", "карточка сайта: прочитана, позиции нет"
-            return "same", "карточка сайта: только что запрашивалась"
+            return "same", "карточка сайта: повтор через минуту"
 
         def near():
             # точечные снимки района: кто из карт знает это судно
@@ -2536,12 +2552,12 @@ class RadarCore:
                 try:
                     events = loader()
                 except Exception as error:
-                    parts.append(f"{title}: ошибка ({error})")
+                    parts.append(f"{title}: {brief(error)}")
                     continue
                 found = next((event for event in events
                               if str(event.get("mmsi")) == mmsi), None)
                 if not found:
-                    parts.append(f"{title}: судна нет в ответе")
+                    parts.append(f"{title}: нет данных")
                     continue
                 if self._apply_near_found(mmsi, found, source):
                     fresh_here = True
@@ -2562,7 +2578,7 @@ class RadarCore:
                 try:
                     results[key] = future.result(timeout=120)
                 except Exception as error:
-                    results[key] = "error", f"{key}: ошибка ({error})"
+                    results[key] = "error", f"{key}: {brief(error)}"
 
         parts = []
         fresh = False
@@ -2579,7 +2595,8 @@ class RadarCore:
             near_fresh, near_parts = flashed
             parts.extend(near_parts)
             fresh = fresh or near_fresh
-        return {"text": "; ".join(parts), "fresh": fresh}
+        head = "✓ обновлено: " if fresh else "позиция без изменений: "
+        return {"text": head + "; ".join(parts), "fresh": fresh}
 
     def _apply_near_found(self, mmsi, found, source) -> bool:
         """Пишет точку из точечного запроса к источнику.
