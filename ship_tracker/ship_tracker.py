@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.74"
+APP_VERSION = "2026.12.75"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2468,7 +2468,7 @@ class App:
         ttk.Button(ais_row, text="Проверить", command=self.check_key
                    ).pack(side="left", padx=(8, 0))
         ttk.Button(ais_row, text="Открыть aisstream.io",
-                   command=lambda: webbrowser.open(AIRSTREAM_SITE)).pack(side="left", padx=(6, 0))
+                   command=lambda: self.open_site(AIRSTREAM_SITE)).pack(side="left", padx=(6, 0))
         # Районный поток занимает один из трёх слотов AISStream. Если его снять,
         # освободившийся слот забирает MMSI-слежение (три соединения по 190 судов).
         ttk.Checkbutton(ais_row, text="районный поток (слот можно отдать MMSI)",
@@ -2489,7 +2489,7 @@ class App:
         ttk.Button(ow_row, text="Проверить", command=self.check_openwaters
                    ).pack(side="left", padx=(6, 0))
         ttk.Button(ow_row, text="Открыть openwaters.io",
-                   command=lambda: webbrowser.open("https://openwaters.io/ais/")
+                   command=lambda: self.open_site("https://openwaters.io/ais/")
                    ).pack(side="left", padx=(6, 0))
 
 
@@ -2572,7 +2572,7 @@ class App:
                            ).pack(side="left", padx=(6, 0))
                 site_name, site_url = SERVICE_SITES[key]
                 ttk.Button(service_row, text=f"Открыть {site_name}",
-                           command=lambda u=site_url: webbrowser.open(u)
+                           command=lambda u=site_url: self.open_site(u)
                            ).pack(side="left", padx=(6, 0))
                 row += 3
                 drawn.add(key)
@@ -2608,7 +2608,7 @@ class App:
             ttk.Label(links, textvariable=var, foreground="#555").grid(
                 row=row, column=1, sticky="w", pady=(2, 0))
             ttk.Button(links, text="Открыть сайт",
-                       command=lambda u=site: webbrowser.open(u)).grid(
+                       command=lambda u=site: self.open_site(u)).grid(
                 row=row, column=2, sticky="e", padx=8, pady=(2, 0))
             row += 1
 
@@ -2623,7 +2623,7 @@ class App:
                   font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
                                              sticky="w", padx=(16, 6), pady=(2, 0))
         ttk.Button(links, text="Открыть сайт",
-                   command=lambda: webbrowser.open("https://overpass-api.de/")).grid(
+                   command=lambda: self.open_site("https://overpass-api.de/")).grid(
             row=row, column=2, sticky="e", padx=8, pady=(2, 0))
         row += 1
         vesselapi_state = ("ключ задан" if str(self.config.get("vesselapi_key") or "").strip()
@@ -2633,7 +2633,7 @@ class App:
                   font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
                                              sticky="w", padx=(16, 6), pady=(2, 0))
         ttk.Button(links, text="Открыть сайт",
-                   command=lambda: webbrowser.open("https://vesselapi.com/")).grid(
+                   command=lambda: self.open_site("https://vesselapi.com/")).grid(
             row=row, column=2, sticky="e", padx=8, pady=(2, 0))
         row += 1
         telegram_state = ("настроен" if self.config.get("telegram_token")
@@ -2643,7 +2643,7 @@ class App:
                   font=("Segoe UI", 9)).grid(row=row, column=0, columnspan=2,
                                              sticky="w", padx=(16, 6), pady=(2, 0))
         ttk.Button(links, text="Открыть сайт",
-                   command=lambda: webbrowser.open("https://core.telegram.org/bots/api")
+                   command=lambda: self.open_site("https://core.telegram.org/bots/api")
                    ).grid(row=row, column=2, sticky="e", padx=8, pady=(2, 0))
         row += 1
 
@@ -2685,7 +2685,7 @@ class App:
                        command=lambda k=key: self.check_source(k)
                        ).pack(side="left", padx=(6, 0))
             ttk.Button(source_row, text="Открыть",
-                       command=lambda u=source["url"]: webbrowser.open(u)
+                       command=lambda u=source["url"]: self.open_site(u)
                        ).pack(side="left", padx=(6, 0))
             row += 3
 
@@ -2913,7 +2913,7 @@ class App:
             f = ttk.Frame(box1)
             f.pack(fill="x", padx=8, pady=2)
             ttk.Label(f, text=name, width=18).pack(side="left")
-            ttk.Button(f, text="Открыть", command=lambda u=url: webbrowser.open(u)).pack(side="left")
+            ttk.Button(f, text="Открыть", command=lambda u=url: self.open_site(u)).pack(side="left")
 
         box2 = ttk.LabelFrame(inner, text="AIS-потоки (альтернативы AISStream)")
         box2.pack(fill="x", pady=(0, 10))
@@ -2928,7 +2928,7 @@ class App:
             f.pack(fill="x", padx=8, pady=2)
             ttk.Label(f, text=name, width=22).pack(side="left")
             ttk.Label(f, text=desc, foreground="#555").pack(side="left", padx=(0, 8))
-            ttk.Button(f, text="Сайт", command=lambda u=url: webbrowser.open(u)).pack(side="right")
+            ttk.Button(f, text="Сайт", command=lambda u=url: self.open_site(u)).pack(side="right")
 
         box3 = ttk.LabelFrame(inner, text="Десктопные программы")
         box3.pack(fill="x", pady=(0, 10))
@@ -2941,7 +2941,7 @@ class App:
             f.pack(fill="x", padx=8, pady=2)
             ttk.Label(f, text=name, width=22).pack(side="left")
             ttk.Label(f, text=desc, foreground="#555").pack(side="left", padx=(0, 8))
-            ttk.Button(f, text="Сайт", command=lambda u=url: webbrowser.open(u)).pack(side="right")
+            ttk.Button(f, text="Сайт", command=lambda u=url: self.open_site(u)).pack(side="right")
 
         ttk.Label(inner, text="Подсказка: в карточке судна (панель справа на вкладке Радар) добавлены прямые ссылки для быстрой проверки.",
                   foreground="#666").pack(anchor="w", pady=(12, 0))
@@ -4237,6 +4237,51 @@ class App:
                      "cloudflare", "rate limited", "недоступен")
 
 
+    def open_site(self, url):
+        """Открывает сайт сервиса; если система не смогла — копирует ссылку.
+
+        Молчаливый отказ webbrowser.open выглядел как кнопка, которая ничего
+        не делает: в журнале и буфере обмена теперь видно, что произошло.
+        """
+        text = str(url or "").strip()
+        if not text:
+            return
+        opened = False
+        try:
+            opened = bool(webbrowser.open(text))
+        except Exception as error:
+            self.log(f"Сайт {text}: браузер не открылся — {error}")
+        if not opened:
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(text)  # noqa: S606  (штатное открытие в Windows)
+                    opened = True
+            except Exception as error:
+                self.log(f"Сайт {text}: открыть не удалось — {error}")
+        if opened:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            self.log(f"Сайт {text}: браузер не открылся, ссылка скопирована в буфер.")
+        except Exception:
+            self.log(f"Сайт {text}: браузер не открылся.")
+
+    # Имена живых потоков — для плашки: в ядре они называются по-английски
+    FEED_TITLES = {"ais-feed": "AISStream", "ais-feed-ow": "Open Waters AIS",
+                   "ais-snapshot": "Снимок района"}
+
+    def feed_title(self, name) -> str:
+        """Понятное название потока; пусто — если у него есть свой статус."""
+        name = str(name or "")
+        if name.startswith("service-"):
+            # у сервисов есть отдельный статус с названием — второй раз не надо
+            return ""
+        if name.startswith("ais-feed-mmsi"):
+            return "Слежение по MMSI"
+        return self.FEED_TITLES.get(name) or name
+
     def collect_problems(self):
         """Текущие ошибки связи и ключей — короткими строками для шапки."""
         problems = []
@@ -4247,20 +4292,20 @@ class App:
         for state in states:
             if state.get("connected"):
                 continue
+            title = self.feed_title(state.get("name"))
+            if not title:
+                continue
             error = str(state.get("error") or "").strip()
             if error:
-                problems.append(f"{state.get('name') or 'поток'}: "
-                                f"{self.short_error(error).lstrip('· ')}")
+                problems.append(f"{title}: {self.short_error(error).lstrip('· ')}")
         titles = {key: value[0] for key, value in SERVICE_SITES.items()}
         for key, text in (getattr(self.core, "service_status", {}) or {}).items():
             text = str(text or "")
             low = text.lower()
             if not text or not any(word in low for word in self.PROBLEM_WORDS):
                 continue
-            # ядро подписывает статусы как «service-mt»: показываем название сервиса
-            name = str(key)
-            base = name.split("-")[-1]
-            title = titles.get(name) or titles.get(base) or name.upper()
+            name = str(key).split("-")[-1]
+            title = titles.get(name) or name.upper()
             problems.append(f"{title}: {text}")
         seen, unique = set(), []
         for item in problems:
@@ -4286,8 +4331,8 @@ class App:
                     "Если данных по судну всё равно нет, проверьте галочку канала "
                     "и ключ ниже, затем нажмите «Проверить».")
         else:
-            lines = [f"⚠ Ошибок подключения: {len(problems)} — из-за них данные "
-                     f"не приходят:"]
+            lines = [f"⚠ Не отвечают: {len(problems)} из подключений — остальные "
+                     f"каналы данные получают:"]
             for index, item in enumerate(problems[:6], 1):
                 lines.append(f"  {index}. {item}")
             if len(problems) > 6:
@@ -4304,9 +4349,15 @@ class App:
                              "лимита не шлёт. Если сайт всё равно ответил «rate "
                              "limited», источники сделают паузу и повторят сами — "
                              "ключ и галочка тут не при чём.")
-            lines.append("Что делать: вставьте правильный ключ в поле сервиса ниже "
-                         "и нажмите «Проверить». Ключ AISStream берётся бесплатно "
-                         "на aisstream.io, остальные — в кабинете сервиса.")
+            joined = " ".join(problems).lower()
+            if any(word in joined for word in
+                   ("ключ", "401", "403", "не принят", "invalid")):
+                lines.append("Что делать: вставьте правильный ключ в поле сервиса ниже "
+                             "и нажмите «Проверить». Ключ AISStream берётся бесплатно "
+                             "на aisstream.io, остальные — в кабинете сервиса.")
+            lines.append("Остальное работает: живые потоки AIS и бесплатные сервисы "
+                         "со статусом «подключен» ниже получают данные, пока эти "
+                         "каналы ждут.")
             text = "\n".join(lines)
         if var.get() != text:
             var.set(text)
@@ -5313,15 +5364,21 @@ class App:
                 self.log("MarineTraffic: в поле вставлен ключ VesselFinder, а не "
                          "MarineTraffic — их нельзя путать, сервер отвечает "
                          "«SERVICE KEY NOT FOUND».")
+        # Список судов нужен всем сервисам, которые обогащают базу: без него
+        # проверка отвечала «судов 0, нет судов для обогащения» и выглядела
+        # как неработающее подключение.
+        if key in ("srd", "mo", "sa", "mlink"):
+            vessels = self.core.enrich_candidates
+        elif key == "gfw":
+            vessels = self.core.profile_candidates
+        else:
+            vessels = self.core.tracked_mmsis
         feed = services_feed.build(
             key, lambda event: None, self.log, threading.Event(),
             api_key=api_key, bboxes=self.config.get("bounding_boxes"),
-            ports=self.config.get("ports"),
-            vessels=(self.core.enrich_candidates
-                     if key in ("srd", "mo", "sa", "mlink")
-                     else self.core.tracked_mmsis if key == "sn" else None),
-            # проверка не должна тратить много кредитов: только 5 записей
-            max_records=5)
+            ports=self.config.get("ports"), vessels=vessels,
+            # проверка не должна тратить кредиты и время: пара судов и 5 записей
+            max_records=5, max_vessels=2)
         if feed is None:
             self.log(f"{title}: нет доступного API.")
             finish("нет доступного API")
