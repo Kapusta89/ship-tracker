@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 
 import geo
+import net
 
 STREAM_URL = "wss://stream.aisstream.io/v0/stream"
 # Снимок всех известных судов района через REST (ключ не нужен).
@@ -744,7 +745,7 @@ class MmsiWatchFeed(AISStreamFeed):
         try:
             payload = self.subscription()
         except Exception as error:
-            self.log(f"{self.feed_title}: не удалось пересобрать список ({error})")
+            self.log(f"{self.feed_title}: не удалось пересобрать список ({net.brief_error(error)})")
             return
         mmsis = set(payload.get("FiltersShipMMSI") or [])
         if not mmsis:
@@ -758,7 +759,7 @@ class MmsiWatchFeed(AISStreamFeed):
         try:
             socket.send(json.dumps(payload))
         except Exception as error:
-            self.log(f"{self.feed_title}: обновление подписки не отправлено ({error})")
+            self.log(f"{self.feed_title}: обновление подписки не отправлено ({net.brief_error(error)})")
             return
         added = len(mmsis - self._sent_mmsis)
         dropped = len(self._sent_mmsis - mmsis)
@@ -983,7 +984,7 @@ class SnapshotFeed(threading.Thread):
                 response.raise_for_status()
                 data = response.json()
             except Exception as error:  # сеть, лимит, формат — просто ждём следующий цикл
-                failed = f"снимок района недоступен: {error}"
+                failed = f"снимок района недоступен: {net.brief_error(error)}"
                 continue
             features = data.get("features") if isinstance(data, dict) else None
             if not isinstance(features, list):

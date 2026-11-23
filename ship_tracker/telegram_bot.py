@@ -36,6 +36,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
+import net
 
 BASE_DIR = (Path(sys.executable).resolve().parent
             if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
@@ -766,7 +767,7 @@ async def cmd_expected(message: Message):
     try:
         portcalls = _import("portcalls")
     except Exception as error:
-        await message.answer(f"Список ожидаемых недоступен: {error}")
+        await message.answer(f"Список ожидаемых недоступен: {net.brief_error(error)}")
         return
     rows = portcalls.expected_rows()
     if not rows:
@@ -859,7 +860,7 @@ async def cmd_port(message: Message):
     try:
         vessels = await asyncio.to_thread(core.port_vessels, 600)
     except Exception as error:
-        await message.answer(f"Список судов в портах недоступен: {error}")
+        await message.answer(f"Список судов в портах недоступен: {net.brief_error(error)}")
         return
     at_berth = sum(1 for vessel in vessels if vessel.get("port_km") == 0)
     lines = ["⚓ <b>Суда в портах и на рейде</b>",
@@ -886,7 +887,7 @@ async def cmd_sea(message: Message):
         vessels = await asyncio.to_thread(core.sea_vessels, 500)
         silent = await asyncio.to_thread(core.sea_without_position, 500)
     except Exception as error:
-        await message.answer(f"Список судов в море недоступен: {error}")
+        await message.answer(f"Список судов в море недоступен: {net.brief_error(error)}")
         return
     config = reload_config()
     # В приложении вкладка «В море» показывает только актуальные позиции —
@@ -987,7 +988,7 @@ async def cmd_plan(message: Message):
     try:
         rows = await asyncio.to_thread(build)
     except Exception as error:
-        await message.answer(f"Прогноз недоступен: {error}")
+        await message.answer(f"Прогноз недоступен: {net.brief_error(error)}")
         return
 
     ready = sum(1 for _, plan in rows if not plan.get("no_speed"))
@@ -1075,7 +1076,7 @@ async def cmd_all(message: Message):
     try:
         vessels = await asyncio.to_thread(store.vessels, 3000)
     except Exception as error:
-        await message.answer(f"Список судов недоступен: {error}")
+        await message.answer(f"Список судов недоступен: {net.brief_error(error)}")
         return
     if not vessels:
         await message.answer("В базе пока нет судов — поток AIS ещё не собрал данные.")
@@ -1146,7 +1147,7 @@ async def cmd_visits(message: Message):
     try:
         visits = await asyncio.to_thread(store.visits, 600)
     except Exception as error:
-        await message.answer(f"Стоянки недоступны: {error}")
+        await message.answer(f"Стоянки недоступны: {net.brief_error(error)}")
         return
     current = [visit for visit in visits if not visit.get("left_at")]
     # открытая стоянка судна без свежей позиции — догадка: оно могло уйти незамеченным
@@ -1201,7 +1202,7 @@ async def cmd_history(message: Message):
         visits = await asyncio.to_thread(store.visits, 500)
         counts = await asyncio.to_thread(store.visit_counts)
     except Exception as error:
-        await message.answer(f"История стоянок недоступна: {error}")
+        await message.answer(f"История стоянок недоступна: {net.brief_error(error)}")
         return
     ended = [visit for visit in visits if visit.get("left_at")]
     lines = ["🕘 <b>История стоянок</b>",
@@ -1244,7 +1245,7 @@ async def cmd_alerts(message: Message):
         rows = await asyncio.to_thread(store.alerts, 30)
         today = await asyncio.to_thread(store.alerts_count_today)
     except Exception as error:
-        await message.answer(f"Журнал алертов недоступен: {error}")
+        await message.answer(f"Журнал алертов недоступен: {net.brief_error(error)}")
         return
     lines = ["🚨 <b>Алерты</b>",
              f"Отправлено сегодня: <b>{today}</b> · в журнале последних: {len(rows)}.", ""]
@@ -1303,7 +1304,7 @@ async def cmd_vessel(message: Message):
     try:
         vessel, matches = await asyncio.to_thread(_find_vessels, query)
     except Exception as error:
-        await message.answer(f"Поиск не удался: {error}")
+        await message.answer(f"Поиск не удался: {net.brief_error(error)}")
         return
     if vessel:
         core = get_core()
@@ -1326,7 +1327,7 @@ async def cmd_map(message: Message):
     try:
         mapimage = _import("mapimage")
     except Exception as error:
-        await message.answer(f"Карта недоступна: {error}")
+        await message.answer(f"Карта недоступна: {net.brief_error(error)}")
         return
     config = reload_config()
     vessels = await asyncio.to_thread(lambda: get_core().related_vessels(1000))
@@ -1337,7 +1338,7 @@ async def cmd_map(message: Message):
         await asyncio.to_thread(mapimage.render, vessels, ports, MAP_PATH, without)
     except Exception as error:
         log.warning("Карта не нарисована: %s", error)
-        await message.answer(f"Карту не удалось нарисовать: {error}")
+        await message.answer(f"Карту не удалось нарисовать: {net.brief_error(error)}")
         return
     caption = ("🗺 <b>Карта</b>\n"
                f"Судов с позицией на карте: <b>{len(vessels) - without}</b>\n"
@@ -1351,7 +1352,7 @@ async def cmd_sources(message: Message):
         portcalls = _import("portcalls")
         services_feed = _import("services_feed")
     except Exception as error:
-        await message.answer(f"Проверка источников недоступна: {error}")
+        await message.answer(f"Проверка источников недоступна: {net.brief_error(error)}")
         return
 
     config = reload_config()
@@ -1386,7 +1387,7 @@ async def cmd_sources(message: Message):
     try:
         results = await asyncio.to_thread(portcalls.check_sources)
     except Exception as error:
-        await message.answer("\n".join(lines + [f"Проверка не удалась: {error}"]),
+        await message.answer("\n".join(lines + [f"Проверка не удалась: {net.brief_error(error)}"]),
                              disable_web_page_preview=True)
         return
     # 3. Что реально нашёл бесплатный AIS-catcher — главный источник без ключа
@@ -1403,7 +1404,7 @@ async def cmd_sources(message: Message):
             if cache.get("stale"):
                 lines.append("Страницы сейчас отдают 0 — показан прошлый список.")
     except Exception as error:
-        lines.append(f"AIS-catcher: список не прочитан ({error}).")
+        lines.append(f"AIS-catcher: список не прочитан ({net.brief_error(error)}).")
 
     for result in results:
         if result.get("ok"):
@@ -1661,7 +1662,7 @@ async def cmd_log(message: Message):
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
-        await message.answer(f"📜 Журнал недоступен: {error}")
+        await message.answer(f"📜 Журнал недоступен: {net.brief_error(error)}")
         return
     rows = [row.strip() for row in text.splitlines() if row.strip()][-25:]
     body = "\n".join(html.escape(row) for row in rows) or "Журнал пуст."

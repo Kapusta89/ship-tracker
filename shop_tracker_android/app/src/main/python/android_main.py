@@ -14,6 +14,7 @@
 """
 
 import json
+import net
 import threading
 import time
 from datetime import datetime
@@ -97,7 +98,7 @@ def ensure_config() -> dict:
                 config[key] = value
                 changed = True
     except Exception as error:  # шаблон настроек не обязателен
-        log_line(f"Настройки по умолчанию не прочитаны: {error}")
+        log_line(f"Настройки по умолчанию не прочитаны: {net.brief_error(error)}")
     for key, value in DEFAULT_EXTRA.items():
         if key not in config:
             config[key] = value
@@ -179,7 +180,7 @@ def restart_core() -> None:
             try:
                 _core.stop()
             except Exception as error:
-                log_line(f"Остановка сбора: {error}")
+                log_line(f"Остановка сбора: {net.brief_error(error)}")
             _core = None
         if _store is not None:
             try:
@@ -204,7 +205,7 @@ def refresh_vessel(mmsi) -> dict:
     try:
         return dict(_core.refresh_vessel_now(mmsi))
     except Exception as error:
-        return {"text": f"ошибка: {error}"}
+        return {"text": f"ошибка: {net.brief_error(error)}"}
 
 
 def core_status() -> dict:

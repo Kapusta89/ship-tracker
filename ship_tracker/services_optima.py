@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 import ais_feed
+import net
 import services_feed as base
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -166,7 +167,7 @@ class MaritimeOptimaBase(base.ServiceFeed):
                                                  ensure_ascii=False),
                                        encoding="utf-8")
         except OSError as error:
-            self.log(f"{self.title}: состояние не сохранено ({error})")
+            self.log(f"{self.title}: состояние не сохранено ({net.brief_error(error)})")
 
     def http(self):
         # Главную страницу не открываем: сайт отвечает на неё кодом 103 (Early
@@ -228,7 +229,7 @@ class MaritimeOptimaFeed(MaritimeOptimaBase):
                 errors += 1
                 self.attempts[mmsi] = {"at": time.time(), "ok": False}
                 if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {error}")
+                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
                 continue
             self.attempts[mmsi] = {"at": time.time(), "ok": bool(card)}
             if not card:
@@ -284,7 +285,7 @@ class ShipAtlasFeed(MaritimeOptimaBase):
             except Exception as error:
                 errors += 1
                 if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {error}")
+                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
                 continue
             if not card:
                 continue
@@ -352,7 +353,7 @@ class MarineLinkTypesFeed(base.ServiceFeed):
                     return
                 response.raise_for_status()
             except Exception as error:
-                self.log(f"{self.title}: тип {label} не прочитан ({error})")
+                self.log(f"{self.title}: тип {label} не прочитан ({net.brief_error(error)})")
                 continue
             for name in re.findall(r"<h3[^>]*>(.*?)</h3>", response.text or "", re.S):
                 clean = re.sub(r"<[^>]+>", "", name).strip()
@@ -425,7 +426,7 @@ class ShipNextFeed(base.ServiceFeed):
             except Exception as error:
                 errors += 1
                 if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {error}")
+                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
                 continue
             if response.status_code in (401, 403):
                 raise RuntimeError("ShipNext не принял токен: нужен токен аккаунта "

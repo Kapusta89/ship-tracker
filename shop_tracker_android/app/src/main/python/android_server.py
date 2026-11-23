@@ -7,6 +7,7 @@
 """
 
 import json
+import net
 import threading
 from http.server import ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -16,7 +17,7 @@ import mobile_server
 import portcalls
 import setup_page
 
-VERSION = "3.5.5"
+VERSION = "3.5.6"
 
 
 class Server(ThreadingHTTPServer):
@@ -141,7 +142,7 @@ def refresh_expected() -> bool:
                         for entry in (data.get("ports") or {}).values())
             android_main.log_line(f"AIS-catcher: ожидаемых судов {total}.")
         except Exception as error:
-            android_main.log_line(f"AIS-catcher: ошибка — {error}")
+            android_main.log_line(f"AIS-catcher: ошибка — {net.brief_error(error)}")
         finally:
             with _expected_lock:
                 _expected_loading = False
@@ -231,7 +232,7 @@ def check_source(key: str) -> bool:
         try:
             portcalls.check_sources([key], log=android_main.log_line)
         except Exception as error:
-            android_main.log_line(f"Проверка источника {key}: ошибка {error}")
+            android_main.log_line(f"Проверка источника {key}: ошибка {net.brief_error(error)}")
 
     threading.Thread(target=worker, name=f"check-{key}", daemon=True).start()
     return True
@@ -270,7 +271,7 @@ class Handler(mobile_server.Handler):
                     Handler.data = fresh
                     self.data = fresh
             except Exception as error:
-                android_main.log_line(f"База ещё не готова: {error}")
+                android_main.log_line(f"База ещё не готова: {net.brief_error(error)}")
         if path == "/setup":
             self.send_bytes(setup_html().encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -320,7 +321,7 @@ class Handler(mobile_server.Handler):
             raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
             form = parse_qs(raw, keep_blank_values=True)
         except Exception as error:
-            self.send_json({"ok": False, "error": f"форма не прочитана: {error}"})
+            self.send_json({"ok": False, "error": f"форма не прочитана: {net.brief_error(error)}"})
             return
 
         if path == "/api/expected/refresh":
@@ -351,7 +352,7 @@ class Handler(mobile_server.Handler):
             try:
                 self.send_json(apply_settings(form))
             except OSError as error:
-                self.send_json({"ok": False, "error": f"настройки не сохранены: {error}"})
+                self.send_json({"ok": False, "error": f"настройки не сохранены: {net.brief_error(error)}"})
             return
 
         def field(name: str) -> str:
@@ -368,14 +369,14 @@ class Handler(mobile_server.Handler):
         try:
             android_main.save_config(config)
         except OSError as error:
-            self.send_json({"ok": False, "error": f"настройки не сохранены: {error}"})
+            self.send_json({"ok": False, "error": f"настройки не сохранены: {net.brief_error(error)}"})
             return
 
         # база и настройки могли появиться только сейчас — пересобираем Data
         try:
             Handler.data = mobile_server.Data()
         except Exception as error:
-            android_main.log_line(f"Данные не перечитаны: {error}")
+            android_main.log_line(f"Данные не перечитаны: {net.brief_error(error)}")
 
         threading.Thread(target=android_main.restart_core, name="core-restart",
                          daemon=True).start()

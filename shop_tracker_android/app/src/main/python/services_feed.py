@@ -585,7 +585,7 @@ class ServiceFeed(threading.Thread):
     fail_log_every = 600.0
 
     def fail(self, error):
-        text = str(error).strip() or error.__class__.__name__
+        text = net.brief_error(error)
         # Сбой сети (DNS, TLS, таймаут) повторы уже отработали: если он
         # разовый, не пугаем «ошибкой» — следующий цикл обычно проходит.
         transient = net.is_transient(error)
@@ -1267,7 +1267,7 @@ class GfwFeed(ServiceFeed):
         except Exception as error:
             # история заходов — дополнение: без неё профиль и разрывы
             # всё равно сохраняются
-            merged["port_visits_error"] = str(error)[:80]
+            merged["port_visits_error"] = net.brief_error(error)
         merged["checked"] = datetime.now().isoformat(timespec="seconds")
         # паспорт сразу в базу: именно из-за пустых полей в карточках
         # были прочерки вместо типа, размеров и позывного
@@ -1569,7 +1569,7 @@ class GoradarFeed(ServiceFeed):
             try:
                 session.get(GORADAR_HOME, timeout=30)
             except Exception as error:
-                self.log(f"{self.title}: главная страница не открылась ({error})")
+                self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
             self.session = session
         return self.session
 
@@ -1741,7 +1741,7 @@ class MarineTrafficLiveFeed(ServiceFeed):
             try:
                 session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
             except Exception as error:
-                self.log(f"{self.title}: главная страница не открылась ({error})")
+                self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
             self.session = session
         return self.session
 
@@ -1991,7 +1991,7 @@ class ShipRadarDetailsFeed(ServiceFeed):
             self.state_path.write_text(json.dumps(self.attempts, ensure_ascii=False),
                                        encoding="utf-8")
         except OSError as error:
-            self.log(f"{self.title}: состояние не сохранено ({error})")
+            self.log(f"{self.title}: состояние не сохранено ({net.brief_error(error)})")
 
     def http(self):
         import requests
@@ -2005,7 +2005,7 @@ class ShipRadarDetailsFeed(ServiceFeed):
             try:
                 session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
             except Exception as error:
-                self.log(f"{self.title}: главная страница не открылась ({error})")
+                self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
             self.session = session
         return self.session
 

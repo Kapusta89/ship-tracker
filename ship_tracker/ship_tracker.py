@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.76"
+APP_VERSION = "2026.12.77"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -1317,7 +1317,7 @@ class App:
         try:
             rows = self.store.vessels_in_bbox(south, west, north, east, limit=3000)
         except Exception as error:
-            self.log(f"Трафик района: {error}")
+            self.log(f"Трафик района: {net.brief_error(error)}")
             rows = []
         ports = self.config.get("ports") or []
         limit_hours = core_module.MAX_VIEW_AGE_HOURS
@@ -1365,7 +1365,7 @@ class App:
             try:
                 track = self.store.track_between(mmsi, now - timedelta(hours=24), now)
             except Exception as error:
-                self.log(f"Трек {mmsi}: {error}")
+                self.log(f"Трек {mmsi}: {net.brief_error(error)}")
             path = analysis.track_path(track)
             sog = row.get("sog")
             try:
@@ -1541,7 +1541,7 @@ class App:
         try:
             vessels = self.store.vessels_in_bbox(south, west, north, east, limit=3000)
         except Exception as error:
-            self.log(f"Прогноз всех судов: {error}")
+            self.log(f"Прогноз всех судов: {net.brief_error(error)}")
             return
         ports = self.config.get("ports") or []
         now = datetime.now()
@@ -1992,7 +1992,7 @@ class App:
         try:
             local = self.core.backfill_visits()
         except Exception as error:
-            self.log(f"История стоянок: ошибка — {error}")
+            self.log(f"История стоянок: ошибка — {net.brief_error(error)}")
         else:
             self.log(f"История стоянок: по своим позициям за {local['days']:g} дн. "
                      f"проверено судов {local['vessels']} "
@@ -2002,7 +2002,7 @@ class App:
         try:
             result = self.core.import_history_stays(limit=25, pause=0.5)
         except Exception as error:
-            self.log(f"История стоянок: ошибка — {error}")
+            self.log(f"История стоянок: ошибка — {net.brief_error(error)}")
         else:
             self.log(f"История стоянок: проверено судов {result['checked']}, "
                      f"новых визитов {result['imported']}"
@@ -2065,7 +2065,7 @@ class App:
             rows = self.store.visits(500, port=port or None)
             counts = self.store.visit_counts(closed_only=True)
         except Exception as error:
-            self.log(f"История стоянок: {error}")
+            self.log(f"История стоянок: {net.brief_error(error)}")
             return
         for name, button in getattr(self, "visit_port_buttons", {}).items():
             label = next((p.get("label") or p.get("name")
@@ -2283,7 +2283,7 @@ class App:
                         for entry in (data.get("ports") or {}).values())
             self.log(f"AIS-catcher: ожидаемых судов {total}.")
         except Exception as error:
-            self.log(f"AIS-catcher: ошибка — {error}")
+            self.log(f"AIS-catcher: ошибка — {net.brief_error(error)}")
         finally:
             self._expected_loading = False
             try:
@@ -3113,7 +3113,7 @@ class App:
             try:
                 self.radar.fit_vessels(self.core.port_focus_vessels(3000))
             except Exception as error:
-                self.log(f"Масштаб по целям: {error}")
+                self.log(f"Масштаб по целям: {net.brief_error(error)}")
         self.redraw_map()
 
     def toggle_tracks(self):
@@ -3135,7 +3135,7 @@ class App:
         try:
             self.radar.fit_vessels(self.core.port_focus_vessels(3000))
         except Exception as error:
-            self.log(f"Масштаб по нашим судам: {error}")
+            self.log(f"Масштаб по нашим судам: {net.brief_error(error)}")
 
     def redraw_map(self):
         """Строго наша обстановка: только суда, связанные с нашими портами.
@@ -3179,7 +3179,7 @@ class App:
             self.radar.draw(vessels, set(self._targets.keys()), [],
                             allowed_mmsi=allowed, approach_mmsi=approach)
         except Exception as error:
-            self.log(f"Отрисовка радара: {error}")
+            self.log(f"Отрисовка радара: {net.brief_error(error)}")
 
     def select_vessel(self, mmsi):
         self.selected = mmsi
@@ -3188,7 +3188,7 @@ class App:
         try:
             self.radar.focus_on(vessel.get("lat"), vessel.get("lon"))
         except Exception as error:
-            self.log(f"Карта: не удалось показать судно {mmsi}: {error}")
+            self.log(f"Карта: не удалось показать судно {mmsi}: {net.brief_error(error)}")
         self.update_detail()
         self.update_track()
         self.load_photo(mmsi)
@@ -3201,7 +3201,7 @@ class App:
             try:
                 self.core.request_enrich(mmsi, vessel.get("name") or "")
             except Exception as error:
-                self.log(f"Догрузка паспорта {mmsi}: {error}")
+                self.log(f"Догрузка паспорта {mmsi}: {net.brief_error(error)}")
 
     def on_tree_double_click(self, event):
         tree = event.widget
@@ -3355,7 +3355,7 @@ class App:
         try:
             save_config(self.config, self.config_path)
         except OSError as error:
-            self.log(f"Настройки фото: {error}")
+            self.log(f"Настройки фото: {net.brief_error(error)}")
         self.log("Фото: автообновление " + ("включено." if self.config["photos_auto"]
                                              else "выключено."))
         self.photo_auto_var.set(self.photos_auto_text())
@@ -3374,7 +3374,7 @@ class App:
                 if self.config.get("photos_auto", True):
                     self._photos_auto_pass()
             except Exception as error:
-                self.log(f"Автообновление фото: {error}")
+                self.log(f"Автообновление фото: {net.brief_error(error)}")
             try:
                 minutes = float(self.config.get("photos_minutes") or 15)
             except (TypeError, ValueError):
@@ -3449,7 +3449,7 @@ class App:
             results = photos.check_sources()
         except Exception as error:
             results = [{"key": key, "title": title, "ok": False,
-                        "detail": str(error)[:60]}
+                        "detail": net.brief_error(error)}
                        for key, title, _ in photos.PROVIDERS]
         finally:
             self._photo_busy = False
@@ -3514,7 +3514,7 @@ class App:
         try:
             info = self.core.destination_analysis(vessel)
         except Exception as error:
-            return [f"анализ недоступен: {error}"]
+            return [f"анализ недоступен: {net.brief_error(error)}"]
         rows = [f"Заявлено судном: {info.get('declared') or '—'}"]
         port = info.get("declared_port") or {}
         if port:
@@ -3663,7 +3663,7 @@ class App:
             info = self.core.berth_info(mmsi)
         except Exception as error:
             info = {"berth": None, "last_stop": None, "since": None}
-            self.log(f"Причал по истории: {error}")
+            self.log(f"Причал по истории: {net.brief_error(error)}")
         stay = self.core.port_stay(vessel)
         if stay:
             stay_port = stay.get("port_label") or stay.get("port")
@@ -3945,7 +3945,7 @@ class App:
             result = self.core.refresh_vessel_now(mmsi)
             text = str(result.get("text") or "")
         except Exception as error:
-            text = f"ошибка: {error}"
+            text = f"ошибка: {net.brief_error(error)}"
         finally:
             self._auto_busy = False
             self._auto_state = {"mmsi": mmsi, "at": datetime.now(), "text": text}
@@ -4075,7 +4075,7 @@ class App:
         try:
             self._fast_tick()
         except Exception as error:
-            self.log(f"Обновление окна: {error}")
+            self.log(f"Обновление окна: {net.brief_error(error)}")
         finally:
             try:
                 self.root.after(700, self.fast_tick)
@@ -4130,7 +4130,7 @@ class App:
         try:
             self.restart_core()
         except Exception as error:
-            self.log(f"Сторож: перезапуск не удался ({error}).")
+            self.log(f"Сторож: перезапуск не удался ({net.brief_error(error)}).")
 
     def _fast_tick(self):
         self._watchdog()
@@ -4256,14 +4256,14 @@ class App:
         try:
             opened = bool(webbrowser.open(text))
         except Exception as error:
-            self.log(f"Сайт {text}: браузер не открылся — {error}")
+            self.log(f"Сайт {text}: браузер не открылся — {net.brief_error(error)}")
         if not opened:
             try:
                 if sys.platform.startswith("win"):
                     os.startfile(text)  # noqa: S606  (штатное открытие в Windows)
                     opened = True
             except Exception as error:
-                self.log(f"Сайт {text}: открыть не удалось — {error}")
+                self.log(f"Сайт {text}: открыть не удалось — {net.brief_error(error)}")
         if opened:
             return
         try:
@@ -4372,7 +4372,7 @@ class App:
         try:
             self._slow_tick()
         except Exception as error:
-            self.log(f"Обновление таблиц: {error}")
+            self.log(f"Обновление таблиц: {net.brief_error(error)}")
         finally:
             try:
                 self.root.after(2000, self.slow_tick)
@@ -4383,7 +4383,7 @@ class App:
         try:
             self._targets = {target["mmsi"]: target for target in self.core.targets()}
         except Exception as error:
-            self.log(f"Расчёт целей: {error}")
+            self.log(f"Расчёт целей: {net.brief_error(error)}")
             self._targets = {}
         if hasattr(self, "targets_tree"):
             self.refresh_targets_table()
@@ -4432,7 +4432,7 @@ class App:
                 self.log("AIS: поток прежнего процесса встал — принимаю данные "
                          "в этом окне.")
         except Exception as error:
-            self.log(f"AIS: не удалось забрать поток: {error}")
+            self.log(f"AIS: не удалось забрать поток: {net.brief_error(error)}")
 
     def on_tab_changed(self, event=None):
         """При переключении вкладки сразу читаем данные, а не ждём такта."""
@@ -4544,7 +4544,7 @@ class App:
             elif tab is getattr(self, "tab_log", None):
                 self.log_text.see("end")
         except Exception as error:
-            self.log(f"Обновление вкладки: {error}")
+            self.log(f"Обновление вкладки: {net.brief_error(error)}")
 
     def reload_filter_fields(self):
         """Перечитывает сохранённые настройки фильтров в поля вкладки."""
@@ -4624,7 +4624,7 @@ class App:
         try:
             rows = self.core.sea_vessels(3000)
         except Exception as error:
-            self.log(f"Список «В море»: {error}")
+            self.log(f"Список «В море»: {net.brief_error(error)}")
             rows = []
         try:
             visit_ports = self.store.visit_ports()
@@ -4958,7 +4958,7 @@ class App:
         try:
             save_config(self.config, self.config_path)
         except OSError as error:
-            self.messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {error}")
+            self.messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {net.brief_error(error)}")
             raise AppError(str(error))
         return self.config
 
@@ -5215,7 +5215,7 @@ class App:
             if len(targets) > 1:
                 self.log(f"Тест Telegram: отправлено в {len(targets)} чата.")
         except AppError as error:
-            self.log(f"Тест Telegram: {error}")
+            self.log(f"Тест Telegram: {net.brief_error(error)}")
             text = str(error)
             self.root.after(0, lambda: self.messagebox.showerror("Telegram", text))
         else:
@@ -5271,7 +5271,7 @@ class App:
             self.log("Бот Telegram запущен вместе с приложением.")
         except Exception as error:
             self.bot_process = None
-            self.log(f"Бот Telegram не запущен: {error}")
+            self.log(f"Бот Telegram не запущен: {net.brief_error(error)}")
 
     def stop_bot_process(self):
         """Останавливает только тот бот, который запустило это окно."""
@@ -5358,7 +5358,7 @@ class App:
                 result = self.core.refresh_live_positions(limit=2)
                 text = f"обновлено {result['updated']} из {result['checked']}"
             except Exception as error:
-                text = f"ошибка: {str(error)[:60]}"
+                text = f"ошибка: {net.brief_error(error)}"
             self.log(f"{title}: {text}.")
             finish(text)
             return
@@ -5393,7 +5393,7 @@ class App:
         try:
             feed.poll_once()
         except Exception as error:
-            text = str(error).strip() or error.__class__.__name__
+            text = net.brief_error(error)
             self.log(f"{title}: не подключился — {text}")
             finish(f"ошибка: {text[:60]}")
             return
@@ -5432,7 +5432,7 @@ class App:
         try:
             portcalls.save_sources(items)
         except OSError as error:
-            self.log(f"Не удалось сохранить результат проверки: {error}")
+            self.log(f"Не удалось сохранить результат проверки: {net.brief_error(error)}")
         if key not in getattr(self, "source_status", {}):
             return
         text = self.format_source_result(result)
@@ -5464,7 +5464,7 @@ class App:
         except Exception as error:                     # не должно случаться
             result = {"key": source["key"], "title": source["title"],
                       "ok": False, "warn": False,
-                      "detail": str(error)[:120],
+                      "detail": net.brief_error(error),
                       "checked": datetime.now().isoformat(timespec="seconds")}
         finally:
             self._source_checking.discard(source["key"])
@@ -5493,7 +5493,7 @@ class App:
         try:
             asked = self.core.refresh_all_sources()
         except Exception as error:
-            self.log(f"Обновление источников: {error}")
+            self.log(f"Обновление источников: {net.brief_error(error)}")
             return 0
         stamp = f"{datetime.now():%H:%M:%S}"
         if asked:
@@ -5537,7 +5537,7 @@ class App:
                 except Exception as error:
                     return {"key": source["key"], "title": source["title"],
                             "ok": False, "warn": False,
-                            "detail": str(error)[:120],
+                            "detail": net.brief_error(error),
                             "checked": datetime.now().isoformat(timespec="seconds")}
 
             workers = max(1, min(8, len(portcalls.SOURCES)))
@@ -5614,10 +5614,10 @@ def report_startup_error(error: BaseException) -> Path:
             handle.write(text)
     except OSError:
         pass
-    console_log(f"ОШИБКА ЗАПУСКА: {error.__class__.__name__}: {error}")
+    console_log(f"ОШИБКА ЗАПУСКА: {error.__class__.__name__}: {net.brief_error(error)}")
     console_log(text.strip())
 
-    summary = f"{error.__class__.__name__}: {error}"
+    summary = f"{error.__class__.__name__}: {net.brief_error(error)}"
     body = (f"Приложение не смогло запуститься.\n\n{summary}\n\n"
             f"Подробности сохранены в файл:\n{log_path}")
     if sys.platform.startswith("win"):
@@ -5686,7 +5686,7 @@ def test_telegram_cli(config) -> int:
         send_telegram(config.get("telegram_token"), config.get("telegram_chat_id"),
                       "✅ Ship Tracker на связи.")
     except AppError as error:
-        console_log(f"ОШИБКА: {error}")
+        console_log(f"ОШИБКА: {net.brief_error(error)}")
         return 1
     console_log("Тестовое сообщение отправлено.")
     return 0
@@ -5716,7 +5716,7 @@ def refresh_mmsi_cli(args) -> int:
         try:
             result = core.refresh_vessel_now(mmsi)
         except Exception as error:
-            console_log(f"  ошибка: {error}")
+            console_log(f"  ошибка: {net.brief_error(error)}")
             continue
         console_log(f"  {result.get('text')}")
         time.sleep(1.5)  # очередь успевает записать паспорт из карточки

@@ -992,7 +992,7 @@ class RadarCore:
                         self.feed = feed2
                     self.feeds.append(feed2)
                 except Exception as error:
-                    self.log(f"Open Waters AIS: не удалось запустить ({error})")
+                    self.log(f"Open Waters AIS: не удалось запустить ({net.brief_error(error)})")
         # Слежение по MMSI: суда района и наши суда в любой точке мира, где есть
         # приём AIS. Одна подписка AISStream принимает не больше 200 MMSI, поэтому
         # список делится на несколько соединений — на каждое своя доля (`part`).
@@ -1030,7 +1030,7 @@ class RadarCore:
                         self.feed = watch
                 except Exception as error:
                     self.log(f"Слежение по MMSI, соединение {index + 1}: "
-                             f"не удалось запустить ({error})")
+                             f"не удалось запустить ({net.brief_error(error)})")
             if started:
                 self.log(f"Слежение по MMSI: соединений {started}, по 50 MMSI — "
                          f"до {started * 50} судов (AISStream занято "
@@ -1064,7 +1064,7 @@ class RadarCore:
                     self.log(f"Снимок района: клеток {len(boxes)}, обновление "
                              f"каждые {minutes:g} мин.")
                 except Exception as error:
-                    self.log(f"Снимок района: не удалось запустить ({error})")
+                    self.log(f"Снимок района: не удалось запустить ({net.brief_error(error)})")
             else:
                 self.log("Снимок района: не заданы порты наблюдения.")
         # История стоянок: визиты, которые программа сама не видела
@@ -1390,7 +1390,7 @@ class RadarCore:
                 feed.poll_once()
                 self.log(f"Паспорт {mmsi}: запрос в Ship Radar 24 отправлен.")
             except Exception as error:
-                self.log(f"Паспорт {mmsi}: сервис не ответил ({error})")
+                self.log(f"Паспорт {mmsi}: {net.brief_error(error)}")
 
         threading.Thread(target=worker, daemon=True, name=f"enrich-{mmsi}").start()
         return True
@@ -1403,7 +1403,7 @@ class RadarCore:
             try:
                 result = self.import_history_stays(limit=60, pause=0.5)
             except Exception as error:
-                self.log(f"История стоянок: {error}")
+                self.log(f"История стоянок: {net.brief_error(error)}")
                 break
             if result.get("imported"):
                 self.log(f"История стоянок: добавлено визитов {result['imported']} "
@@ -1420,7 +1420,7 @@ class RadarCore:
             try:
                 result = self.backfill_visits()
             except Exception as error:
-                self.log(f"История стоянок: {error}")
+                self.log(f"История стоянок: {net.brief_error(error)}")
                 break
             if result.get("imported") or result.get("closed"):
                 self.log(f"История стоянок: за {result['days']:g} дн. добавлено "
@@ -1448,7 +1448,7 @@ class RadarCore:
             try:
                 self.revive_stale(limit=max(1, min(20, limit)))
             except Exception as error:
-                self.log(f"AIS-поиск устаревших: {error}")
+                self.log(f"AIS-поиск устаревших: {net.brief_error(error)}")
             if self.stop_event.wait(180):
                 break
 
@@ -1472,7 +1472,7 @@ class RadarCore:
             try:
                 self._send_alert(target, text)
             except Exception as error:
-                self.log(f"Алерт по {target.get('name')}: сбой отправки ({error})")
+                self.log(f"Алерт по {target.get('name')}: сбой отправки ({net.brief_error(error)})")
 
     def stop(self, wait=3):
         self.stop_event.set()
@@ -2204,7 +2204,7 @@ class RadarCore:
             try:
                 self.scan_approaches()
             except Exception as error:
-                self.log(f"Проверка курса к портам: {error}")
+                self.log(f"Проверка курса к портам: {net.brief_error(error)}")
             if self.stop_event.wait(120):
                 break
 
@@ -2331,7 +2331,7 @@ class RadarCore:
             try:
                 found = ais_feed.fetch_vessels(ids[start:start + size])
             except Exception as error:
-                self.log(f"Обновление координат: {error}")
+                self.log(f"Обновление координат: {net.brief_error(error)}")
                 continue
             for data in found:
                 try:
@@ -2415,14 +2415,14 @@ class RadarCore:
         try:
             feed = self.card_feed()
         except Exception as error:
-            self.log(f"Карточка {mmsi}: {error}")
+            self.log(f"Карточка {mmsi}: {net.brief_error(error)}")
             return None
         if feed is None:
             return None
         try:
             return feed.poll_vessel(mmsi, name)
         except Exception as error:
-            self.log(f"Карточка {mmsi}: {error}")
+            self.log(f"Карточка {mmsi}: {net.brief_error(error)}")
             return None
 
     def refresh_shipfinder(self, mmsi) -> dict | None:
@@ -2484,21 +2484,7 @@ class RadarCore:
         name = str(row.get("name") or "")
         lat, lon = row.get("lat"), row.get("lon")
 
-        def brief(error) -> str:
-            """Короткая причина вместо простыни «403 Client Error for url…»."""
-            text = str(error or "").split(" for url:")[0].strip()
-            low = text.lower()
-            if "403" in low or "cloudflare" in low or "forbidden" in low:
-                return "недоступен: Cloudflare"
-            if "429" in low or "too many requests" in low or "rate limited" in low:
-                return "недоступен: лимит запросов"
-            if "timed out" in low or "timeout" in low:
-                return "не ответил вовремя"
-            if "404" in low or "not found" in low:
-                return "судна нет на сайте"
-            if "connect" in low:
-                return "нет связи"
-            return text[:60] or "не ответил"
+        brief = net.brief_error
 
         def openwaters():
             try:
@@ -2640,7 +2626,7 @@ class RadarCore:
         try:
             updated = self.refresh_vessels(batch)
         except Exception as error:
-            self.log(f"Обновление наших судов: {error}")
+            self.log(f"Обновление наших судов: {net.brief_error(error)}")
             return {"checked": len(batch), "updated": 0}
         return {"checked": len(batch), "updated": updated}
 
@@ -2744,7 +2730,7 @@ class RadarCore:
                 if self.config.get("use_sfp", True):
                     self.refresh_live_positions()
             except Exception as error:
-                self.log(f"ShipFinder: {error}")
+                self.log(f"ShipFinder: {net.brief_error(error)}")
             if self.stop_event.wait(max(120.0, minutes * 60.0)):
                 break
 
@@ -2838,7 +2824,7 @@ class RadarCore:
             try:
                 self.refresh_portcalls()
             except Exception as error:
-                self.log(f"Порты заходов: {error}")
+                self.log(f"Порты заходов: {net.brief_error(error)}")
             if self.stop_event.wait(2 * 3600):
                 break
 
@@ -2892,18 +2878,18 @@ class RadarCore:
         try:
             asked = self.refresh_all_sources()
         except Exception as error:
-            self.log(f"Резерв: источники не проснулись ({error})")
+            self.log(f"Резерв: источники не проснулись ({net.brief_error(error)})")
         try:
             self.refresh_focus(limit=30)
         except Exception as error:
-            self.log(f"Резерв: Open Waters — {error}")
+            self.log(f"Резерв: Open Waters — {net.brief_error(error)}")
         limit = int(self.config.get("failover_limit") or 40)
         try:
             result = self.refresh_live_positions(limit=limit)
             self.log(f"Резерв: ShipFinder проверил {result['checked']} судов, "
                      f"новых позиций {result['updated']}; источников разбужено {asked}.")
         except Exception as error:
-            self.log(f"Резерв: ShipFinder — {error}")
+            self.log(f"Резерв: ShipFinder — {net.brief_error(error)}")
 
     def _failover_worker(self):
         if self.stop_event.wait(60):
@@ -2912,7 +2898,7 @@ class RadarCore:
             try:
                 self.check_failover()
             except Exception as error:
-                self.log(f"Резерв источников: {error}")
+                self.log(f"Резерв источников: {net.brief_error(error)}")
             if self.stop_event.wait(60):
                 break
 
@@ -2991,7 +2977,7 @@ class RadarCore:
             with ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(chunks)))) as pool:
                 results = list(pool.map(one, chunks))
         except Exception as error:
-            self.log(f"Обновление координат: {error}")
+            self.log(f"Обновление координат: {net.brief_error(error)}")
             return {"checked": len(slice_), "updated": 0}
         return {"checked": len(slice_), "updated": sum(results),
                 "total": len(ordered)}
@@ -3015,7 +3001,7 @@ class RadarCore:
                     self.log(f"Координаты: обновлено {result['updated']} из "
                              f"{result['checked']} (в базе {result.get('total', '?')}).")
             except Exception as error:
-                self.log(f"Обновление координат: {error}")
+                self.log(f"Обновление координат: {net.brief_error(error)}")
             try:
                 pause = float(self.config.get("bulk_refresh_pause_seconds") or 5)
             except (TypeError, ValueError):
@@ -3038,7 +3024,7 @@ class RadarCore:
                     self.log(f"Свежие данные: обновлено {result['updated']} "
                              f"из {result['checked']} судов (Open Waters).")
             except Exception as error:
-                self.log(f"Обновление наших судов: {error}")
+                self.log(f"Обновление наших судов: {net.brief_error(error)}")
             if self.stop_event.wait(max(60.0, minutes * 60.0)):
                 break
 
@@ -3071,7 +3057,7 @@ class RadarCore:
             try:
                 found = services_feed.vesselapi_position(mmsi, key)
             except Exception as error:
-                self.log(f"AIS-поиск (VesselAPI): {error}")
+                self.log(f"AIS-поиск (VesselAPI): {net.brief_error(error)}")
                 found = None
             if found and self._accept_position(mmsi, found.get("lat"), found.get("lon"),
                                                found.get("sog"), found.get("cog"),
@@ -3121,7 +3107,7 @@ class RadarCore:
             try:
                 source = self.revive_vessel(str(vessel.get("mmsi")))
             except Exception as error:
-                self.log(f"AIS-поиск: {error}")
+                self.log(f"AIS-поиск: {net.brief_error(error)}")
                 source = None
             if source:
                 found += 1
@@ -3249,7 +3235,7 @@ class RadarCore:
             try:
                 self.process(event)
             except Exception as error:  # одно плохое сообщение не должно ронять поток
-                self.log(f"Ошибка обработки сообщения: {error}")
+                self.log(f"Ошибка обработки сообщения: {net.brief_error(error)}")
             self._housekeeping()
 
     def reconcile_open_visits(self, stale_hours=24.0) -> int:
@@ -3308,7 +3294,7 @@ class RadarCore:
                     if self.store.delete_visit(visit.get("id")):
                         closed += 1
                 except Exception as error:
-                    self.log(f"Сверка стоянок: {mmsi} — {error}")
+                    self.log(f"Сверка стоянок: {mmsi} — {net.brief_error(error)}")
                 continue
             if when is None or when < entered:
                 when = entered
@@ -3316,7 +3302,7 @@ class RadarCore:
                 if self.store.close_visit_by_id(visit.get("id"), when):
                     closed += 1
             except Exception as error:
-                self.log(f"Сверка стоянок: {mmsi} — {error}")
+                self.log(f"Сверка стоянок: {mmsi} — {net.brief_error(error)}")
         if closed:
             self.log(f"Сверка стоянок: закрыто {closed} без подтверждения координатами.")
         return closed
@@ -3340,7 +3326,7 @@ class RadarCore:
             try:
                 self.reconcile_open_visits()
             except Exception as error:
-                self.log(f"Сверка стоянок: {error}")
+                self.log(f"Сверка стоянок: {net.brief_error(error)}")
             forgotten = self.store.forget_vessels(self.config.get("forget_vessels_hours") or 24)
             if forgotten:
                 self.log(f"Убрано из списка судов без связи: {forgotten}.")
@@ -3351,7 +3337,7 @@ class RadarCore:
             if dropped:
                 self.log(f"Убрано судов без связи с портами дольше двух суток: {dropped}.")
         except Exception as error:
-            self.log(f"Обслуживание базы: {error}")
+            self.log(f"Обслуживание базы: {net.brief_error(error)}")
 
     def sync_expected(self) -> int:
         """Заносит суда из бесплатного AIS-catcher в базу — без координат.
@@ -3629,7 +3615,7 @@ class RadarCore:
                 "updated_at": stamp,
             }])
         except Exception as error:
-            self.log(f"Трафик района: запись не удалась ({error})")
+            self.log(f"Трафик района: запись не удалась ({net.brief_error(error)})")
 
     def _track_geofence(self, mmsi, port_name, lat, lon, when):
         visit = self.store.open_visit(mmsi)
@@ -3787,14 +3773,14 @@ class RadarCore:
                 items = places.fetch_quays(lat - 0.12, lon - 0.15,
                                            lat + 0.12, lon + 0.15)
             except Exception as error:
-                self.log(f"Причалы {port.get('name')}: {error}")
+                self.log(f"Причалы {port.get('name')}: {net.brief_error(error)}")
                 continue
             if not items:
                 continue
             try:
                 saved = self.store.save_quay_places(area, items)
             except Exception as error:
-                self.log(f"Причалы {port.get('name')}: {error}")
+                self.log(f"Причалы {port.get('name')}: {net.brief_error(error)}")
                 continue
             self.log(f"Причалы {port.get('name')}: сохранено {saved} объектов OSM")
 
@@ -4733,7 +4719,7 @@ class RadarCore:
             except Exception as error:
                 failed += 1
                 if failed == 1:
-                    self.log(f"История стоянок: сервис ответил ошибкой ({error}).")
+                    self.log(f"История стоянок: сервис ответил ошибкой ({net.brief_error(error)}).")
                 continue
             kind, _ = cargo.cargo_kind(vessel.get("type_code"))
             for stay in stays:
@@ -5004,7 +4990,7 @@ class BotCommander(threading.Thread):
         try:
             send_telegram(token, chat_id, text)
         except AppError as error:
-            self.log(f"Команды Telegram: ответ не отправлен: {error}")
+            self.log(f"Команды Telegram: ответ не отправлен: {net.brief_error(error)}")
 
     def run(self):
         self._lock = claim_telegram_lock(self.store)
@@ -5025,13 +5011,13 @@ class BotCommander(threading.Thread):
             except AppError as error:
                 if self.stop_event.is_set():
                     break
-                self.log(f"Команды Telegram: {error}")
+                self.log(f"Команды Telegram: {net.brief_error(error)}")
                 self.stop_event.wait(15)
                 continue
             except Exception as error:
                 if self.stop_event.is_set():
                     break
-                self.log(f"Команды Telegram: {error.__class__.__name__}: {error}")
+                self.log(f"Команды Telegram: {error.__class__.__name__}: {net.brief_error(error)}")
                 self.stop_event.wait(30)
                 continue
             for update in updates:
@@ -5040,10 +5026,10 @@ class BotCommander(threading.Thread):
                 try:
                     self.handle(update)
                 except AppError as error:
-                    self.log(f"Команды Telegram: {error}")
+                    self.log(f"Команды Telegram: {net.brief_error(error)}")
                 except Exception as error:
                     self.log(f"Команды Telegram: сбой обработки "
-                             f"({error.__class__.__name__}: {error})")
+                             f"({error.__class__.__name__}: {net.brief_error(error)})")
 
     def handle(self, update):
         message = update.get("message") or update.get("edited_message") or {}

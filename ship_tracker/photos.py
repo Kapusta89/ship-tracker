@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+import net
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -300,7 +301,7 @@ def check_sources(timeout=12) -> list:
                 ok = response.status_code == 200
                 detail = "отвечает" if ok else f"HTTP {response.status_code}"
             except requests.RequestException as error:
-                ok, detail = False, str(error)[:60]
+                ok, detail = False, net.brief_error(error)
         else:
             try:
                 response = requests.get(site, headers=HEADERS, timeout=timeout,
@@ -311,6 +312,6 @@ def check_sources(timeout=12) -> list:
                 else:
                     detail = f"HTTP {response.status_code}"
             except requests.RequestException as error:
-                ok, detail = False, str(error)[:60]
+                ok, detail = False, net.brief_error(error)
         result.append({"key": key, "title": title, "ok": ok, "detail": detail})
     return result

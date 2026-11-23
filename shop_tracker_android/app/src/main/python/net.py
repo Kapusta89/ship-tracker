@@ -49,6 +49,39 @@ def is_transient(error) -> bool:
     return isinstance(error, (ssl.SSLError, socket.gaierror, ConnectionError))
 
 
+def brief_error(error) -> str:
+    """Короткая человеческая причина вместо «403 Client Error: Forbidden for url…».
+
+    Текст исключения попадает в подписи карточек, статусы сервисов, плашку
+    проблем и сообщения бота. Простыню с адресом запроса там читать нельзя,
+    поэтому причина сводится к одной фразе. Уже человеческие короткие
+    сообщения (их поднимают сами сервисы) возвращаются как есть.
+    """
+    text = str(error or "").split(" for url:")[0].strip()
+    text = text.rstrip(".")
+    if not text:
+        return "не ответил"
+    low = text.lower()
+    if ("cloudflare" in low or "forbidden" in low or " 403" in low
+            or low.startswith("403") or "just a moment" in low):
+        return "недоступен: Cloudflare"
+    if ("429" in low or "too many requests" in low
+            or "rate limit" in low):
+        return "недоступен: лимит запросов"
+    if "timed out" in low or "timeout" in low:
+        return "не ответил вовремя"
+    if "404" in low or "not found" in low:
+        return "судна нет на сайте"
+    if "не задан ключ" in low or "ключ не задан" in low:
+        return "нужен ключ API"
+    if "401" in low or "unauthorized" in low or "ключ" in low:
+        return "ключ не принят"
+    if ("connect" in low or "getaddrinfo" in low or "ssl" in low
+            or "name resolution" in low or "dns" in low):
+        return "нет связи"
+    return text[:60]
+
+
 def _pause(attempt, retry_after=None) -> None:
     delay = BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0.0, 0.3)
     if retry_after:

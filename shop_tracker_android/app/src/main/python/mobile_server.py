@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import net
 from mobile_page import PAGE
 
 APP_NAME = "Ship Tracker Mobile"
@@ -1059,7 +1060,7 @@ def start_discovery(port: int):
     try:
         sock.bind(("", DISCOVERY_PORT))
     except OSError as error:
-        log_line(f"Автопоиск недоступен: {error}")
+        log_line(f"Автопоиск недоступен: {net.brief_error(error)}")
         return None
     reply = json.dumps({"app": "ship_tracker_mob", "port": port}).encode("utf-8")
 

@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timedelta, timezone
 import sys
 from pathlib import Path
+import net
 
 BASE_DIR = (Path(sys.executable).resolve().parent
             if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
@@ -116,7 +117,7 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None, retries=1) -> dict:
                 # у сети AIS-catcher есть не все порты — это не сбой канала
                 entry["unsupported"] = True
             else:
-                entry["error"] = str(error).strip()[:120] or error.__class__.__name__
+                entry["error"] = net.brief_error(error)
                 if log:
                     log(f"AIS-catcher {locode}: {entry['error']}")
         return locode, entry
@@ -664,7 +665,7 @@ def check_source(source, timeout=25, log=None) -> dict:
                                     "для автоматических запросов")
         response.close()
     except Exception as error:                      # сеть, DNS, таймаут
-        result["detail"] = str(error).strip()[:120] or error.__class__.__name__
+        result["detail"] = net.brief_error(error)
     result["seconds"] = round(time.monotonic() - started, 1)
     if log:
         state = "работает" if result["ok"] else "не отвечает" if not result["warn"] \
