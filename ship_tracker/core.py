@@ -2679,13 +2679,31 @@ class RadarCore:
             limit = int(self.config.get("sfp_limit") or 12)
         stale = float(self.config.get("sfp_stale_minutes") or 5)
         rows = self.live_web_candidates(limit=limit, stale_minutes=stale)
+        # запросы к карте идут параллельно: раньше суда читались по одному
+        # с паузой 0.8 с, и 12 судов занимали больше 20 секунд
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch(row):
+            if self.stop_event.is_set():
+                return None
+            mmsi = str(row.get("mmsi"))
+            try:
+                found = services_feed.shipfinder_position(mmsi)
+            except Exception:
+                found = None
+            time.sleep(0.2)
+            return mmsi, found
+
+        fetched = []
+        if rows:
+            workers = max(1, min(4, len(rows)))
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="shipfinder-") as pool:
+                fetched = [item for item in pool.map(fetch, rows) if item]
         checked = 0
         updated = 0
-        for row in rows:
-            if self.stop_event.is_set():
-                break
-            mmsi = str(row.get("mmsi"))
-            found = services_feed.shipfinder_position(mmsi)
+        # в базу пишет только этот поток: соединение SQLite общее на процесс
+        for mmsi, found in fetched:
             checked += 1
             if not found:
                 continue
@@ -2709,7 +2727,6 @@ class RadarCore:
                         self.store.save_field(mmsi, field, cleaned, moment, "shipfinder")
                     except Exception:
                         pass
-            self.stop_event.wait(0.8)
         if checked:
             stamp = datetime.now().strftime("%H:%M")
             self._set_service_status("sfp", f"обновлено {updated} из {checked} · {stamp}")
@@ -2723,7 +2740,9 @@ class RadarCore:
             minutes = float(self.config.get("sfp_minutes") or 5)
         except (TypeError, ValueError):
             minutes = 5
-        if self.stop_event.wait(75):
+        # короткая пауза: свежие координаты нужны сразу после открытия,
+        # а не через полторы минуты
+        if self.stop_event.wait(10):
             return
         while not self.stop_event.is_set():
             try:
@@ -2791,10 +2810,8 @@ class RadarCore:
         """Догружает историю заходов для наших судов и складывает в кэш."""
         cache = self._load_portcalls()
         now = time.time()
-        checked = updated = 0
+        targets = []
         for row in self.portcall_candidates(limit):
-            if self.stop_event.is_set():
-                break
             mmsi = str(row.get("mmsi"))
             item = cache.get(mmsi) or {}
             try:
@@ -2803,14 +2820,34 @@ class RadarCore:
                 fetched = 0
             if fetched and now - fetched < ttl_hours * 3600:
                 continue
-            data = services_feed.shipradar_portcalls(mmsi)
+            targets.append(mmsi)
+        # история заходов читается параллельно: пауза 1 с на судно
+        # превращала 25 судов в полминуты ожидания
+        from concurrent.futures import ThreadPoolExecutor
+
+        def fetch(mmsi):
+            if self.stop_event.is_set():
+                return mmsi, None
+            try:
+                data = services_feed.shipradar_portcalls(mmsi)
+            except Exception:
+                data = None
+            time.sleep(0.25)
+            return mmsi, data
+
+        fetched = []
+        if targets:
+            with ThreadPoolExecutor(max_workers=max(1, min(4, len(targets))),
+                                    thread_name_prefix="portcalls-") as pool:
+                fetched = list(pool.map(fetch, targets))
+        checked = updated = 0
+        for mmsi, data in fetched:
             checked += 1
             if not data:
                 continue
             data["fetched"] = now
             cache[mmsi] = data
             updated += 1
-            self.stop_event.wait(1.0)
         if updated:
             self._save_portcalls(cache)
             self.log(f"Порты заходов: обновлено {updated} из {checked} судов.")

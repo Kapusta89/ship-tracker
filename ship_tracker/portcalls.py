@@ -122,12 +122,33 @@ def fetch_expected(ports, timeout=45, pause=1.5, log=None, retries=1) -> dict:
                     log(f"AIS-catcher {locode}: {entry['error']}")
         return locode, entry
 
-    for port in ports or []:
-        asked = ask(port)
-        if not asked:
-            continue
-        result["ports"][asked[0]] = asked[1]
-        time.sleep(max(0.0, pause))
+    # порты читаются параллельно: раньше 20 портов с паузой 1.5 с
+    # занимали полминуты, и вкладка «Ожидаемые» открывалась пустой
+    import threading
+
+    ports = list(ports or [])
+    gate = threading.Lock()
+    next_slot = [0.0]
+
+    def one(port):
+        with gate:
+            moment = time.monotonic()
+            slot = max(moment, next_slot[0])
+            next_slot[0] = slot + max(0.0, pause)
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        return ask(port)
+
+    asked_all = []
+    if ports:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max(1, min(4, len(ports))),
+                                thread_name_prefix="expected-") as pool:
+            asked_all = [asked for asked in pool.map(one, ports) if asked]
+    for locode, entry in asked_all:
+        result["ports"][locode] = entry
     # второй подход к портам, которые не отдали таблицу с первого раза
     for attempt in range(max(0, int(retries or 0))):
         failed = [port for port in (ports or [])

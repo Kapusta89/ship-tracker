@@ -19,6 +19,7 @@
 
 import json
 import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -147,7 +148,7 @@ class MaritimeOptimaBase(base.ServiceFeed):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = None
+        self._local = threading.local()
         self.vessel_source = kwargs.get("vessels") or (lambda: [])
         self.attempts = self._load_attempts()
         if kwargs.get("minutes"):
@@ -173,13 +174,16 @@ class MaritimeOptimaBase(base.ServiceFeed):
         # Главную страницу не открываем: сайт отвечает на неё кодом 103 (Early
         # Hints) с пустым телом, после чего сессия отдаёт пустые карточки.
         # Карточки читаются и без прогрева — прямо по адресу судна.
+        # сессия своя на каждый поток: requests.Session не рассчитана на
+        # одновременные запросы, а карточки теперь читаются параллельно
         import requests
-        if self.session is None:
+        session = getattr(self._local, "session", None)
+        if session is None:
             session = requests.Session()
             session.headers.update({"User-Agent": base.MAP_HEADERS["User-Agent"],
                                     "Accept-Language": "en"})
-            self.session = session
-        return self.session
+            self._local.session = session
+        return session
 
     def candidates(self):
         """Суда с IMO, которые ещё не читали: без IMO адрес карточки не собрать."""
@@ -216,24 +220,17 @@ class MaritimeOptimaFeed(MaritimeOptimaBase):
     state_path = MARITIMEOPTIMA_STATE
 
     def poll_once(self):
-        session = self.http()
-        saved = errors = 0
-        for item in self.candidates():
-            if self.stop_event.is_set():
-                break
+        def read(item):
             mmsi = str(item.get("mmsi") or "")
             try:
                 card = maritimeoptima_page(mmsi, item.get("imo"), item.get("name"),
-                                           session=session)
+                                           session=self.http())
             except Exception as error:
-                errors += 1
                 self.attempts[mmsi] = {"at": time.time(), "ok": False}
-                if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
-                continue
+                return "error", mmsi, error
             self.attempts[mmsi] = {"at": time.time(), "ok": bool(card)}
             if not card:
-                continue
+                return "empty", mmsi, None
             try:
                 code = ais_feed.type_code_for_label(card.get("type_text"))
             except Exception:
@@ -251,10 +248,16 @@ class MaritimeOptimaFeed(MaritimeOptimaBase):
                        "eta_declared": None,
                        "at": datetime.now(),
                        "source": "mo"})
-            saved += 1
-            time.sleep(self.pause)
+            return "saved", mmsi, None
+
+        results = [item for item in self.gather(self.candidates(), read) if item]
+        saved = sum(1 for state, _mmsi, _error in results if state == "saved")
+        errors = [(mmsi, error) for state, mmsi, error in results
+                  if state == "error"]
+        for mmsi, error in errors[:3]:
+            self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
         self._save_attempts()
-        self.ok(saved, f"ошибок {errors}")
+        self.ok(saved, f"ошибок {len(errors)}")
 
 
 class ShipAtlasFeed(MaritimeOptimaBase):
@@ -272,23 +275,17 @@ class ShipAtlasFeed(MaritimeOptimaBase):
     state_path = SHIPATLAS_STATE
 
     def poll_once(self):
-        session = self.http()
-        saved = errors = 0
         cache = self._load_attempts()
-        for item in self.candidates():
-            if self.stop_event.is_set():
-                break
+
+        def read(item):
             mmsi = str(item.get("mmsi") or "")
             try:
                 card = maritimeoptima_page(mmsi, item.get("imo"), item.get("name"),
-                                           session=session)
+                                           session=self.http())
             except Exception as error:
-                errors += 1
-                if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
-                continue
+                return "error", mmsi, error
             if not card:
-                continue
+                return "empty", mmsi, None
             cache[mmsi] = {"name": item.get("name") or "",
                            "imo": item.get("imo") or "",
                            "area": card.get("area") or "",
@@ -302,10 +299,17 @@ class ShipAtlasFeed(MaritimeOptimaBase):
                 self.emit({"kind": "static", "mmsi": mmsi,
                            "destination": destination, "at": datetime.now(),
                            "source": "sa"})
-                saved += 1
-            time.sleep(self.pause)
+                return "saved", mmsi, None
+            return "empty", mmsi, None
+
+        results = [item for item in self.gather(self.candidates(), read) if item]
+        saved = sum(1 for state, _mmsi, _error in results if state == "saved")
+        errors = [(mmsi, error) for state, mmsi, error in results
+                  if state == "error"]
+        for mmsi, error in errors[:3]:
+            self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
         self._save_attempts(cache)
-        self.ok(saved, f"ошибок {errors}")
+        self.ok(saved, f"ошибок {len(errors)}")
 
 
 class MarineLinkTypesFeed(base.ServiceFeed):
@@ -321,45 +325,60 @@ class MarineLinkTypesFeed(base.ServiceFeed):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = None
+        self._local = threading.local()
         self.vessel_source = kwargs.get("vessels") or (lambda: [])
         self.types = {}
 
     def http(self):
         import requests
-        if self.session is None:
+        session = getattr(self._local, "session", None)
+        if session is None:
             session = requests.Session()
             session.headers.update({"User-Agent": base.MAP_HEADERS["User-Agent"]})
-            self.session = session
-        return self.session
+            self._local.session = session
+        return session
 
     def load_types(self):
-        session = self.http()
-        for slug, label in MARINELINK_TYPES:
-            if self.stop_event.is_set():
-                break
+        def read(pair):
+            slug, label = pair
+            if self.blocked_until > time.monotonic():
+                return "blocked", label, None
             try:
-                response = session.get("http://directory.marinelink.com/ships/type-"
-                                       + slug, timeout=30)
+                response = self.http().get(
+                    "http://directory.marinelink.com/ships/type-" + slug, timeout=30)
                 if response.status_code == 429:
                     # справочник просит сбавить темп: не долбим остальные
-                    # 198 страниц подряд, иначе лимит только углубится
+                    # страницы подряд, иначе лимит только углубится
                     minutes = max(1, int(self.rate_limit_for // 60))
                     self.blocked_until = max(self.blocked_until,
                                              time.monotonic() + self.rate_limit_for)
                     self.set_status(f"лимит запросов, ждём {minutes} мин")
                     self.log(f"{self.title}: справочник ограничил частоту запросов "
                              f"(HTTP 429) — пауза {minutes} мин, типы остаются прежние.")
-                    return
+                    return "blocked", label, None
                 response.raise_for_status()
             except Exception as error:
-                self.log(f"{self.title}: тип {label} не прочитан ({net.brief_error(error)})")
-                continue
+                return "error", label, error
+            names = []
             for name in re.findall(r"<h3[^>]*>(.*?)</h3>", response.text or "", re.S):
                 clean = re.sub(r"<[^>]+>", "", name).strip()
                 if clean and clean.lower() != "filters":
-                    self.types.setdefault(clean.upper(), label)
-            time.sleep(0.4)
+                    names.append(clean.upper())
+            return "names", label, names
+
+        for result in self.gather(MARINELINK_TYPES, read,
+                                  workers=4, pace=0.2):
+            if not result:
+                continue
+            state, label, payload = result
+            if state == "blocked":
+                return
+            if state == "error":
+                self.log(f"{self.title}: тип {label} не прочитан "
+                         f"({net.brief_error(payload)})")
+                continue
+            for name in payload or []:
+                self.types.setdefault(name, label)
 
     def poll_once(self):
         self.load_types()
@@ -416,30 +435,26 @@ class ShipNextFeed(base.ServiceFeed):
         import requests
 
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        saved = errors = 0
-        for mmsi in (self.vessel_source() or [])[:self.max_per_cycle]:
-            if self.stop_event.is_set():
-                break
+
+        def read(mmsi):
             try:
                 response = requests.get(SHIPNEXT_URL, params={"search": str(mmsi)},
                                         headers=headers, timeout=25)
             except Exception as error:
-                errors += 1
-                if errors <= 3:
-                    self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
-                continue
+                return "error", mmsi, error
             if response.status_code in (401, 403):
-                raise RuntimeError("ShipNext не принял токен: нужен токен аккаунта "
-                                   "(Authorization: Bearer)")
+                return "fatal", mmsi, RuntimeError(
+                    "ShipNext не принял токен: нужен токен аккаунта "
+                    "(Authorization: Bearer)")
             if response.status_code == 429:
-                raise RuntimeError("ShipNext: слишком много запросов, пауза")
+                return "fatal", mmsi, RuntimeError(
+                    "ShipNext: слишком много запросов, пауза")
             if response.status_code >= 400:
-                errors += 1
-                continue
+                return "error", mmsi, None
             try:
                 data = response.json() or {}
             except ValueError:
-                continue
+                return "empty", mmsi, None
             rows = data.get("data") if isinstance(data, dict) else None
             for row in (rows or [])[:5]:
                 if not isinstance(row, dict):
@@ -453,10 +468,22 @@ class ShipNextFeed(base.ServiceFeed):
                     continue
                 self.emit({"kind": "static", "mmsi": str(mmsi), "name": name,
                            "imo": imo, "at": datetime.now(), "source": "sn"})
-                saved += 1
-                break
-            time.sleep(self.pause)
-        self.ok(saved, f"ошибок {errors}")
+                return "saved", mmsi, None
+            return "empty", mmsi, None
+
+        results = [item for item in self.gather(
+            (self.vessel_source() or [])[:self.max_per_cycle], read,
+            workers=4, pace=0.3) if item]
+        for state, _mmsi, payload in results:
+            if state == "fatal":
+                raise payload
+        saved = sum(1 for state, _mmsi, _error in results if state == "saved")
+        errors = [(mmsi, error) for state, mmsi, error in results
+                  if state == "error"]
+        for mmsi, error in errors[:3]:
+            if error is not None:
+                self.log(f"{self.title}: {mmsi} — {net.brief_error(error)}")
+        self.ok(saved, f"ошибок {len(errors)}")
 
 
 # Регистрация каналов: services_feed уже загружен (его класс ServiceFeed здесь

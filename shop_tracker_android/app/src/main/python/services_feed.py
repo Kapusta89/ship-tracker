@@ -500,6 +500,13 @@ class ServiceFeed(threading.Thread):
 
     key = ""
     interval = 300.0
+    # Сколько запросов к сервису одновременно и какая общая пауза между ними.
+    # Раньше карточки судов читались строго по одной: 60 судов занимали
+    # минуты, и источник отвечал «получено судов 0» почти всё это время.
+    # Теперь запросы идут пучком, а суммарный темп держит `gather`, поэтому
+    # сайт видит примерно ту же частоту запросов, но цикл кончается быстрее.
+    workers = 6
+    pace = 0.25
     # внешний API, а не AIS-поток: не участвует в состоянии «поток на связи»
     service = True
     # проверка Cloudflare: сколько ждать до следующей попытки
@@ -601,6 +608,50 @@ class ServiceFeed(threading.Thread):
             self.set_status("переподключение (сбой сети)")
         else:
             self.set_status(f"ошибка: {text[:60]}")
+
+    def gather(self, items, worker, workers=None, pace=None):
+        """Обходит список в нескольких потоках с общей паузой между запросами.
+
+        Возвращает результаты в порядке исходного списка; ошибка одного
+        элемента не роняет остальные — воркер сам решает, что вернуть.
+        `stop_event` проверяется до запроса, поэтому остановка приложения
+        не ждёт конца пачки.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        items = list(items or [])
+        if not items:
+            return []
+        count = max(1, min(int(workers or self.workers), len(items)))
+        pause = self.pace if pace is None else max(0.0, float(pace))
+        gate = threading.Lock()
+        next_slot = [0.0]
+
+        cancel = getattr(self, "_cancel", None)
+
+        def one(item):
+            if self.stop_event.is_set():
+                return None
+            # источник может закрыться на первой же странице (Cloudflare):
+            # тогда оставшиеся задачи не ждут своей очереди зря
+            if cancel is not None and cancel.is_set():
+                return None
+            if pause:
+                # слоты выдаются по очереди: запросы уходят не чаще, чем
+                # раз в `pause` секунд на весь источник, а не на каждый поток
+                with gate:
+                    moment = time.monotonic()
+                    slot = max(moment, next_slot[0])
+                    next_slot[0] = slot + pause
+                delay = slot - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            return worker(item)
+
+        with ThreadPoolExecutor(
+                max_workers=count,
+                thread_name_prefix=f"{self.key or 'service'}-") as pool:
+            return list(pool.map(one, items))
 
     def ok(self, count, detail=""):
         self.last_error = ""
@@ -1557,44 +1608,53 @@ class GoradarFeed(ServiceFeed):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = None
+        self._local = threading.local()
         if kwargs.get("minutes"):
             self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
 
     def http(self):
         import requests
-        if self.session is None:
+        session = getattr(self._local, "session", None)
+        if session is None:
             session = requests.Session()
             session.headers.update(dict(MAP_HEADERS, Referer=GORADAR_HOME))
             try:
                 session.get(GORADAR_HOME, timeout=30)
             except Exception as error:
                 self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
-            self.session = session
-        return self.session
+            self._local.session = session
+        return session
 
     def poll_once(self):
-        session = self.http()
         cells = _grid_boxes(self.bboxes)
         if not cells:
             raise RuntimeError("не задан район наблюдения")
-        seen = {}
-        errors = 0
-        for cell in cells:
-            if self.stop_event.is_set():
-                break
+
+        # клетки читаются параллельно: каждая — отдельный POST, и на нитке
+        # своей сессии, потому что requests.Session не потокобезопасна
+        def read(cell):
             lat1, lon1, lat2, lon2 = cell
             try:
-                response = session.post(GORADAR_URL,
-                                        data={"lat1": lat1, "lat2": lat2,
-                                              "lng1": lon1, "lng2": lon2},
-                                        timeout=45)
+                response = self.http().post(GORADAR_URL,
+                                            data={"lat1": lat1, "lat2": lat2,
+                                                  "lng1": lon1, "lng2": lon2},
+                                            timeout=45)
                 response.raise_for_status()
                 rows = response.json()
             except Exception:
+                return "error", None
+            return "rows", rows if isinstance(rows, list) else []
+
+        seen = {}
+        errors = 0
+        for result in self.gather(cells, read, workers=4, pace=0.2):
+            if not result:
+                continue
+            state, rows = result
+            if state == "error":
                 errors += 1
                 continue
-            for row in rows if isinstance(rows, list) else []:
+            for row in rows or []:
                 try:
                     mmsi = _mmsi(row[0])
                     lat, lon = _number(row[2]), _number(row[3])
@@ -1617,7 +1677,6 @@ class GoradarFeed(ServiceFeed):
                 seen[mmsi] = _position(mmsi, lat, lon, sog=speed, cog=course,
                                        heading=heading, source="goradar",
                                        at=when, type_label=label)
-            self.stop_event.wait(0.4)
         for event in seen.values():
             self.emit(event)
         detail = f"клеток {len(cells)}" + (f", ошибок {errors}" if errors else "")
@@ -1728,22 +1787,23 @@ class MarineTrafficLiveFeed(ServiceFeed):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = None
+        self._local = threading.local()
         self.ports = [port for port in (kwargs.get("ports") or []) if isinstance(port, dict)]
         if kwargs.get("minutes"):
             self.interval = max(120.0, float(kwargs["minutes"]) * 60.0)
 
     def http(self):
         import requests
-        if self.session is None:
+        session = getattr(self._local, "session", None)
+        if session is None:
             session = requests.Session()
             session.headers.update(dict(MAP_HEADERS, Referer=MARINETRAFFIC_LIVE_HOME))
             try:
                 session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
             except Exception as error:
                 self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
-            self.session = session
-        return self.session
+            self._local.session = session
+        return session
 
     def centers(self):
         """Точки опроса: наши порты, а если их нет — центры клеток района."""
@@ -1770,36 +1830,47 @@ class MarineTrafficLiveFeed(ServiceFeed):
         return unique
 
     def poll_once(self):
-        session = self.http()
         centers = self.centers()
         if not centers:
             raise RuntimeError("не задан район наблюдения")
         radius = self.radius_km if self.ports else max(self.radius_km, 220)
+
+        # точки опроса читаются параллельно: раньше каждая ждала 0.4 с
+        # после ответа, и карта собиралась в два раза дольше
+        def read(center):
+            lat, lon = center
+            params = {"lat": lat, "lon": lon, "radius": radius, "limit": self.limit}
+            try:
+                response = self.http().get(MARINETRAFFIC_LIVE_URL,
+                                           params=params, timeout=45)
+            except Exception:
+                return "error", None
+            if response.status_code >= 400:
+                if cloudflare_block(response):
+                    # сайт закрыт целиком: остальные точки смысла не имеют
+                    return "blocked", None
+                return "error", None
+            try:
+                return "rows", ((response.json() or {}).get("data") or {})
+            except ValueError:
+                return "error", None
+
         seen = {}
         errors = 0
         blocked = False
-        for lat, lon in centers:
-            if self.stop_event.is_set() or blocked:
-                break
-            params = {"lat": lat, "lon": lon, "radius": radius, "limit": self.limit}
-            try:
-                response = session.get(MARINETRAFFIC_LIVE_URL, params=params, timeout=45)
-            except Exception:
+        for result in self.gather(centers, read, workers=4, pace=0.2):
+            if not result:
+                continue
+            state, data = result
+            if state == "blocked":
+                blocked = True
+                continue
+            if state == "error":
                 errors += 1
                 continue
-            if response.status_code >= 400:
-                if cloudflare_block(response):
-                    # сайт закрыт целиком: остальные точки опроса смысла не имеют
-                    blocked = True
-                    continue
-                errors += 1
+            if blocked:
                 continue
-            try:
-                data = ((response.json() or {}).get("data") or {})
-            except ValueError:
-                errors += 1
-                continue
-            for row in data.get("vessels") or []:
+            for row in (data or {}).get("vessels") or []:
                 mmsi = _mmsi(row.get("mmsi"))
                 if not mmsi:
                     continue
@@ -1814,7 +1885,6 @@ class MarineTrafficLiveFeed(ServiceFeed):
                                   source="mlive", at=_time(row.get("updated"), utc=True))
                 if event:
                     seen[mmsi] = event
-            self.stop_event.wait(0.4)
         for event in seen.values():
             self.emit(event)
         if blocked and not seen:
@@ -1958,7 +2028,7 @@ class ShipRadarDetailsFeed(ServiceFeed):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = None
+        self._local = threading.local()
         self.vessel_source = kwargs.get("vessels") or (lambda: [])
         self.state_path = SHIPRADAR_STATE
         self.attempts = self._load_attempts()
@@ -1995,7 +2065,10 @@ class ShipRadarDetailsFeed(ServiceFeed):
 
     def http(self):
         import requests
-        if self.session is None:
+        # своя сессия на каждый поток: карточки читаются параллельно, а общая
+        # сессия при одновременных запросах теряет cookies и получает 403
+        session = getattr(self._local, "session", None)
+        if session is None:
             session = requests.Session()
             session.headers.update({"User-Agent": MAP_HEADERS["User-Agent"],
                                     "Accept-Language": "ru,en;q=0.8",
@@ -2006,8 +2079,8 @@ class ShipRadarDetailsFeed(ServiceFeed):
                 session.get(MARINETRAFFIC_LIVE_HOME, timeout=30)
             except Exception as error:
                 self.log(f"{self.title}: главная страница не открылась ({net.brief_error(error)})")
-            self.session = session
-        return self.session
+            self._local.session = session
+        return session
 
     def candidates(self) -> list:
         try:
@@ -2107,47 +2180,65 @@ class ShipRadarDetailsFeed(ServiceFeed):
         return card
 
     def poll_once(self):
-        session = self.http()
         targets = self.candidates()
         if not targets:
             self.ok(0, "все карточки уже прочитаны")
             return
-        filled = 0
-        errors = 0
-        for mmsi, name in targets:
-            if self.stop_event.is_set():
-                break
+
+        # карточки читаются пачкой: каждая — отдельная страница сайта,
+        # и 120 карточек по одной с паузой занимали три минуты
+        closed = threading.Event()
+        self._cancel = closed
+
+        def read(target):
+            mmsi, name = target
+            if closed.is_set():
+                return None
             try:
-                response = session.get(self.url_for(mmsi, name), timeout=30)
+                response = self.http().get(self.url_for(mmsi, name), timeout=30)
             except Exception as error:
-                errors += 1
-                if errors == 1:
-                    self.log(f"{self.title}: карточка не открылась "
-                             f"({error.__class__.__name__}: {self.url_for(mmsi, name)})")
                 self.attempts[mmsi] = {"at": time.time(), "ok": False}
-                self.stop_event.wait(self.pause)
-                continue
+                return "error", mmsi, error
             if cloudflare_block(response):
-                # весь сайт закрыт проверкой: нет смысла читать оставшиеся карточки
-                self._save_attempts()
-                self.blocked("карточки судов больше не отдаются без проверки браузера")
-                return
+                # весь сайт закрыт проверкой: остальные карточки не читаем
+                closed.set()
+                return "blocked", mmsi, None
             try:
                 response.raise_for_status()
                 card = parse_vessel_card(response.text)
             except Exception as error:
-                errors += 1
-                if errors == 1:
-                    self.log(f"{self.title}: карточка не открылась "
-                             f"({error.__class__.__name__}: {self.url_for(mmsi, name)})")
                 self.attempts[mmsi] = {"at": time.time(), "ok": False}
-                self.stop_event.wait(self.pause)
-                continue
+                return "error", mmsi, error
             self.attempts[mmsi] = {"at": time.time(), "ok": True}
+            return "card", mmsi, (card, name)
+
+        filled = 0
+        errors = 0
+        first_error = None
+        blocked = False
+        for result in self.gather(targets, read, workers=6, pace=0.2):
+            if not result:
+                continue
+            state, mmsi, payload = result
+            if not state:
+                continue
+            if state == "blocked":
+                blocked = True
+                continue
+            if state == "error":
+                errors += 1
+                if first_error is None:
+                    first_error = payload
+                    self.log(f"{self.title}: карточка {mmsi} не открылась "
+                             f"({net.brief_error(payload)})")
+                continue
+            card, name = payload
             if self._store_card(mmsi, name, card):
                 filled += 1
-            self.stop_event.wait(self.pause)
         self._save_attempts()
+        if blocked:
+            self.blocked("карточки судов больше не отдаются без проверки браузера")
+            return
         detail = f"запросов {len(targets)}" + (f", ошибок {errors}" if errors else "")
         self.ok(filled, detail)
 
