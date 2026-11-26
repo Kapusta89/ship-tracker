@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.80"
+APP_VERSION = "2026.12.81"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -58,6 +58,7 @@ import net
 import photos
 import portcalls
 import services_feed
+import watch
 from core import (AppError, CONFIG_PATH, DATA_DIR, DB_PATH, RadarCore,
                   duration_text, fmt_moment, fmt_number, fmt_tons, load_config, span_text,
                   norm, parse_chat_ids, port_matches, save_config, send_telegram, split_list,
@@ -72,6 +73,9 @@ AIRSTREAM_SITE = "https://aisstream.io"
 
 # Кэш фото судов: скачивается один раз и остаётся на диске.
 PHOTO_DIR = DATA_DIR / "photos"
+
+# Подпись «любой порт» в сторожевом правиле: следить за ближайшим из наших.
+WATCH_ANY_PORT = "любой порт"
 
 # Поля с ключами API тех сервисов, которым они нужны.
 SERVICE_KEY_FIELDS = {"vf": "var_vf_key", "vfa": "var_vf_key",
@@ -1199,9 +1203,11 @@ class App:
         ttk.Label(detail_bar, textvariable=self.card_note_var,
                   foreground="#555", wraplength=300).pack(side="left", padx=8)
 
+        self.build_watch(panel)
+
         detail_box = ttk.Frame(panel)
         detail_box.pack(fill="both", expand=True, padx=(8, 0), pady=0)
-        self.detail_text = tk.Text(detail_box, width=36, height=20, wrap="word",
+        self.detail_text = tk.Text(detail_box, width=36, height=16, wrap="word",
                                    state="disabled", font=("Consolas", 9),
                                    background="#f7f9fa")
         self.detail_scroll = ttk.Scrollbar(detail_box, orient="vertical",
@@ -1213,6 +1219,161 @@ class App:
         # сохраняется, иначе окно прыгало бы наверх каждый раз.
         self._detail_cache = None
         self.detail_text.bind("<MouseWheel>", self.scroll_detail)
+
+    def build_watch(self, panel):
+        """Сторож за выбранным судном — прямо в карточке.
+
+        Правила (войти в N км от порта, сменить Destination, пропасть из AIS)
+        хранятся по MMSI и работают мимо общего фильтра алертов: стеречь можно
+        любое судно, а не только танкер из наших портов.
+        """
+        ttk = self.ttk
+        box = ttk.LabelFrame(panel, text="Сторож за судном")
+        box.pack(fill="x", padx=(8, 0), pady=(4, 4))
+        self.watch_box = box
+
+        row = ttk.Frame(box)
+        row.pack(fill="x", padx=6, pady=(4, 0))
+        self.watch_enter_on = self.tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="войти в", variable=self.watch_enter_on).pack(side="left")
+        self.watch_enter_km = self.tk.StringVar(value=f"{watch.DEFAULT_ENTER_KM:g}")
+        ttk.Entry(row, textvariable=self.watch_enter_km, width=5).pack(side="left", padx=2)
+        ttk.Label(row, text="км от").pack(side="left")
+        self.watch_port = self.tk.StringVar(value=WATCH_ANY_PORT)
+        labels = [WATCH_ANY_PORT] + [str(port.get("label") or port.get("name") or "")
+                                     for port in self.config.get("ports") or []
+                                     if port.get("name")]
+        ttk.Combobox(row, textvariable=self.watch_port, values=labels, width=11,
+                     state="readonly").pack(side="left", padx=(3, 0))
+
+        row2 = ttk.Frame(box)
+        row2.pack(fill="x", padx=6, pady=(3, 0))
+        self.watch_dest_on = self.tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="сообщить о смене Destination",
+                        variable=self.watch_dest_on).pack(side="left")
+
+        row3 = ttk.Frame(box)
+        row3.pack(fill="x", padx=6, pady=(3, 0))
+        self.watch_silent_on = self.tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text="пропасть из AIS на",
+                        variable=self.watch_silent_on).pack(side="left")
+        self.watch_silent_hours = self.tk.StringVar(value=f"{watch.DEFAULT_SILENT_HOURS:g}")
+        ttk.Entry(row3, textvariable=self.watch_silent_hours, width=5).pack(side="left", padx=2)
+        ttk.Label(row3, text="ч").pack(side="left")
+
+        row4 = ttk.Frame(box)
+        row4.pack(fill="x", padx=6, pady=(5, 5))
+        ttk.Button(row4, text="Сохранить", command=self.apply_watch_rule).pack(side="left")
+        ttk.Button(row4, text="Убрать", command=self.remove_watch_rule).pack(side="left", padx=4)
+        self.watch_note = self.tk.StringVar(value="судно не выбрано")
+        ttk.Label(box, textvariable=self.watch_note, foreground="#555",
+                  wraplength=290, justify="left").pack(fill="x", padx=6, pady=(0, 5))
+
+    def load_watch_rule(self, mmsi):
+        """Показывает в панели правило выбранного судна."""
+        if not hasattr(self, "watch_note"):
+            return
+        mmsi = str(mmsi or "")
+        rule = next((item for item in self.config.get("watch_rules") or []
+                     if str(item.get("mmsi")) == mmsi), None)
+        if not mmsi:
+            self.watch_note.set("судно не выбрано")
+            return
+        if not rule:
+            self.watch_enter_on.set(False)
+            self.watch_dest_on.set(False)
+            self.watch_silent_on.set(False)
+            self.watch_enter_km.set(f"{watch.DEFAULT_ENTER_KM:g}")
+            self.watch_silent_hours.set(f"{watch.DEFAULT_SILENT_HOURS:g}")
+            self.watch_port.set(WATCH_ANY_PORT)
+            self.watch_note.set("правила нет — включите, что нужно сообщить")
+            return
+        self.watch_enter_on.set(bool(rule.get("enter_km")))
+        self.watch_enter_km.set(f"{(rule.get('enter_km') or watch.DEFAULT_ENTER_KM):g}")
+        self.watch_dest_on.set(bool(rule.get("destination")))
+        self.watch_silent_on.set(bool(rule.get("silent_hours")))
+        self.watch_silent_hours.set(f"{(rule.get('silent_hours') or watch.DEFAULT_SILENT_HOURS):g}")
+        port = str(rule.get("port") or "").upper()
+        label = WATCH_ANY_PORT
+        for item in self.config.get("ports") or []:
+            if str(item.get("name") or "").upper() == port:
+                label = str(item.get("label") or item.get("name") or "")
+                break
+        self.watch_port.set(label)
+        self.watch_note.set("Слежу: " + watch.rule_text(watch.clean_rule(rule, self.config.get("ports"))))
+
+    def _watch_port_name(self) -> str:
+        """Название порта по подписи в выпадающем списке."""
+        chosen = str(self.watch_port.get() or "").strip()
+        if not chosen or chosen == WATCH_ANY_PORT:
+            return ""
+        for port in self.config.get("ports") or []:
+            if str(port.get("label") or port.get("name") or "") == chosen:
+                return str(port.get("name") or "").upper()
+        return ""
+
+    def apply_watch_rule(self):
+        """Сохраняет правило сторожа для выбранного судна."""
+        mmsi = str(self.selected or "").strip()
+        if not mmsi.isdigit():
+            self.watch_note.set("сначала выберите судно на карте или в списке")
+            return
+        try:
+            enter_km = float(str(self.watch_enter_km.get()).replace(",", ".") or 0)
+            silent_hours = float(str(self.watch_silent_hours.get()).replace(",", ".") or 0)
+        except ValueError:
+            self.watch_note.set("километры и часы — числа: например 50 и 6")
+            return
+        rule = watch.clean_rule({
+            "mmsi": mmsi,
+            "name": (self.store.vessel(mmsi) or {}).get("name") or "",
+            "port": self._watch_port_name(),
+            "enter_km": enter_km if self.watch_enter_on.get() else 0,
+            "destination": bool(self.watch_dest_on.get()),
+            "silent_hours": silent_hours if self.watch_silent_on.get() else 0,
+        }, self.config.get("ports"))
+        if not rule:
+            self.watch_note.set("нечего сообщать: включите хотя бы одно условие")
+            return
+        rules = [item for item in self.config.get("watch_rules") or []
+                 if str(item.get("mmsi")) != mmsi]
+        rules.append(rule)
+        self.config["watch_rules"] = rules
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as error:
+            self.watch_note.set("не удалось записать настройки: " + net.brief_error(error))
+            return
+        try:
+            self.core.set_watch_rules(rules)
+        except Exception as error:
+            self.log(f"Сторож: правило не применилось — {net.brief_error(error)}")
+        self.load_watch_rule(mmsi)
+        self.log(f"Сторож {rule.get('name') or mmsi}: {watch.rule_text(rule)}.")
+
+    def remove_watch_rule(self):
+        """Убирает правило сторожа у выбранного судна."""
+        mmsi = str(self.selected or "").strip()
+        if not mmsi:
+            self.watch_note.set("судно не выбрано")
+            return
+        rules = [item for item in self.config.get("watch_rules") or []
+                 if str(item.get("mmsi")) != mmsi]
+        if len(rules) == len(self.config.get("watch_rules") or []):
+            self.watch_note.set("у этого судна правила нет")
+            return
+        self.config["watch_rules"] = rules
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as error:
+            self.watch_note.set("не удалось записать настройки: " + net.brief_error(error))
+            return
+        try:
+            self.core.set_watch_rules(rules)
+        except Exception as error:
+            self.log(f"Сторож: правило не снялось — {net.brief_error(error)}")
+        self.load_watch_rule(mmsi)
+        self.log(f"Сторож: правило для {mmsi} убрано.")
 
     def build_sea(self):
         """Вкладка «В море»: суда с позицией вне портов и без статики AIS."""
@@ -3254,6 +3415,7 @@ class App:
     def select_vessel(self, mmsi):
         self.selected = mmsi
         self.radar.selected = mmsi
+        self.load_watch_rule(mmsi)
         vessel = self.store.vessel(mmsi) or {}
         try:
             self.radar.focus_on(vessel.get("lat"), vessel.get("lon"))

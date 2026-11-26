@@ -7,6 +7,7 @@
   "mmsi_watch_connections": 3,
   "ais_connection_limit": 3,
   "pinned_mmsis": [],
+  "watch_rules": [],
   "mmsi_refresh_minutes": 10,
   "snapshot_minutes": 1,
   "snapshot_max_age_hours": 6,

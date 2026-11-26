@@ -37,6 +37,7 @@ import geo
 import metrics
 import portcalls
 import services_feed
+import watch
 from store import Store, parse_iso
 
 # Повторы запросов при обрывах DNS/TLS — общий сетевой слой.
@@ -295,6 +296,11 @@ DEFAULT_CONFIG = {
     "trip_window_hours": 96,
     "min_speed_knots": 2.0,
     "alert_cooldown_hours": 6,
+    # Сторож за отдельными судами: список правил вида
+    # {"mmsi": "…", "enter_km": 50, "port": "IZMAIL",
+    #  "destination": true, "silent_hours": 6}. Работает независимо от
+    # общего фильтра `filter_origins`/`filter_destinations`.
+    "watch_rules": [],
     "stale_minutes": 15,
     # Судно, у которого позиция старше этого срока, не показываем ни на радаре,
     # ни во вкладках: это уже не обстановка, а мусор в списке.
@@ -868,6 +874,10 @@ class RadarCore:
         # правила связи с портами — иначе судно, у которого в AIS чужой порт,
         # пропадает с радара и из списков, хотя его специально отслеживают
         self.pinned_mmsis = self._load_pinned(config)
+        # сторож за конкретными судами: правила их не отсекают ни на радаре,
+        # ни в базах, а сообщения идут мимо общего фильтра алертов
+        self.watch_rules = watch.load_rules(config)
+        self.watch_state = watch.load_state()
         self._source_conflict = {}
         self._feed_lock = None
         self.feed_elsewhere = False
@@ -927,6 +937,9 @@ class RadarCore:
         self.events = queue.Queue(maxsize=20000)
         self.stats["started_at"] = datetime.now()
         self._start_alert_worker()
+        # сторож за отдельными судами проверяет потерю связи по таймеру:
+        # сообщений AIS от пропавшего судна нет, значит и события нет
+        self._start_watch_worker()
         self._start_consumer()
         self._start_feed()
         self._start_startup_refresh()
@@ -1462,6 +1475,32 @@ class RadarCore:
                                             name="alerts-send")
         self.alert_worker.start()
 
+    def _start_watch_worker(self):
+        """Поднимает проверку правил сторожа по таймеру."""
+        thread = getattr(self, "_watch_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._watch_thread = threading.Thread(target=self._watch_worker, daemon=True,
+                                              name="watch-rules")
+        self._watch_thread.start()
+
+    def _watch_worker(self):
+        """Сторож по таймеру: у молчащего судна событий AIS больше нет.
+
+        «Вход в радиус» и «смена Destination» проверяются на каждом
+        сообщении (см. `_watch_vessel`), а потерю связи по сообщению не
+        узнать — поэтому раз в пять минут обходим правила с `silent_hours`.
+        """
+        if self.stop_event.wait(120):
+            return
+        while not self.stop_event.is_set():
+            try:
+                self._check_watch_silence()
+            except Exception as error:
+                self.log(f"Сторож: проверка связи не удалась ({net.brief_error(error)})")
+            if self.stop_event.wait(300):
+                break
+
     def _alert_worker(self):
         """Шлёт алерты в Telegram в своём потоке, чтобы не задерживать AIS."""
         while not self.stop_event.is_set() or not self._alert_queue.empty():
@@ -1591,6 +1630,22 @@ class RadarCore:
             raw = raw.replace(";", ",").split(",")
         return {str(item).strip() for item in raw if str(item).strip()}
 
+    def watch_mmsis(self) -> set:
+        """MMSI судов, за которыми следят правила сторожа."""
+        return watch.rules_mmsis(getattr(self, "watch_rules", ()))
+
+    def set_watch_rules(self, rules):
+        """Заменяет правила сторожа из окна — без перезапуска сбора.
+
+        Конфиг обновляет само окно (оно же его и сохраняет), а здесь
+        обновляются правила в памяти и состояние: новое судно сразу
+        считается «своим», а не только после перезапуска.
+        """
+        self.config["watch_rules"] = list(rules or [])
+        self.watch_rules = watch.load_rules(self.config)
+        self.watch_state = watch.load_state()
+        return self.watch_rules
+
     def _vessel_related(self, mmsi, lat=None, lon=None, vessel=None, destination=None,
                         area=False) -> bool:
         """Относится ли судно к нашим портам: стоит/проходит рядом, был в порту
@@ -1601,8 +1656,11 @@ class RadarCore:
         тоже записывается в базу и попадает во вкладку «Все суда».
         """
         mmsi = str(mmsi)
-        # список «видеть всегда» перебивает любые правила отбора
+        # список «видеть всегда» и сторож перебивают любые правила отбора:
+        # судно, за которым следят, не должно пропадать из базы
         if mmsi and mmsi in getattr(self, "pinned_mmsis", ()):
+            return True
+        if mmsi and mmsi in self.watch_mmsis():
             return True
         ports = self.config.get("ports") or []
         if ports and lat is not None and lon is not None:
@@ -2610,6 +2668,8 @@ class RadarCore:
             focus.extend(self.pinned_mmsis or [])
         except Exception:
             pass
+        # суда из правил сторожа обновляются так же, как закреплённые
+        focus.extend(sorted(self.watch_mmsis()))
         try:
             vessels = self.related_vessels(400)
         except Exception:
@@ -3491,6 +3551,12 @@ class RadarCore:
             new_dest = str(after.get("destination") or "").strip()
             if old_dest and new_dest and old_dest.upper() != new_dest.upper():
                 self.log(f"Назначение {after.get('name') or mmsi}: {old_dest} → {new_dest}.")
+        if event.get("destination"):
+            # сторож смотрит на то, что пришло в AIS, а не на слитое поле в
+            # базе: там может остаться более раннее значение из другого канала
+            self._watch_vessel(mmsi, None, None,
+                               valid_static_field("destination",
+                                                  event.get("destination")))
         if after and (before is None or before.get("name") != after.get("name")):
             self.log(f"Новое судно: {after.get('name') or mmsi} "
                      f"({after.get('type_label') or 'тип неизвестен'}), "
@@ -3599,6 +3665,7 @@ class RadarCore:
             self.stats["positions"] += 1
 
         self._track_geofence(mmsi, port_name, lat, lon, event.get("at"))
+        self._watch_vessel(mmsi, lat, lon, event.get("destination"))
         self._maybe_alert(mmsi)
 
     def _record_sea_traffic(self, mmsi, event, lat, lon, vessel=None):
@@ -4868,6 +4935,83 @@ class RadarCore:
     def _telegram_ready(self) -> bool:
         return bool((self.config.get("telegram_token") or "").strip()
                     and parse_chat_ids(self.config.get("telegram_chat_id")))
+
+    # ---------------------------------------------------------- сторож
+    def _watch_vessel(self, mmsi, lat=None, lon=None, destination=None):
+        """Проверяет правила сторожа по очередному сообщению судна.
+
+        Вызывается из разбора позиции и статики. Правила не зависят от
+        общего фильтра алертов: сторожат любое судно, даже не танкер и не
+        следующее из наших портов.
+        """
+        rule = watch.rule_for(getattr(self, "watch_rules", ()), mmsi)
+        if not rule:
+            return
+        vessel = self.store.vessel(mmsi) or {}
+        if lat is not None and lon is not None:
+            vessel["lat"], vessel["lon"] = lat, lon
+        if destination is not None:
+            vessel["destination"] = destination
+        try:
+            alerts = watch.check_position(rule, vessel, self.config.get("ports") or [],
+                                          self.watch_state)
+        except Exception as error:
+            self.log(f"Сторож {mmsi}: {net.brief_error(error)}")
+            return
+        if not alerts:
+            return
+        for kind, message in alerts:
+            self._watch_notify(rule, kind, message)
+        try:
+            watch.save_state(self.watch_state)
+        except Exception:
+            pass
+
+    def _check_watch_silence(self) -> int:
+        """Проверяет «пропасть дольше N часов» по всем правилам."""
+        rules = [rule for rule in getattr(self, "watch_rules", ())
+                 if (rule.get("silent_hours") or 0) > 0]
+        if not rules:
+            return 0
+        sent = 0
+        for rule in rules:
+            vessel = self.store.vessel(rule["mmsi"])
+            if not vessel:
+                continue
+            for kind, message in watch.check_silence(rule, vessel, self.watch_state):
+                self._watch_notify(rule, kind, message)
+                sent += 1
+        if sent:
+            try:
+                watch.save_state(self.watch_state)
+            except Exception:
+                pass
+        return sent
+
+    def _watch_notify(self, rule, kind, message):
+        """Сообщение сторожа: в Telegram и журнал, мимо общего фильтра."""
+        mmsi = str(rule.get("mmsi") or "")
+        vessel = self.store.vessel(mmsi) or {}
+        name = vessel.get("name") or rule.get("name") or mmsi
+        short = watch.KINDS.get(kind, kind)
+        key = f"watch|{mmsi}|{kind}"
+        target = {"key": key, "mmsi": mmsi, "name": name,
+                  "origin": "сторож", "destination": short}
+        text = f"🔔 {name} (MMSI {mmsi}): {message}."
+        if not self.alerts_enabled:
+            self.store.log_alert(key, mmsi, name, "сторож", short, False,
+                                 "алерты выключены (/mute)", text)
+            self.log(f"Сторож: {name} — {message} (алерты выключены).")
+            return
+        if not self._telegram_ready():
+            self.store.log_alert(key, mmsi, name, "сторож", short, False,
+                                 "только в окне: Telegram не настроен", text)
+            self.log(f"Сторож: {name} — {message} (Telegram не настроен — сообщение в окне).")
+            self.on_alert({**target, "ok": False,
+                           "error": "только в окне: Telegram не настроен", "text": text})
+            return
+        # отправка — в потоке алертов: приём AIS не ждёт ответа Telegram
+        self._alert_queue.put((target, text))
 
     def _maybe_alert(self, mmsi):
         if not self.alerts_enabled:

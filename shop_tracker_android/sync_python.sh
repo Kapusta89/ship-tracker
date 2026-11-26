@@ -10,7 +10,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 PY="$HERE/app/src/main/python"
 
 MODULES=(core store ais_feed services_feed services_optima forecast metrics \
-         portcalls analysis geo places net flags cargo)
+         portcalls analysis geo places net flags cargo watch)
 
 for name in "${MODULES[@]}"; do
   cp "$ROOT/ship_tracker/$name.py" "$PY/$name.py"
