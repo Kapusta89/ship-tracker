@@ -1329,7 +1329,10 @@ class RadarCore:
             except (TypeError, ValueError):
                 return False
 
+        # закреплённые и суда под сторожем следим в любой точке мира: без
+        # отдельной подписки по MMSI их сообщения за пределами района пропадают
         pinned = set(str(item) for item in (getattr(self, "pinned_mmsis", ()) or ()))
+        pinned.update(self.watched_mmsis())
 
         def rank(row):
             # Закреплённое судно следим всегда: оно может уйти за пределы
@@ -1630,7 +1633,7 @@ class RadarCore:
             raw = raw.replace(";", ",").split(",")
         return {str(item).strip() for item in raw if str(item).strip()}
 
-    def watch_mmsis(self) -> set:
+    def watched_mmsis(self) -> set:
         """MMSI судов, за которыми следят правила сторожа."""
         return watch.rules_mmsis(getattr(self, "watch_rules", ()))
 
@@ -1660,7 +1663,7 @@ class RadarCore:
         # судно, за которым следят, не должно пропадать из базы
         if mmsi and mmsi in getattr(self, "pinned_mmsis", ()):
             return True
-        if mmsi and mmsi in self.watch_mmsis():
+        if mmsi and mmsi in self.watched_mmsis():
             return True
         ports = self.config.get("ports") or []
         if ports and lat is not None and lon is not None:
@@ -2669,7 +2672,7 @@ class RadarCore:
         except Exception:
             pass
         # суда из правил сторожа обновляются так же, как закреплённые
-        focus.extend(sorted(self.watch_mmsis()))
+        focus.extend(sorted(self.watched_mmsis()))
         try:
             vessels = self.related_vessels(400)
         except Exception:
