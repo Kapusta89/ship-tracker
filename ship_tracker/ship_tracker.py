@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.82"
+APP_VERSION = "2026.12.83"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2746,7 +2746,7 @@ class App:
         self.feed_status["mmsi"] = tk.StringVar(value="ждёт запуска")
         ttk.Label(links, textvariable=self.feed_status["mmsi"], foreground="#555"
                   ).grid(row=8, column=1, columnspan=2, sticky="w", pady=(8, 2))
-        ttk.Label(links, text="отдельные сокеты по 190 судов: наши порты, закреплённые "
+        ttk.Label(links, text="отдельные сокеты по 50 судов: наши порты, закреплённые "
                               "и ближний трафик",
                   foreground="#777").grid(row=9, column=0, columnspan=3, sticky="w",
                                           padx=30, pady=(0, 4))
@@ -4450,7 +4450,17 @@ class App:
                     var.set(text)
                 continue
             state = states.get(key)
-            if not running:
+            mmsi_live = sum(1 for row in mmsi_states if row.get("connected"))
+            mmsi_events = sum(int(row.get("events") or 0) for row in mmsi_states)
+            if (key == "ais" and mmsi_states and running
+                    and not self.config.get("use_area_feed", True)):
+                # Районного потока нет, но ключ работает: три соединения заняты
+                # слежением по MMSI. Без этой строки строка AISStream читается
+                # как «AISStream отключён», хотя он подключён.
+                text = (f"районный поток выключен · слежение по MMSI: "
+                        f"{mmsi_live} из {len(mmsi_states)} на связи, "
+                        f"сообщений {mmsi_events}")
+            elif not running:
                 text = "принимает другой процесс (общая база)" if elsewhere else "не запущен"
             elif not state:
                 text = "отключён в настройках"
@@ -4460,11 +4470,9 @@ class App:
                 text = f"переподключение: {self.short_error(state.get('error'))}".strip()
             else:
                 text = "переподключение"
-            if key == "ais" and mmsi_states:
-                live = sum(1 for row in mmsi_states if row.get("connected"))
-                total_events = sum(int(row.get("events") or 0) for row in mmsi_states)
-                text += (f" · MMSI-слежение: {live} из {len(mmsi_states)} на связи, "
-                         f"сообщений {total_events}")
+            if key == "ais" and mmsi_states and "слежение по MMSI" not in text:
+                text += (f" · MMSI-слежение: {mmsi_live} из {len(mmsi_states)} на связи, "
+                         f"сообщений {mmsi_events}")
             if var.get() != text:
                 var.set(text)
 
