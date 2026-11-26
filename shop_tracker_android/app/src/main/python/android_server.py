@@ -9,6 +9,7 @@
 import json
 import net
 import threading
+from datetime import datetime, timedelta
 from http.server import ThreadingHTTPServer
 from urllib.parse import parse_qs
 
@@ -17,7 +18,7 @@ import mobile_server
 import portcalls
 import setup_page
 
-VERSION = "3.5.7"
+VERSION = "3.5.8"
 
 
 class Server(ThreadingHTTPServer):
@@ -107,6 +108,8 @@ def services_payload() -> dict:
 def expected_payload() -> dict:
     cache = portcalls.load_cache()
     rows = portcalls.expected_rows(cache)
+    judged = _judge_expected(rows)
+    rows = judged["rows"]
     for row in rows:
         row["stale"] = portcalls.expected_is_stale(row)
     rows.sort(key=lambda row: (row.get("stale"), row.get("port") or ""))
@@ -116,11 +119,43 @@ def expected_payload() -> dict:
         "stale": bool(cache.get("stale")),
         "stale_reason": cache.get("stale_reason") or "",
         "loading": _expected_loading,
+        "hidden": len(judged.get("hidden") or []),
+        "added": judged.get("added") or 0,
         "note": ("Кто указал наш порт пунктом назначения — таблица портовых страниц "
-                 "AIS-catcher (открытая сеть приёмников, без ключа). Страницы есть "
-                 "только у части портов, ETA передаёт сам капитан и обновляет его "
-                 "не всегда; серые строки — старый сигнал или прошедший ETA."),
+                 "AIS-catcher (открытая сеть приёмников, без ключа). Назначение "
+                 "проверяется по последней позиции AIS: ушедшие в другую сторону "
+                 "скрываются, а идущие к нам по курсу без назначения добавляются. "
+                 "Страницы есть только у части портов, ETA передаёт сам капитан "
+                 "и обновляет его не всегда; серые строки — старый сигнал."),
     }
+
+
+def _judge_expected(rows) -> dict:
+    """Проверка «Ожидаемых» по живым данным AIS на телефоне.
+
+    Та же проверка, что в настольной версии (`portcalls.judge_expected`):
+    заявленное назначение сверяется с позицией и треком судна из базы.
+    """
+    empty = {"rows": rows, "hidden": [], "added": 0, "checked": 0}
+    core = getattr(android_main, "_core", None)
+    if core is None:
+        return empty
+    try:
+        config = android_main.load_config()
+        store = core.store
+        vessels = {str(v.get("mmsi")): v for v in store.vessels(3000)}
+        if not vessels:
+            return empty
+        now = datetime.now()
+        since = (now - timedelta(hours=72)).isoformat(timespec="seconds")
+        now_text = now.isoformat(timespec="seconds")
+        return portcalls.judge_expected(
+            rows, config.get("ports") or [], vessels,
+            track=lambda mmsi: store.positions_between(mmsi, since, now_text),
+            now=now)
+    except Exception as error:
+        android_main.log_line(f"Ожидаемые: проверка по AIS не удалась — {net.brief_error(error)}")
+        return empty
 
 
 def refresh_expected() -> bool:

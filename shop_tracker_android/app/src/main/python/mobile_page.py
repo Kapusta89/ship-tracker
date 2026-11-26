@@ -889,13 +889,16 @@ async function renderExpected() {
         return `<button class="chip ${expectedFilter === key ? 'on' : ''}" data-expected-filter="${key}">${esc(title)} · ${count}</button>`;
       }).join('')}</div>`
     + `<div class="bar"><button class="primary" data-act="expected-refresh">${expectedRows.loading ? 'Обновляю…' : 'Обновить с портов'}</button></div>`
-    + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · автообновление раз в минуту</div>`
+    + `<div class="hint">Обновлено: ${esc((expectedRows.updated || '').slice(0, 16).replace('T', ' ') || 'ещё не было')} · автообновление раз в минуту`
+      + (expectedRows.hidden ? ` · скрыто ${expectedRows.hidden} (ушли в сторону)` : '')
+      + (expectedRows.added ? ` · добавлено ${expectedRows.added} по курсу` : '') + `</div>`
     + (rows.length ? rows.map(r => `<article class="card" data-mmsi="${esc(r.mmsi || '')}">
       <div class="row"><div><div class="name" style="font-size:15px">${esc(r.name || 'Без имени')}</div>
       <div class="small">${esc(r.port)}${r.type ? ' · ' + esc(r.type) : ''}</div></div>
       <div class="sog" style="font-size:12px">${esc(r.eta || 'ETA —')}</div></div>
       <div class="meta">
         ${r.last_heard ? `<span class="tag">сигнал ${esc(r.last_heard)}</span>` : ''}
+        ${r.note ? `<span class="tag">${esc(r.note)}</span>` : ''}
         <span class="tag ${r.stale ? 'warn' : 'ok'}">${r.stale ? 'устарело' : 'ожидается'}</span>
         ${r.mmsi ? `<span class="tag">MMSI ${esc(r.mmsi)}</span>` : ''}
       </div></article>`).join('') : '<div class="empty">Пока никто не заявил наш порт</div>');

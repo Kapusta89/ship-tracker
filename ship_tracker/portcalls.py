@@ -280,6 +280,334 @@ def expected_for_mmsi(mmsi, cache=None) -> dict | None:
     return None
 
 
+# --------------------------------------- проверка «Ожидаемых» по факту
+#
+# Портовые страницы AIS-catcher показывают то, что капитан записал в поле
+# Destination, и принимают это на веру. А запись живёт долго: после смены
+# рейса в ней ещё висит прошлый порт, и судно неделю «идёт» к нам, стоя
+# в Турции. Поэтому каждую строку проверяем по живым данным: где судно
+# сейчас, куда смотрит курс и приближалось ли оно к нашему порту за
+# последние часы. Судно, которое ушло в другую сторону, помечается ложным
+# и в таблицу не попадает. И наоборот: судно без назначения, идущее прямо
+# к нам по курсу, в список добавляется — это тоже ожидаемое прибытие.
+
+# Ближе этого расстояния курс не судим: на рейде и в гирле судно
+# разворачивается каждую минуту, и вывод получился бы случайным.
+JUDGE_NEAR_KM = 25.0
+# Насколько далеко судно должно уйти от ближайшей точки у порта, чтобы это
+# был рейс в другую сторону, а не обход отмели или работа лоцмана.
+JUDGE_AWAY_KM = 40.0
+# Отклонение курса от направления на порт, после которого судно идёт мимо.
+# 100° — это уже почти обратный курс: случайным такое не бывает.
+JUDGE_OFFSET_DEG = 100.0
+# Ниже этого хода судно стоит или дрейфует: курс ничего не значит.
+JUDGE_MIN_SPEED = 1.0
+# Позиция старше — проверять нечего: судно могло уйти куда угодно.
+JUDGE_STALE_HOURS = 24.0
+# Свежая позиция нужна, чтобы добавить судно «по курсу»: иначе это догадка.
+JUDGE_COURSE_FRESH_HOURS = 3.0
+# Окно трека для проверки «было ближе, стало дальше».
+JUDGE_TRACK_HOURS = 72.0
+# Дальше этого порт за окно прогноза не достать — такая строка бесполезна.
+JUDGE_MAX_KM = 700.0
+JUDGE_REACH_HOURS = 96.0
+# Отклонение курса, при котором судно без назначения считается идущим к нам.
+JUDGE_COURSE_DEG = 35.0
+# Сколько добавленных «по курсу» строк максимум: остальное — уже не ожидаемые.
+JUDGE_MAX_ADDED = 30
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bearing(lat1, lon1, lat2, lon2) -> float:
+    """Начальный пеленг от первой точки ко второй, градусы от севера."""
+    import math
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta = math.radians(lon2 - lon1)
+    y = math.sin(delta) * math.cos(phi2)
+    x = (math.cos(phi1) * math.sin(phi2)
+         - math.sin(phi1) * math.cos(phi2) * math.cos(delta))
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _km_between(lat1, lon1, lat2, lon2):
+    import math
+    try:
+        phi1, phi2 = math.radians(float(lat1)), math.radians(float(lat2))
+        dphi = phi2 - phi1
+        dlambda = math.radians(float(lon2) - float(lon1))
+    except (TypeError, ValueError):
+        return None
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+    return 2 * 6371.0088 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _offset_deg(course, bearing) -> float:
+    """Насколько курс расходится с направлением на порт, градусы 0…180."""
+    return abs(((float(bearing) - float(course) + 540.0) % 360.0) - 180.0)
+
+
+def _km_to_port(lat, lon, port):
+    try:
+        return _km_between(lat, lon, float(port["lat"]), float(port["lon"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _port_for_row(row, ports):
+    """Наш порт строки: сначала по UN/LOCODE, потом по названию."""
+    locode = _clean((row or {}).get("locode")).upper()
+    title = _clean((row or {}).get("port")).upper()
+    for port in ports or []:
+        if locode and _clean(port.get("locode")).upper() == locode:
+            return port
+    for port in ports or []:
+        names = {_clean(port.get("label")).upper(), _clean(port.get("name")).upper()}
+        if title and title in names:
+            return port
+    return None
+
+
+def _age_hours(text, now=None):
+    """Сколько часов назад была позиция (время в базе местное, без зоны)."""
+    if not text:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(text)[:19].replace("T", " "))
+    except (TypeError, ValueError):
+        return None
+    now = now or datetime.now()
+    if moment.tzinfo is not None:
+        moment = moment.replace(tzinfo=None)
+    return max(0.0, (now - moment).total_seconds() / 3600.0)
+
+
+def _age_text(hours):
+    """Возраст сигнала в том виде, в каком его пишет AIS-catcher («3h 20m ago»)."""
+    if hours is None:
+        return ""
+    total = int(round(max(0.0, float(hours)) * 60))
+    if total < 60:
+        return f"{total}m ago"
+    return f"{total // 60}h {total % 60}m ago"
+
+
+def _course_of(vessel):
+    """Курс судна: COG, при его отсутствии — heading (служебные значения мимо)."""
+    for key in ("cog", "heading"):
+        course = _number((vessel or {}).get(key))
+        if course is not None and 0.0 < course < 360.0:
+            return course
+    return None
+
+
+def _best_approach(points, port):
+    """Ближайшая к порту точка трека: (км, время) или None."""
+    best = None
+    for point in points or []:
+        lat, lon = _number(point.get("lat")), _number(point.get("lon"))
+        if lat is None or lon is None:
+            continue
+        km = _km_to_port(lat, lon, port)
+        if km is None:
+            continue
+        if best is None or km < best[0]:
+            best = (km, point.get("ts"))
+    return best
+
+
+def _judge_row(row, ports, vessel, points, now):
+    """Вердикт по строке «Ожидаемых»: ok, false или unknown (нет данных)."""
+    result = dict(row)
+    result.setdefault("verdict", "unknown")
+    result.setdefault("note", "")
+    port = _port_for_row(row, ports)
+    if port is None:
+        result["note"] = "порт не из нашего списка"
+        return result
+    lat, lon = _number((vessel or {}).get("lat")), _number((vessel or {}).get("lon"))
+    if lat is None or lon is None:
+        result["note"] = "позиции AIS нет — проверить нечем"
+        return result
+    age = _age_hours((vessel or {}).get("position_at") or (vessel or {}).get("updated_at"), now)
+    if age is None or age > JUDGE_STALE_HOURS:
+        result["note"] = (f"позиция старше {age:.0f} ч — проверить нечем"
+                          if age is not None else "времени позиции нет")
+        return result
+    km = _km_to_port(lat, lon, port)
+    if km is None:
+        result["note"] = "порт без координат"
+        return result
+    result["checked"] = True
+    result["distance_km"] = round(km)
+    result["verdict"] = "ok"
+    try:
+        radius = float(port.get("radius_km") or 5.0)
+    except (TypeError, ValueError):
+        radius = 5.0
+    if km <= max(radius * 2.0, 3.0):
+        result["note"] = f"у порта, {km:.0f} км"
+        return result
+
+    course = _course_of(vessel)
+    speed = _number((vessel or {}).get("sog")) or 0.0
+    offset = None
+    if course is not None:
+        offset = _offset_deg(course, _bearing(lat, lon, float(port["lat"]), float(port["lon"])))
+    moving = speed >= JUDGE_MIN_SPEED
+
+    best = _best_approach(points, port)
+    if best is not None:
+        best_km = best[0]
+        grew = km - best_km
+        if best_km <= max(radius * 2.0, 8.0) and grew >= JUDGE_AWAY_KM:
+            result["verdict"] = "false"
+            result["note"] = (f"было {best_km:.0f} км от порта, сейчас {km:.0f} км — "
+                              "ушло в другую сторону")
+            return result
+        if (moving and offset is not None and grew >= JUDGE_AWAY_KM
+                and offset > JUDGE_OFFSET_DEG):
+            result["verdict"] = "false"
+            result["note"] = (f"удаляется: {best_km:.0f} → {km:.0f} км, курс мимо порта")
+            return result
+    if moving and offset is not None and offset > JUDGE_OFFSET_DEG and km > JUDGE_NEAR_KM:
+        result["verdict"] = "false"
+        result["note"] = f"в {km:.0f} км, курс в сторону от порта на {offset:.0f}°"
+        return result
+
+    if offset is None:
+        result["note"] = f"в {km:.0f} км, курс не передан"
+    elif offset <= 45.0:
+        result["note"] = f"в {km:.0f} км, курс на порт"
+    else:
+        result["note"] = f"в {km:.0f} км, курс под {offset:.0f}° к порту"
+    return result
+
+
+def _likely_incoming(vessel) -> bool:
+    """Грузовое судно или танкер — только они и ходят к нам с грузом.
+
+    Без этого фильтра в список попадали городские паромы Стамбула и
+    прогулочные катера: у них пустое назначение и курс, который иногда
+    смотрит на Измаил, но к нашим портам они не идут никогда.
+    """
+    code = _number((vessel or {}).get("type_code"))
+    if code is not None and 70 <= code <= 89:
+        return True
+    label = str((vessel or {}).get("type_label") or "").lower()
+    if any(word in label for word in ("груз", "танкер", "cargo", "tanker", "bulk")):
+        return True
+    length = _number((vessel or {}).get("length_m"))
+    return length is not None and length >= 100.0
+
+
+def _course_row(vessel, port, km, now):
+    """Строка «Ожидаемых» для судна без назначения, идущего к нам по курсу."""
+    mmsi = str((vessel or {}).get("mmsi") or "")
+    age = _age_hours((vessel or {}).get("position_at") or (vessel or {}).get("updated_at"), now)
+    return {
+        "locode": port.get("locode") or "",
+        "port": port.get("label") or port.get("name") or "",
+        "name": (vessel or {}).get("name") or mmsi,
+        "type": (vessel or {}).get("type_label") or "",
+        "eta": "",
+        "last_heard": _age_text(age),
+        "last_heard_at": (vessel or {}).get("position_at") or "",
+        "mmsi": mmsi,
+        "updated": "",
+        "verdict": "course",
+        "note": f"в {km:.0f} км, курс на порт — назначение не указано",
+        "distance_km": round(km),
+    }
+
+
+def judge_expected(rows, ports=None, vessels=None, track=None, now=None) -> dict:
+    """Проверяет «Ожидаемые» по живым данным AIS.
+
+    rows — строки `expected_rows()`; ports — наши порты из настроек;
+    vessels — {MMSI: судно из базы}; track(MMSI) — позиции судна за
+    последние часы (для проверки, приближалось ли оно к порту).
+
+    Возвращает словарь: rows — что показывать (без ложных, с добавленными
+    по курсу), hidden — ложные строки с пояснением, added — сколько строк
+    добавлено по курсу, checked — сколько удалось проверить по позиции.
+    """
+    now = now or datetime.now()
+    ports = list(ports or [])
+    vessels = vessels if isinstance(vessels, dict) else {}
+    kept, hidden = [], []
+    checked = 0
+    for row in rows or []:
+        mmsi = str((row or {}).get("mmsi") or "")
+        vessel = vessels.get(mmsi)
+        points = []
+        if vessel is not None and track is not None:
+            try:
+                points = track(mmsi) or []
+            except Exception:                     # база занята, старые записи
+                points = []
+        judged = _judge_row(row, ports, vessel, points, now)
+        if judged.get("checked"):
+            checked += 1
+        if judged.get("verdict") == "false":
+            hidden.append(judged)
+        else:
+            kept.append(judged)
+
+    added = []
+    shown = {str(row.get("mmsi")) for row in kept}
+    for mmsi, vessel in vessels.items():
+        if len(added) >= JUDGE_MAX_ADDED:
+            break
+        if str(mmsi) in shown:
+            continue
+        if _clean((vessel or {}).get("destination")):
+            # назначение указано — это не «без назначения», его проверяет страница
+            continue
+        if not _likely_incoming(vessel):
+            continue
+        lat, lon = _number(vessel.get("lat")), _number(vessel.get("lon"))
+        if lat is None or lon is None:
+            continue
+        speed = _number(vessel.get("sog")) or 0.0
+        if speed < 2.0:
+            continue
+        age = _age_hours(vessel.get("position_at") or vessel.get("updated_at"), now)
+        if age is None or age > JUDGE_COURSE_FRESH_HOURS:
+            continue
+        course = _course_of(vessel)
+        if course is None:
+            continue
+        best = None
+        for port in ports:
+            km = _km_to_port(lat, lon, port)
+            if km is None or km < 1.0 or km > JUDGE_MAX_KM:
+                continue
+            if km / (speed * 1.852) > JUDGE_REACH_HOURS:
+                continue
+            offset = _offset_deg(course, _bearing(lat, lon, float(port["lat"]),
+                                                  float(port["lon"])))
+            if offset > JUDGE_COURSE_DEG:
+                continue
+            candidate = (offset, km, port)
+            if best is None or candidate[:2] < best[:2]:
+                best = candidate
+        if best is None:
+            continue
+        added.append(_course_row(vessel, best[2], best[1], now))
+        shown.add(str(mmsi))
+
+    return {"rows": kept + added, "hidden": hidden,
+            "added": len(added), "checked": checked,
+            "checked_at": now.isoformat(timespec="seconds")}
+
+
 # ------------------------------------------------------------------- GFW
 
 # Классы судов GFW → код типа AIS и подпись по-русски. Нужно, чтобы данные

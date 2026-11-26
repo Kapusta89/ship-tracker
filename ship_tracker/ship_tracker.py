@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.78"
+APP_VERSION = "2026.12.79"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2118,8 +2118,9 @@ class App:
         top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Label(top, text="Кто указал наш порт пунктом назначения — таблица портовых "
                             "страниц AIS-catcher (открытая сеть приёмников, без ключа). "
-                            "Страницы есть только у части портов, ETA передаёт сам "
-                            "капитан и обновляет его не всегда.",
+                            "Назначение проверяется по факту: суда, ушедшие в другую "
+                            "сторону, скрываются, а идущие к нам по курсу без назначения "
+                            "добавляются. ETA передаёт капитан и обновляет не всегда.",
                   foreground="#555", wraplength=760, justify="left").pack(
             side="left", fill="x", expand=True)
         self.expected_button = ttk.Button(top, text="Обновить сейчас",
@@ -2131,10 +2132,14 @@ class App:
         self.expected_tree = self.make_tree(
             frame, (("port", "Порт", 110), ("name", "Судно", 180),
                     ("type", "Тип", 130), ("eta", "Заявленный ETA", 200),
-                    ("heard", "Последний сигнал", 150), ("mmsi", "MMSI", 100),
+                    ("heard", "Последний сигнал", 150),
+                    ("note", "Проверка по AIS", 280), ("mmsi", "MMSI", 100),
                     ("updated", "Обновлено", 150)))
         # Судно, чьё последнее сообщение AIS давно не приходило, — серым.
         self.expected_tree.tag_configure("old", foreground="#8c8c8c")
+        # Добавленные по курсу (без назначения) — зелёным: это не заявка,
+        # а расчёт по последней позиции.
+        self.expected_tree.tag_configure("bycourse", foreground="#0b6b3a")
         self.refresh_expected()
         self.root.after(60000, self._expected_watch)
 
@@ -2203,7 +2208,7 @@ class App:
         cache = portcalls.load_cache()
         self._expected_stamp = portcalls.EXPECTED_PATH.stat().st_mtime \
             if portcalls.EXPECTED_PATH.exists() else None
-        rows = portcalls.expected_rows(cache)
+        rows, hidden_rows, added_rows, checked = self.expected_judged(portcalls.expected_rows(cache))
         updated_at = parse_iso(cache.get("updated"))
         local_stamp = "—"
         if updated_at is not None:
@@ -2226,15 +2231,29 @@ class App:
                 # сигнал старше порога — и ETA, и порт уже ничего не значат
                 if not self.stale_visible():
                     continue
-            tags = ("old",) if stale_row else ()
+            if stale_row:
+                tags = ("old",)
+            elif row.get("verdict") == "course":
+                tags = ("bycourse",)
+            else:
+                tags = ()
             tree.insert("", "end", tags=tags, values=(
                 row.get("port"), row.get("name"), row.get("type") or "—",
-                eta, row.get("last_heard") or "—", row.get("mmsi"), local_stamp))
+                eta, row.get("last_heard") or "—", row.get("note") or "—",
+                row.get("mmsi"), local_stamp))
         ports = cache.get("ports") or {}
         failed = [entry.get("name") for entry in ports.values() if entry.get("error")]
         missing = [entry.get("name") for entry in ports.values() if entry.get("unsupported")]
         info = (f"Ожидается судов: {len(rows)} в портах: {len(ports)}."
                 if ports else "Данных пока нет: нажмите «Обновить сейчас».")
+        if hidden_rows:
+            info += (f" Скрыто {len(hidden_rows)}: назначение не подтверждается — "
+                     "судно ушло в другую сторону.")
+        if added_rows:
+            info += (f" Добавлено {added_rows} по курсу: назначения нет, но судно "
+                     "идёт прямо к нам.")
+        if checked:
+            info += f" Проверено по позиции AIS: {checked}."
         if updated_at:
             now = datetime.now(updated_at.tzinfo) if updated_at.tzinfo else datetime.now()
             minutes = int((now - updated_at).total_seconds() / 60)
@@ -2261,6 +2280,42 @@ class App:
                      "несколько дней назад — капитан его не обновил, судно идёт по "
                      "старому плану.")
         self.expected_info.set(info)
+
+    def expected_judged(self, rows):
+        """Проверяет «Ожидаемые» по живым данным: назначение — не факт.
+
+        Строка портовой страницы — это заявленное назначение, а не маршрут.
+        Сверяем его с последней позицией и треком судна: ушло в другую
+        сторону — скрываем, а судно без назначения, идущее по курсу прямо
+        к нам, добавляем в список.
+        """
+        nothing = (rows, 0, 0, 0)
+        try:
+            vessels = {str(v.get("mmsi")): v
+                       for v in self.core.store.vessels(3000)}
+        except Exception as error:
+            self.log(f"Ожидаемые: проверка по AIS не удалась — {net.brief_error(error)}")
+            return nothing
+        if not vessels:
+            return nothing
+
+        since = (datetime.now() - timedelta(hours=72)).isoformat(timespec="seconds")
+        now_text = datetime.now().isoformat(timespec="seconds")
+
+        def track(mmsi):
+            try:
+                return self.core.store.positions_between(mmsi, since, now_text)
+            except Exception:
+                return []
+
+        try:
+            judged = portcalls.judge_expected(rows, self.config.get("ports") or [],
+                                               vessels, track=track)
+        except Exception as error:
+            self.log(f"Ожидаемые: проверка по AIS не удалась — {net.brief_error(error)}")
+            return nothing
+        return (judged["rows"], judged["hidden"], judged["added"],
+                judged["checked"])
 
     def refresh_expected_now(self):
         if getattr(self, "_expected_loading", False):
