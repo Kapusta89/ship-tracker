@@ -42,7 +42,7 @@ if str(APP_DIR) not in sys.path:
 
 # Версия видна в заголовке окна и на вкладке «Подключение»: так сразу ясно,
 # запущена ли текущая копия или где-то лежит старая сборка.
-APP_VERSION = "2026.12.79"
+APP_VERSION = "2026.12.80"
 # Открытая карточка сама перезапрашивает источники по своему судну: не чаще.
 AUTO_REFRESH_SECONDS = 60.0
 
@@ -2129,12 +2129,16 @@ class App:
         self.expected_info = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.expected_info, foreground="#333",
                   wraplength=1200, justify="left").pack(anchor="w", padx=8, pady=(0, 4))
+        # Ширины подобраны так, чтобы все столбцы влезали в окно по умолчанию
+        # (~1220 px): «Проверка по AIS» вмещает самую длинную подпись
+        # («в 1234 км, курс на порт — назначение не указано» — 275 px),
+        # а «Обновлено» раньше уезжало за правый край вместе с заголовком.
         self.expected_tree = self.make_tree(
-            frame, (("port", "Порт", 110), ("name", "Судно", 180),
-                    ("type", "Тип", 130), ("eta", "Заявленный ETA", 200),
-                    ("heard", "Последний сигнал", 150),
-                    ("note", "Проверка по AIS", 280), ("mmsi", "MMSI", 100),
-                    ("updated", "Обновлено", 150)))
+            frame, (("port", "Порт", 95), ("name", "Судно", 160),
+                    ("type", "Тип", 105), ("eta", "Заявленный ETA", 200),
+                    ("heard", "Последний сигнал", 120),
+                    ("note", "Проверка по AIS", 320), ("mmsi", "MMSI", 90),
+                    ("updated", "Обновлено", 120)))
         # Судно, чьё последнее сообщение AIS давно не приходило, — серым.
         self.expected_tree.tag_configure("old", foreground="#8c8c8c")
         # Добавленные по курсу (без назначения) — зелёным: это не заявка,
@@ -2217,7 +2221,14 @@ class App:
                                else updated_at).strftime("%d.%m.%Y %H:%M")
             except (ValueError, OSError):
                 local_stamp = updated_at.strftime("%d.%m.%Y %H:%M")
+        # у добавленной по курсу строки нет своей даты в кэше: показываем время
+        # проверки, иначе в «Обновлено» стоит дата старой таблицы AIS-catcher
+        now_stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
         stale_rows = 0
+        # сколько строк реально попало в таблицу: всего заявленных может быть
+        # больше — устаревшие скрыты, и «Ожидается судов: 1» при пустой
+        # таблице выглядело как ошибка
+        shown_rows = 0
         for row in rows:
             hours = self._heard_hours(row.get("last_heard"))
             eta_hours = self._eta_state(row.get("eta"))
@@ -2237,14 +2248,18 @@ class App:
                 tags = ("bycourse",)
             else:
                 tags = ()
+            stamp = now_stamp if row.get("verdict") == "course" else local_stamp
             tree.insert("", "end", tags=tags, values=(
                 row.get("port"), row.get("name"), row.get("type") or "—",
                 eta, row.get("last_heard") or "—", row.get("note") or "—",
-                row.get("mmsi"), local_stamp))
+                row.get("mmsi"), stamp))
+            shown_rows += 1
         ports = cache.get("ports") or {}
         failed = [entry.get("name") for entry in ports.values() if entry.get("error")]
         missing = [entry.get("name") for entry in ports.values() if entry.get("unsupported")]
-        info = (f"Ожидается судов: {len(rows)} в портах: {len(ports)}."
+        counted = (f"{shown_rows} из {len(rows)}" if shown_rows != len(rows)
+                   else f"{shown_rows}")
+        info = (f"Ожидается судов: {counted} в портах: {len(ports)}."
                 if ports else "Данных пока нет: нажмите «Обновить сейчас».")
         if hidden_rows:
             info += (f" Скрыто {len(hidden_rows)}: назначение не подтверждается — "
